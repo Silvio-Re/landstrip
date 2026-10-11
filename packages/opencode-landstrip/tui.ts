@@ -835,6 +835,7 @@ const tui: TuiPlugin.Definition = {
     };
 
     context.keymap.layer(() => ({
+      mode: 'global',
       commands: [
         {
           id: 'landstrip',
