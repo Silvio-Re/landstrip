@@ -94,7 +94,7 @@ test('extractDeniedPath resolves structured traps, native errors, and candidate 
 
   // Structured trap
   const trapOutput =
-    '{"kind":"filesystem","query_id":"q1","path":"/opt/data","operation":"read","state":"denial"}';
+    '{"kind":"filesystem","code":"FILESYSTEM_DENIED","query_id":"0","path":"/opt/data","requested_path":"/opt/data","operation":"read","state":"denial","syscall":"openat","errno":"EACCES","flags":[],"reason":"deny_match","suggested_grant":{"allowRead":"/opt/data"},"process":{"pid":1,"exe":null,"cwd":null},"mechanism":"seccomp"}';
   assert.equal(extractDeniedPath(trapOutput, { cwd }), canonicalizePath('/opt/data', cwd));
 
   // Native denial
@@ -105,7 +105,7 @@ test('extractDeniedPath resolves structured traps, native errors, and candidate 
   );
 
   // Command fallback when internal trap occurred
-  const internalTrap = '{"kind":"internal","code":"PERMISSION_DENIED","message":"Access denied"}';
+  const internalTrap = '{"kind":"internal","code":"INTERNAL_ERROR","message":"Access denied"}';
   assert.equal(
     extractDeniedPath(internalTrap, { cwd, command: 'cat /workspace/test/secret.key' }),
     canonicalizePath('/workspace/test/secret.key', cwd),

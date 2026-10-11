@@ -24,6 +24,7 @@ import type {
 } from './index.js';
 
 export type LandstripDenialTrap = LandstripFilesystemTrap | LandstripNetworkTrap;
+export type LandstripQueryTrap = LandstripDenialTrap & { state: 'query' };
 
 export type {
   SandboxConfig,
@@ -78,7 +79,7 @@ export function isFilesystemTrap(trap: LandstripTrap): trap is LandstripFilesyst
 
 export function isDenialTrap(trap: LandstripTrap): trap is LandstripDenialTrap;
 
-export function isQueryTrap(trap: LandstripTrap): trap is LandstripDenialTrap;
+export function isQueryTrap(trap: LandstripTrap): trap is LandstripQueryTrap;
 
 export function formatLandstripTrap(trap: LandstripTrap): string;
 

@@ -21,7 +21,6 @@ import {
   allowsAllDomains,
   canonicalizePath,
   controlResponseLine,
-  decodeLandstripTrap,
   evaluateDomainAccess,
   evaluateReadAccess,
   evaluateWriteAccess,
@@ -31,11 +30,13 @@ import {
   getConfigPaths,
   isDomainAllowed,
   isRecord,
+  isQueryTrap,
   buildLandstripPolicy,
   landstripBinaryPath,
   loadConfig,
   normalizeOptions,
   parseLandstripTraps,
+  parseTrapLine,
   readDiscoveryPort,
   writeLandstripPolicyFile,
   trapSessionHelloLine,
@@ -262,17 +263,8 @@ function startTrapServer(
         buffer = buffer.slice(nl + 1);
         nl = buffer.indexOf('\n');
         if (line.length === 0) continue;
-        let trap: LandstripTrap | null = null;
-        try {
-          trap = decodeLandstripTrap(JSON.parse(line));
-        } catch {
-          trap = null;
-        }
-        if (
-          (trap?.kind === 'filesystem' || trap?.kind === 'network') &&
-          trap.state === 'query' &&
-          trap.query_id
-        ) {
+        const trap = parseTrapLine(line);
+        if (trap && isQueryTrap(trap)) {
           const queryId = trap.query_id;
           if (trap.kind === 'filesystem') {
             const path = canonicalizePath(trap.path, baseDirectory);
@@ -295,13 +287,8 @@ function startTrapServer(
               trapSocket.write(controlResponseLine(queryId, 'deny'));
               trapLines.push(line);
             }
-          } else if (
-            trap.kind === 'network' &&
-            (trap.operation === 'connect' || trap.operation === 'bind')
-          ) {
-            trapSocket.write(controlResponseLine(queryId, 'deny'));
-            trapLines.push(line);
           } else {
+            trapSocket.write(controlResponseLine(queryId, 'deny'));
             trapLines.push(line);
           }
         } else {

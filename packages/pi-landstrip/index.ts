@@ -39,8 +39,6 @@ import {
 import {
   binaryPath,
   type LandstripControlResponse,
-  type LandstripFilesystemTrap,
-  type LandstripNetworkTrap,
   type LandstripPolicy,
   type SandboxConfig as BaseSandboxConfig,
   type SandboxConfigFile,
@@ -52,6 +50,7 @@ import {
 import {
   buildLandstripPolicy as assembleLandstripPolicy,
   allowsAllDomains,
+  type LandstripQueryTrap,
   controlResponseLine,
   deepMergeSandboxConfig as deepMerge,
   domainMatchesAny,
@@ -1381,7 +1380,7 @@ function createLandstripIntegrationWithPrompts(
   }
 
   async function resolveTrapQuery(
-    trap: LandstripFilesystemTrap | LandstripNetworkTrap,
+    trap: LandstripQueryTrap,
     ctx: ExtensionContext,
     cwd: string,
     allowances: ExecutionAllowances,
@@ -1525,7 +1524,7 @@ function createLandstripIntegrationWithPrompts(
       });
     };
 
-    const handleQuery = (trap: LandstripFilesystemTrap | LandstripNetworkTrap): void => {
+    const handleQuery = (trap: LandstripQueryTrap): void => {
       prompts = prompts
         .then(async () => {
           const result = await resolveTrapQuery(trap, ctx, cwd, allowances, true, signal);

@@ -122,51 +122,115 @@ function allowsAllDomains(allowedDomains) {
   return allowedDomains.includes('*');
 }
 
-// landstrip emits each trap as a flat JSON record tagged by a `kind`
-// discriminant (`filesystem`, `network`, `launch`, `usage`, `internal`)
-// alongside a stable `code` and variant-specific fields. The declarations it
-// ships are erased at compile time, so validate the fields callers read
-// before trusting a decoded line. `state` is deliberately not validated: a
-// missing or unknown state degrades to "informational", the safe direction.
-// `query_id` must be a string — landstrip < 0.17 sent a number, and a
-// numeric id fails its own deserializer when echoed back.
-const LANDSTRIP_OPERATIONS = new Set(['read', 'write']);
+const LANDSTRIP_MECHANISMS = new Set([
+  'landlock',
+  'seccomp',
+  'seatbelt',
+  'appcontainer',
+  'windowsuser',
+]);
+const LANDSTRIP_INTERNAL_CODES = new Set([
+  'POLICY_PARSE_FAILED',
+  'POLICY_IO_FAILED',
+  'POLICY_UNRESTRICTED_READ',
+  'POLICY_DENY_READ_ALWAYS_UNSUPPORTED',
+  'POLICY_DENY_WRITE_ALWAYS_UNSUPPORTED',
+  'POLICY_TCP_BIND_UNSUPPORTED',
+  'POLICY_LOCAL_BINDING_UNSUPPORTED',
+  'POLICY_UNIX_SOCKET_UNSUPPORTED',
+  'POLICY_UNIX_SOCKET_PATH',
+  'POLICY_DENY_WRITE_SYMLINK_ANCESTOR',
+  'POLICY_INVALID_PORT',
+  'POLICY_EMPTY_PATH',
+  'POLICY_HOME_UNAVAILABLE',
+  'POLICY_TRAVERSAL_DEPTH',
+  'SUPERVISE_FAILED',
+  'HOST_JOB_INCOMPATIBLE',
+  'PLATFORM_UNSUPPORTED',
+  'INTEGER_TOO_LARGE',
+  'INTERNAL_ERROR',
+]);
+
+function isDenialRecord(value) {
+  return (
+    typeof value.query_id === 'string' &&
+    /^(0|[1-9][0-9]{0,19})$/.test(value.query_id) &&
+    BigInt(value.query_id) <= 18446744073709551615n &&
+    (value.state !== 'query' || value.query_id !== '0') &&
+    typeof value.syscall === 'string' &&
+    typeof value.errno === 'string' &&
+    value.mechanism === 'seccomp' &&
+    isRecord(value.process) &&
+    Number.isInteger(value.process.pid) &&
+    value.process.pid >= 0 &&
+    value.process.pid <= 4294967295 &&
+    (value.process.exe === null || typeof value.process.exe === 'string') &&
+    (value.process.cwd === null || typeof value.process.cwd === 'string')
+  );
+}
 
 function isLandstripTrap(value) {
   if (!isRecord(value)) return false;
 
   switch (value.kind) {
-    case 'filesystem':
+    case 'filesystem': {
+      if (!Array.isArray(value.flags)) return false;
+      for (const flag of value.flags) {
+        if (typeof flag !== 'string') return false;
+      }
+      const grant = value.operation === 'read' ? 'allowRead' : 'allowWrite';
+      const otherGrant = value.operation === 'read' ? 'allowWrite' : 'allowRead';
       return (
-        LANDSTRIP_OPERATIONS.has(value.operation) &&
+        value.code === 'FILESYSTEM_DENIED' &&
+        (value.operation === 'read' || value.operation === 'write') &&
         typeof value.path === 'string' &&
-        typeof value.query_id === 'string'
+        typeof value.requested_path === 'string' &&
+        (value.reason === 'allow_miss' || value.reason === 'deny_match') &&
+        isRecord(value.suggested_grant) &&
+        typeof value.suggested_grant[grant] === 'string' &&
+        value.suggested_grant[otherGrant] === undefined &&
+        isDenialRecord(value)
       );
+    }
     case 'network':
       return (
-        typeof value.operation === 'string' &&
+        value.code === 'NETWORK_DENIED' &&
+        (value.operation === 'connect' || value.operation === 'bind') &&
         typeof value.target === 'string' &&
-        typeof value.query_id === 'string'
+        isDenialRecord(value)
       );
     case 'launch':
-      return typeof value.program === 'string' && typeof value.message === 'string';
+      return (
+        value.code === 'LAUNCH_FAILED' &&
+        typeof value.program === 'string' &&
+        typeof value.message === 'string' &&
+        (value.errno === undefined || typeof value.errno === 'string')
+      );
     case 'usage':
-      return typeof value.message === 'string';
+      return value.code === 'USAGE_ERROR' && typeof value.message === 'string';
     case 'internal':
-      return typeof value.code === 'string' && typeof value.message === 'string';
+      return (
+        typeof value.message === 'string' &&
+        (value.code === 'SANDBOX_SETUP_FAILED'
+          ? LANDSTRIP_MECHANISMS.has(value.mechanism)
+          : LANDSTRIP_INTERNAL_CODES.has(value.code) && value.mechanism === undefined)
+      );
     default:
       return false;
   }
 }
 
 function decodeLandstripTrap(value) {
-  return isLandstripTrap(value) ? value : null;
+  if (!isLandstripTrap(value)) return null;
+  if (isDenialTrap(value) && value.state !== 'query' && value.state !== 'info') {
+    return { ...value, state: 'info' };
+  }
+  return value;
 }
 
 function parseTrapLine(line) {
   try {
-    const parsed = JSON.parse(line);
-    return isLandstripTrap(parsed) ? parsed : null;
+    return decodeLandstripTrap(JSON.parse(line));
   } catch {
     return null;
   }

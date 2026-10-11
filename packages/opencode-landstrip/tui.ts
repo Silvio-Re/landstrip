@@ -16,6 +16,7 @@ import {
   controlResponseLine,
   decodeTrapSessionHello,
   getConfigPaths,
+  isQueryTrap,
   loadConfig,
   normalizeOptions,
   nextSandboxPermissionIndex,
@@ -576,8 +577,7 @@ const tui: TuiPlugin.Definition = {
 
             const allowances = sessionAllowancesFor(sessionAllowances, routeSessionID);
             for (const trap of parseLandstripTraps(line)) {
-              if (trap.kind !== 'filesystem' && trap.kind !== 'network') continue;
-              if (trap.state !== 'query') continue;
+              if (!isQueryTrap(trap)) continue;
               if (seen.has(trap.query_id)) continue;
               seen.add(trap.query_id);
 

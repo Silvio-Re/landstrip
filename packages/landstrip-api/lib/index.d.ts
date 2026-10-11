@@ -5,7 +5,8 @@ export type LandstripMechanism =
   | 'landlock'
   | 'seccomp'
   | 'seatbelt'
-  | 'appcontainer';
+  | 'appcontainer'
+  | 'windowsuser';
 
 /**
  * `query` holds the syscall until the launcher answers with a
@@ -86,6 +87,7 @@ export type LandstripPolicyErrorCode =
   | 'POLICY_DENY_READ_ALWAYS_UNSUPPORTED'
   | 'POLICY_DENY_WRITE_ALWAYS_UNSUPPORTED'
   | 'POLICY_TCP_BIND_UNSUPPORTED'
+  | 'POLICY_LOCAL_BINDING_UNSUPPORTED'
   | 'POLICY_UNIX_SOCKET_UNSUPPORTED'
   | 'POLICY_UNIX_SOCKET_PATH'
   | 'POLICY_DENY_WRITE_SYMLINK_ANCESTOR'
@@ -99,6 +101,7 @@ export type LandstripInternalCode =
   | LandstripPolicyErrorCode
   | 'SANDBOX_SETUP_FAILED'
   | 'SUPERVISE_FAILED'
+  | 'HOST_JOB_INCOMPATIBLE'
   | 'PLATFORM_UNSUPPORTED'
   | 'INTEGER_TOO_LARGE'
   | 'INTERNAL_ERROR';

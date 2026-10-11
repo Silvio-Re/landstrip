@@ -140,10 +140,19 @@ for (const diagnostic of ['native denial', 'filesystem trap']) {
               ? `cat: ${blockedPath}: Permission denied`
               : JSON.stringify({
                   kind: 'filesystem',
+                  code: 'FILESYSTEM_DENIED',
                   state: 'info',
                   operation: 'read',
                   path: blockedPath,
-                  query_id: 'diagnostic-query',
+                  requested_path: blockedPath,
+                  query_id: '0',
+                  syscall: 'openat',
+                  errno: 'EACCES',
+                  flags: [],
+                  reason: 'deny_match',
+                  suggested_grant: { allowRead: blockedPath },
+                  process: { pid: 1, exe: null, cwd: null },
+                  mechanism: 'seccomp',
                 });
           const event = {
             id: 'diagnostic-call',
@@ -172,7 +181,7 @@ for (const diagnostic of ['native denial', 'filesystem trap']) {
           assert.deepEqual(
             errors,
             hasDiagnostic && diagnostic === 'filesystem trap'
-              ? [`opencode-landstrip: landstrip: filesystem read denied (${blockedPath})`]
+              ? [`opencode-landstrip: landstrip: filesystem read denied (${blockedPath}) [seccomp]`]
               : [],
           );
         },

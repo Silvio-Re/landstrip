@@ -40,6 +40,15 @@ Descriptor lifetimes and the reply protocol are covered in the manual.
 Integration helpers are exported through [`/shared`](lib/shared.d.ts) and
 [`/proxy`](lib/proxy.d.ts).
 
+`decodeLandstripTrap(value)` and `parseTrapLine(line)` from `/shared` return a
+validated `LandstripTrap`, or `null` for malformed input. Extra fields are
+preserved. Missing or unknown denial states are normalized to `info`, never
+queries; query IDs must be decimal `u64` strings and nonzero for queries.
+`isQueryTrap(trap)` narrows validated events to `LandstripQueryTrap` with
+`state: 'query'`. The declarations include all five native mechanisms and the
+current Windows error codes; the previously declared `POLICY_TCP_BIND_UNSUPPORTED`
+code remains accepted alongside `POLICY_LOCAL_BINDING_UNSUPPORTED`.
+
 `writeLandstripPolicyFile(policy, prefix = 'landstrip-')` from `/shared` writes
 `policy.json` and returns `{ dir, path }`. The caller owns `dir` and must remove it
 with `rmSync(dir, { recursive: true, force: true })` after use. Serialization
