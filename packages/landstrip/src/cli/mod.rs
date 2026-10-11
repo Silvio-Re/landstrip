@@ -16,15 +16,19 @@ use crate::trap::Trap;
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::error::Error as StdError;
-use std::io::{self, Write};
+use std::io;
 use std::process;
 
 pub fn execute() {
     let invocation = match parse_cli() {
         Ok(ParseOutcome::Invocation(invocation)) => invocation,
-        Ok(ParseOutcome::Display(text)) => {
-            if let Err(error) = io::stdout().lock().write_all(text.as_bytes()) {
+        Ok(ParseOutcome::Display(error)) => {
+            if let Err(error) = error.print() {
                 exit_with_error(&error.into(), None);
+            }
+            let exit_code = error.exit_code();
+            if exit_code != 0 {
+                process::exit(exit_code);
             }
             return;
         }

@@ -29,7 +29,7 @@ pub(super) struct Invocation {
 #[derive(Debug)]
 pub(super) enum ParseOutcome {
     Invocation(Invocation),
-    Display(String),
+    Display(clap::Error),
 }
 
 #[derive(Debug)]
@@ -236,10 +236,12 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
         Err(error)
             if matches!(
                 error.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
             ) =>
         {
-            return Ok(ParseOutcome::Display(error.to_string()));
+            return Ok(ParseOutcome::Display(error));
         }
         Err(error) => {
             return Err(Error::Usage {
