@@ -3,6 +3,10 @@
 
 //! Windows sandbox platform using `AppContainer`.
 
+mod doctor;
+
+pub(super) use doctor::{probe_null_device, status};
+
 use super::{
     NamedMutex, SandboxJob, ToWideNul, is_locked_error, join_command_line, own_handle,
     path_access_failed, quote_command_text, set_path_access, wait_process_exit, win32_error,

@@ -291,6 +291,8 @@ name=empty stdin policy is rejected | os=linux,macos | stdin_policy=true | polic
 # --- Windows (AppContainer) ---
 
 name=explicit read/write policy permits configured root | os=windows | policy={"filesystem":{"allowWrite":["%TMP%\\allowed"],"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C echo ok> %TMP%\allowed\ok.txt | status=0
+name=standard AppContainer reopens NUL for reading and writing | os=windows | policy={"windows":{"appContainerMode":"standard"},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C type nul && echo x> nul && echo null-ok | status=0 | out=null-ok
+name=LPAC reopens NUL for reading and writing | os=windows | policy={"windows":{"appContainerMode":"lpac"},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C type nul && echo x> nul && echo null-ok | status=0 | out=null-ok
 name=denyReadAlways rejects missing Windows root | os=windows | policy={"filesystem":{"denyReadAlways":["%TMP%\\missing-auth.json.lock"],"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=!0 | out=POLICY_DENY_READ_ALWAYS_UNSUPPORTED
 name=denyReadAlways rejects unmatched Windows glob | os=windows | policy={"filesystem":{"denyReadAlways":["%TMP%\\missing-auth-*"],"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=!0 | out=POLICY_DENY_READ_ALWAYS_UNSUPPORTED
 name=empty denyReadAlways permits Windows policy | os=windows | policy={"filesystem":{"denyReadAlways":[],"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=0

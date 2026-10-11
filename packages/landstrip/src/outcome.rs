@@ -70,15 +70,17 @@ pub(crate) struct WindowsStatusReport {
     pub(crate) runner_healthy: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) accounts_healthy: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
 }
 
 #[cfg(target_os = "windows")]
 impl WindowsStatusReport {
-    pub(crate) fn app_container() -> Self {
+    pub(crate) fn app_container(error: Option<String>) -> Self {
         Self {
             active: SandboxImplementation::AppContainer,
             installed: false,
-            healthy: true,
+            healthy: error.is_none(),
             version: None,
             complete: None,
             restricted_accounts: None,
@@ -88,33 +90,7 @@ impl WindowsStatusReport {
             runner: None,
             runner_healthy: None,
             accounts_healthy: None,
-        }
-    }
-
-    pub(crate) fn restricted_user(
-        version: u32,
-        complete: bool,
-        restricted_accounts: usize,
-        unrestricted_accounts: usize,
-        proxy_port_low: u16,
-        proxy_port_high: u16,
-        runner: PathBuf,
-        runner_healthy: bool,
-        accounts_healthy: bool,
-    ) -> Self {
-        Self {
-            active: SandboxImplementation::RestrictedUser,
-            installed: true,
-            healthy: complete && accounts_healthy && runner_healthy,
-            version: Some(version),
-            complete: Some(complete),
-            restricted_accounts: Some(restricted_accounts),
-            unrestricted_accounts: Some(unrestricted_accounts),
-            proxy_port_low: Some(proxy_port_low),
-            proxy_port_high: Some(proxy_port_high),
-            runner: Some(runner),
-            runner_healthy: Some(runner_healthy),
-            accounts_healthy: Some(accounts_healthy),
+            error,
         }
     }
 }

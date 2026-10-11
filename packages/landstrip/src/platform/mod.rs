@@ -30,6 +30,7 @@ pub(crate) enum WindowsCommand {
         proxy_port_low: u16,
         proxy_port_high: u16,
     },
+    PrepareAppContainer,
     Status,
     Uninstall,
 }
@@ -89,11 +90,7 @@ pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
     let platform = std::env::consts::OS;
     let implementation = status.active;
     let ok = status.healthy;
-    let error = if ok {
-        None
-    } else {
-        Some("restricted-user installation is unhealthy".to_owned())
-    };
+    let error = status.error;
     Ok(DoctorReport {
         ok,
         platform,

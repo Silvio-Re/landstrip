@@ -4,6 +4,7 @@
 //! Windows sandbox implementations.
 
 mod appcontainer;
+mod null_device;
 mod restricted_user;
 
 pub(crate) use restricted_user::{manage, run_worker, status};

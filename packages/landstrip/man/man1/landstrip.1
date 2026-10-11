@@ -33,6 +33,10 @@ Print a JSON report showing whether the current sandbox is usable.
 .It Cm windows install
 Install restricted-user isolation.
 This Windows-only command requests elevation.
+.It Cm windows prepare-appcontainer
+Grant read/write access to the null device for standard AppContainer and LPAC.
+This Windows-only command requests elevation and verifies both modes.
+It does not install or select restricted-user isolation.
 .It Cm windows status
 Report the active Windows implementation and its health.
 .It Cm windows uninstall
@@ -219,6 +223,31 @@ operations.
 .It Windows
 AppContainer or restricted local users enforce explicit filesystem grants.
 Restricted-user mode uses Windows Filtering Platform rules.
+.Pp
+On systems where AppContainer cannot open
+.Pa NUL ,
+Git for Windows and shell null redirections fail regardless of filesystem grants.
+Run
+.Cm landstrip windows prepare-appcontainer
+from an interactive Windows session after each reboot.
+The command preserves the null-device DACL and adds non-inheritable read/write
+permissions for ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES.
+These permissions apply machine-wide, not just to Landstrip containers.
+Existing deny entries, ownership, and audit settings remain unchanged.
+No filesystem or network permissions are added.
+Preparation is repeatable, lasts until reboot, and installs no background service.
+Sandboxed commands remain unelevated.
+.Pp
+In AppContainer mode,
+.Cm doctor
+and
+.Cm windows status
+verify fresh null-device opens, reads, and writes using both standard and LPAC tokens.
+Probe setup failures and inaccessible null devices produce unhealthy reports
+with mode-specific error messages.
+These probes do not certify that every tool or dependency can start.
+On Windows, run the integration suite only after null-device preparation;
+it does not request elevation itself.
 .El
 .Sh OUTPUT
 Policy, doctor, and Windows management commands write one JSON document to

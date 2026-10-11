@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! Elevated installation lifecycle for restricted-user isolation.
+//! Elevated Windows preparation and restricted-user installation lifecycle.
 
+use super::super::{appcontainer, null_device};
 use super::account;
 use super::lease;
 use super::state::{self, INSTALLATION_VERSION, Installation, NetworkMode};
 use super::wfp;
 use super::{NamedMutex, ToWideNul, current_process_token, own_handle};
-use crate::outcome::WindowsStatusReport;
+use crate::outcome::{SandboxImplementation, WindowsStatusReport};
 use crate::platform::WindowsCommand;
 use anyhow::{Context, Result, bail};
 use std::env;
@@ -59,6 +60,15 @@ pub(crate) fn manage(command: &WindowsCommand) -> Result<WindowsStatusReport> {
             )
         }
         WindowsCommand::Status => status(),
+        WindowsCommand::PrepareAppContainer => {
+            if is_elevated()? {
+                null_device::prepare()?;
+            } else {
+                elevate("windows prepare-appcontainer")?;
+            }
+            appcontainer::probe_null_device()?;
+            status()
+        }
         WindowsCommand::Uninstall => {
             if !is_elevated()? {
                 elevate("windows uninstall")?;
@@ -178,7 +188,7 @@ fn provision_accounts(
 
 fn uninstall() -> Result<WindowsStatusReport> {
     let Some(mut installation) = state::load_optional()? else {
-        return Ok(WindowsStatusReport::app_container());
+        return Ok(appcontainer::status());
     };
 
     installation.complete = false;
@@ -193,34 +203,43 @@ fn uninstall() -> Result<WindowsStatusReport> {
     }
     remove_runner(&installation.runner_path)?;
     state::remove()?;
-    Ok(WindowsStatusReport::app_container())
+    Ok(appcontainer::status())
 }
 
 pub(crate) fn status() -> Result<WindowsStatusReport> {
     let Some(installation) = state::load_optional()? else {
-        return Ok(WindowsStatusReport::app_container());
+        return Ok(appcontainer::status());
     };
 
     let (accounts_healthy, runner_healthy) = installation_health(&installation);
-    Ok(WindowsStatusReport::restricted_user(
-        installation.version,
-        installation.complete,
-        installation
-            .accounts
-            .iter()
-            .filter(|account| account.network_mode == NetworkMode::Restricted)
-            .count(),
-        installation
-            .accounts
-            .iter()
-            .filter(|account| account.network_mode == NetworkMode::Unrestricted)
-            .count(),
-        installation.proxy_port_low,
-        installation.proxy_port_high,
-        installation.runner_path,
-        runner_healthy,
-        accounts_healthy,
-    ))
+    let healthy = installation.complete && accounts_healthy && runner_healthy;
+    Ok(WindowsStatusReport {
+        active: SandboxImplementation::RestrictedUser,
+        installed: true,
+        healthy,
+        version: Some(installation.version),
+        complete: Some(installation.complete),
+        restricted_accounts: Some(
+            installation
+                .accounts
+                .iter()
+                .filter(|account| account.network_mode == NetworkMode::Restricted)
+                .count(),
+        ),
+        unrestricted_accounts: Some(
+            installation
+                .accounts
+                .iter()
+                .filter(|account| account.network_mode == NetworkMode::Unrestricted)
+                .count(),
+        ),
+        proxy_port_low: Some(installation.proxy_port_low),
+        proxy_port_high: Some(installation.proxy_port_high),
+        runner: Some(installation.runner_path),
+        runner_healthy: Some(runner_healthy),
+        accounts_healthy: Some(accounts_healthy),
+        error: (!healthy).then(|| "restricted-user installation is unhealthy".to_owned()),
+    })
 }
 
 pub(in crate::platform::windows) fn active_implementation() -> Result<&'static str> {

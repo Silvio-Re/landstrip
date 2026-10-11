@@ -99,7 +99,7 @@ enum CliCommand {
     /// Verify that the current OS sandbox is operational.
     Doctor,
     #[cfg(target_os = "windows")]
-    /// Manage Windows restricted-user provisioning.
+    /// Manage Windows sandbox preparation and restricted-user provisioning.
     Windows(WindowsArgs),
 }
 
@@ -159,6 +159,11 @@ struct WindowsArgs {
 enum WindowsAction {
     /// Install and activate restricted-user isolation.
     Install(WindowsInstallArgs),
+    #[command(
+        name = "prepare-appcontainer",
+        about = "Grant AppContainer read/write access to NUL until reboot (requests elevation)"
+    )]
+    PrepareAppContainer,
     /// Report the active Windows isolation implementation and its health.
     Status,
     /// Uninstall restricted-user isolation and return to `AppContainer`.
@@ -258,6 +263,7 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
                 proxy_port_low: args.proxy_port_range.low,
                 proxy_port_high: args.proxy_port_range.high,
             },
+            WindowsAction::PrepareAppContainer => WindowsCommand::PrepareAppContainer,
             WindowsAction::Status => WindowsCommand::Status,
             WindowsAction::Uninstall => WindowsCommand::Uninstall,
         }),
