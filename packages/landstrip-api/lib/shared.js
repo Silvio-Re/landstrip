@@ -992,7 +992,37 @@ function extractNativeDeniedPath(output, cwd = process.cwd()) {
   return null;
 }
 
-function extractNativeWriteDeniedPath(output, cwd = process.cwd()) {
+const nativeWriteTools = new Set(['mkdir', 'rm', 'rmdir', 'tee', 'touch', 'truncate', 'unlink']);
+const nativeShellTools = new Set(['bash', 'dash', 'fish', 'ksh', 'sh', 'zsh']);
+const nativeWriteSyscalls = new Set([
+  'chmod',
+  'chown',
+  'copyfile',
+  'link',
+  'mkdir',
+  'mkdtemp',
+  'rename',
+  'rmdir',
+  'symlink',
+  'truncate',
+  'unlink',
+  'utimes',
+  'write',
+]);
+
+function commandRedirectsToPath(command, path, cwd) {
+  if (typeof command !== 'string') return false;
+  const redirects = command.matchAll(
+    /(?:[0-9]*>>?|&>>?|>\|)\s*(?:'([^'\r\n]+)'|"([^"\r\n]+)"|\x60([^\x60\r\n]+)\x60|([^\s'"\x60;&|<>]+))/g,
+  );
+  for (const redirect of redirects) {
+    const target = redirect[1] ?? redirect[2] ?? redirect[3] ?? redirect[4];
+    if (target !== undefined && normalizePathMatch(target, cwd) === path) return true;
+  }
+  return false;
+}
+
+function extractNativeWriteDeniedPath(output, cwd = process.cwd(), command) {
   if (typeof output !== 'string') return null;
   const denial = String.raw`(?:Access is denied\.?|Operation not permitted|Permission denied)`;
   let match = output.match(
@@ -1019,6 +1049,29 @@ function extractNativeWriteDeniedPath(output, cwd = process.cwd()) {
     ),
   );
   if (match) return normalizePathMatch(match[1], cwd);
+
+  match = output.match(
+    new RegExp(
+      String.raw`^([^\s:]+):\s+((?:[a-zA-Z]:[\\/]|\\\\|\/|\.{1,2}[\\/])[^:\r\n]*?):\s+${denial}$`,
+      'im',
+    ),
+  );
+  if (match) {
+    const tool = basename(match[1]);
+    const path = normalizePathMatch(match[2], cwd);
+    if (path && nativeWriteTools.has(tool)) return path;
+    if (path && nativeShellTools.has(tool) && commandRedirectsToPath(command, path, cwd)) return path;
+  }
+
+  match = output.match(
+    new RegExp(
+      String.raw`(?:EPERM|EACCES):\s*(?:operation not permitted|permission denied),\s*([a-z]+)\s+['"\x60]([^'"\x60\r\n]+)['"\x60]`,
+      'i',
+    ),
+  );
+  if (match && nativeWriteSyscalls.has(match[1].toLowerCase())) {
+    return normalizePathMatch(match[2], cwd);
+  }
 
   return null;
 }

@@ -223,7 +223,11 @@ export function extractCandidatePaths(command: string): string[];
 
 export function extractNativeDeniedPath(output: string, cwd?: string): string | null;
 
-export function extractNativeWriteDeniedPath(output: string, cwd?: string): string | null;
+export function extractNativeWriteDeniedPath(
+  output: string,
+  cwd?: string,
+  command?: string,
+): string | null;
 
 export interface ExtractDeniedPathOptions {
   cwd?: string;

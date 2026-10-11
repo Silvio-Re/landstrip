@@ -2342,7 +2342,7 @@ function createLandstripIntegrationWithPrompts(
       const fallbackOutput = `${stderrOutput}\n${errorText}`;
       const blockedWritePath =
         extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'write') ??
-        extractNativeWriteDeniedPath(fallbackOutput, ctx.cwd);
+        extractNativeWriteDeniedPath(fallbackOutput, ctx.cwd, params.command);
       if (blockedWritePath) {
         const retryResult = await retryWithAccess('write', blockedWritePath);
         if (retryResult) return retryResult;
@@ -2367,7 +2367,7 @@ function createLandstripIntegrationWithPrompts(
     }
     const blockedWritePath =
       extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'write') ??
-      extractNativeWriteDeniedPath(stderrOutput, ctx.cwd);
+      extractNativeWriteDeniedPath(stderrOutput, ctx.cwd, params.command);
     if (blockedWritePath) {
       const retryResult = await retryWithAccess('write', blockedWritePath);
       if (retryResult) return retryResult;
