@@ -730,6 +730,7 @@ const tui: TuiPlugin.Definition = {
       const dimensions = useTerminalDimensions();
 
       context.keymap.layer(() => ({
+        mode: 'modal',
         enabled: () => landstripOpen(),
         priority: 1000,
         commands: [
