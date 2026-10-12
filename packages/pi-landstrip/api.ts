@@ -184,33 +184,56 @@ function isRuntime(value: unknown): value is PiLandstripRuntimeV2 {
   );
 }
 
-export function useLandstrip(
+function discoverLandstrip(
   pi: ExtensionAPI,
   callback: (runtime: PiLandstripRuntimeV2) => void,
+  onInvalid?: (error: Error) => void,
 ): () => void {
   const events = eventBus(pi);
   if (!events) return () => undefined;
 
   let current: PiLandstripRuntimeV2 | undefined;
-  const register = (runtime: PiLandstripRuntimeV2): void => {
-    if (runtime === current) return;
-    current = runtime;
-    callback(runtime);
+  let disposed = false;
+  const register = (value: unknown): void => {
+    if (disposed) return;
+    if (!isRuntime(value)) {
+      onInvalid?.(new Error('Invalid Landstrip runtime v2 declaration'));
+      return;
+    }
+    if (value === current) return;
+    current = value;
+    callback(value);
   };
   const unsubscribe = events.on(RUNTIME_REGISTER_EVENT, (value) => {
-    if (!isRecord(value) || value.version !== LANDSTRIP_RUNTIME_VERSION) return;
-    if (isRuntime(value.runtime)) register(value.runtime);
+    if (disposed) return;
+    if (!isRecord(value) || value.version !== LANDSTRIP_RUNTIME_VERSION) {
+      onInvalid?.(new Error('Invalid Landstrip runtime v2 registration'));
+      return;
+    }
+    register(value.runtime);
   });
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    unsubscribe();
+  };
   try {
     events.emit(RUNTIME_DISCOVER_EVENT, {
       version: LANDSTRIP_RUNTIME_VERSION,
       register,
     } satisfies RuntimeDiscovery);
-    return unsubscribe;
+    return dispose;
   } catch (error) {
-    unsubscribe();
+    dispose();
     throw error;
   }
+}
+
+export function useLandstrip(
+  pi: ExtensionAPI,
+  callback: (runtime: PiLandstripRuntimeV2) => void,
+): () => void {
+  return discoverLandstrip(pi, callback);
 }
 
 function provideExtensionProvider(
