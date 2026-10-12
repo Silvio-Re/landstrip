@@ -105,6 +105,11 @@ export interface LandstripPreparedProcess {
   dispose(): Promise<void>;
 }
 
+export interface Landstrip {
+  prepareProcess(options: LandstripProcessOptions): Promise<LandstripPreparedProcess | undefined>;
+  dispose(): void;
+}
+
 export interface LandstripRpcChildProcess {
   readonly stdin: Writable;
   readonly stdout: Readable;
@@ -184,6 +189,26 @@ function isRuntime(value: unknown): value is PiLandstripRuntimeV2 {
   );
 }
 
+function isDisposableProcess(value: unknown): value is Pick<LandstripPreparedProcess, 'dispose'> {
+  return isRecord(value) && typeof value.dispose === 'function';
+}
+
+function isPreparedProcess(value: unknown): value is LandstripPreparedProcess {
+  return (
+    isRecord(value) &&
+    typeof value.command === 'string' &&
+    value.command.trim().length > 0 &&
+    Array.isArray(value.args) &&
+    [...value.args].every((arg: unknown) => typeof arg === 'string') &&
+    typeof value.cwd === 'string' &&
+    value.cwd.length > 0 &&
+    isRecord(value.env) &&
+    Object.values(value.env).every((entry) => entry === undefined || typeof entry === 'string') &&
+    typeof value.spawn === 'function' &&
+    isDisposableProcess(value)
+  );
+}
+
 function discoverLandstrip(
   pi: ExtensionAPI,
   callback: (runtime: PiLandstripRuntimeV2) => void,
@@ -234,6 +259,80 @@ export function useLandstrip(
   callback: (runtime: PiLandstripRuntimeV2) => void,
 ): () => void {
   return discoverLandstrip(pi, callback);
+}
+
+export function createLandstrip(pi: ExtensionAPI): Landstrip {
+  let runtime: PiLandstripRuntimeV2 | undefined;
+  let runtimeError: Error | undefined;
+  let disposed = false;
+  const stopDiscovery = discoverLandstrip(
+    pi,
+    (value) => {
+      runtime = value;
+    },
+    (error) => {
+      runtimeError ??= error;
+    },
+  );
+  if (runtimeError) {
+    stopDiscovery();
+    throw runtimeError;
+  }
+
+  return {
+    async prepareProcess(options) {
+      if (disposed) throw new Error('Landstrip handle has been disposed');
+      if (runtimeError) throw runtimeError;
+      options.signal?.throwIfAborted();
+      if (!runtime) return undefined;
+
+      const prepared: unknown = await runtime.prepareProcess(options);
+      if (!isDisposableProcess(prepared)) {
+        throw new Error('Landstrip returned a process without a disposal method');
+      }
+      let disposePromise: Promise<void> | undefined;
+      const dispose = (): Promise<void> => {
+        disposePromise ??= Promise.resolve().then(() => prepared.dispose());
+        return disposePromise;
+      };
+      try {
+        options.signal?.throwIfAborted();
+        if (disposed) throw new Error('Landstrip handle has been disposed');
+        if (runtimeError) throw runtimeError;
+        if (!isPreparedProcess(prepared)) {
+          throw new Error('Landstrip returned an invalid prepared process');
+        }
+      } catch (error) {
+        try {
+          await dispose();
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            'Landstrip process preparation cleanup failed',
+          );
+        }
+        throw error;
+      }
+
+      return {
+        command: prepared.command,
+        args: prepared.args,
+        cwd: prepared.cwd,
+        env: prepared.env,
+        spawn(command, args, spawnOptions) {
+          if (disposePromise) throw new Error('Prepared Landstrip process has been disposed');
+          return prepared.spawn(command, args, spawnOptions);
+        },
+        dispose,
+      };
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      stopDiscovery();
+      runtime = undefined;
+    },
+  };
 }
 
 function provideExtensionProvider(

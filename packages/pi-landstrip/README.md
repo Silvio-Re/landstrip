@@ -112,6 +112,10 @@ Provider credential files still need filesystem permission.
 From this package: `npm ci`, then `npm run all` (format, lint, typecheck, build,
 and tests; building requires Bun). For a read-only formatting check: `npm run ci:fmt`.
 
+Extension consumers can import `createLandstrip` from `pi-landstrip/api`.
+Its `prepareProcess` returns `undefined` without a loaded runtime; callers dispose
+prepared processes separately from the discovery handle.
+
 ## License
 
 Apache-2.0; see [LICENSE](LICENSE).
