@@ -9,7 +9,7 @@ pub(super) use doctor::{probe_null_device, status};
 
 use super::{
     NamedMutex, SandboxJob, ToWideNul, is_locked_error, join_command_line, own_handle,
-    path_access_failed, quote_command_text, set_path_access, wait_process_exit, win32_error,
+    path_access_failed, quote_command_arg, set_path_access, wait_process_exit, win32_error,
     win32_status,
 };
 use crate::config::AppContainerMode;
@@ -79,7 +79,7 @@ const NETWORK_CAPABILITY_SIDS: [WELL_KNOWN_SID_TYPE; 3] = [
 
 /// The Win32 error an `HRESULT` carries, when it carries one at all.
 fn hresult_win32(hr: i32) -> Option<u16> {
-    let hresult = hresult_value(hr);
+    let hresult = hr.cast_unsigned();
 
     ((hresult >> 16) & 0x7ff == FACILITY_WIN32).then_some((hresult & 0xffff) as u16)
 }
@@ -92,7 +92,7 @@ fn hresult_win32(hr: i32) -> Option<u16> {
 fn hresult_cause(hr: i32) -> Cause {
     match hresult_win32(hr).map(|code| io::Error::from_raw_os_error(i32::from(code))) {
         Some(error) => error.into(),
-        None => format!("HRESULT 0x{:08x}", hresult_value(hr)).into(),
+        None => format!("HRESULT 0x{:08x}", hr.cast_unsigned()).into(),
     }
 }
 
@@ -672,7 +672,7 @@ fn inheritable_standard_handle(
     source: HANDLE,
     direction: StandardHandleDirection,
 ) -> Result<OwnedHandle> {
-    if !is_real_handle_value(source as isize) || !is_io_file_type(unsafe { GetFileType(source) }) {
+    if source as isize <= 0 || !is_io_file_type(unsafe { GetFileType(source) }) {
         return inheritable_null_handle(direction);
     }
 
@@ -697,7 +697,7 @@ fn inheritable_standard_handle(
         .into());
     }
     let duplicate = unsafe { own_handle(duplicate) };
-    if !is_real_handle_value(duplicate.as_raw_handle() as isize)
+    if duplicate.as_raw_handle() as isize <= 0
         || !is_io_file_type(unsafe { GetFileType(duplicate.as_raw_handle()) })
     {
         return inheritable_null_handle(direction);
@@ -745,10 +745,6 @@ fn inheritable_null_handle(direction: StandardHandleDirection) -> Result<OwnedHa
     Ok(unsafe { own_handle(handle) })
 }
 
-fn is_real_handle_value(value: isize) -> bool {
-    value > 0
-}
-
 fn is_io_file_type(file_type: u32) -> bool {
     matches!(file_type, FILE_TYPE_CHAR | FILE_TYPE_DISK | FILE_TYPE_PIPE)
 }
@@ -769,7 +765,7 @@ fn create_process_in_appcontainer(
         | (1u64 << 48)  // FontDisable
         | (1u64 << 52); // ImageLoadNoRemote
     let command_line = join_command_line(tool, args, |arg| {
-        quote_command_text(&arg.to_string_lossy())
+        quote_command_arg(&arg.to_string_lossy())
             .map_err(|message| LandstripError::launch(tool, message))
     })?;
     let mut startup_info = unsafe { mem::zeroed::<STARTUPINFOEXW>() };
@@ -872,21 +868,23 @@ fn launch_process(
 ) -> Result<PROCESS_INFORMATION> {
     match create_process(command_line, startup_info, EXTENDED_STARTUPINFO_PRESENT) {
         Ok(process_info) => Ok(process_info),
-        Err(source) if in_host_job && is_access_denied(&source) => create_process(
-            command_line,
-            startup_info,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_BREAKAWAY_FROM_JOB,
-        )
-        .map_err(|source| {
-            if is_access_denied(&source) {
-                LandstripError::HostJobIncompatible {
-                    source: source.into(),
+        Err(source) if in_host_job && win32_status(&source) == Some(ERROR_ACCESS_DENIED) => {
+            create_process(
+                command_line,
+                startup_info,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_BREAKAWAY_FROM_JOB,
+            )
+            .map_err(|source| {
+                if win32_status(&source) == Some(ERROR_ACCESS_DENIED) {
+                    LandstripError::HostJobIncompatible {
+                        source: source.into(),
+                    }
+                    .into()
+                } else {
+                    LandstripError::launch(tool, source).into()
                 }
-                .into()
-            } else {
-                LandstripError::launch(tool, source).into()
-            }
-        }),
+            })
+        }
         Err(source) => Err(LandstripError::launch(tool, source).into()),
     }
 }
@@ -916,10 +914,6 @@ fn create_process(
         return Err(io::Error::last_os_error());
     }
     Ok(process_info)
-}
-
-fn is_access_denied(error: &io::Error) -> bool {
-    win32_status(error) == Some(ERROR_ACCESS_DENIED)
 }
 
 fn update_attribute(
@@ -1052,8 +1046,4 @@ impl NetworkCapabilities {
     fn count(&self) -> u32 {
         u32::try_from(self.entries.len()).unwrap_or(0)
     }
-}
-
-fn hresult_value(hr: i32) -> u32 {
-    hr.cast_unsigned()
 }

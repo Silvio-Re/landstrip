@@ -312,16 +312,19 @@ fn hex_digit(value: u8) -> Result<u8, &'static str> {
 
 /// Quote one argument for `CreateProcessW` / `CommandLineToArgvW`.
 ///
-/// `arg` must not contain an interior NUL.
-pub(crate) fn quote_command_arg(arg: &str) -> String {
+/// Quote one already-decoded argument. `arg` must not contain an interior NUL.
+pub(crate) fn quote_command_arg(arg: &str) -> Result<String, &'static str> {
+    if arg.contains('\0') {
+        return Err("command line contains an interior NUL byte");
+    }
     if arg.is_empty() {
-        return "\"\"".to_owned();
+        return Ok("\"\"".to_owned());
     }
     if !arg
         .bytes()
         .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\"'))
     {
-        return arg.to_owned();
+        return Ok(arg.to_owned());
     }
 
     let mut quoted = String::from("\"");
@@ -343,15 +346,7 @@ pub(crate) fn quote_command_arg(arg: &str) -> String {
     }
     quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
     quoted.push('"');
-    quoted
-}
-
-/// Quote one already-decoded argument. `arg` must not contain an interior NUL.
-pub(crate) fn quote_command_text(arg: &str) -> Result<String, &'static str> {
-    if arg.contains('\0') {
-        return Err("command line contains an interior NUL byte");
-    }
-    Ok(quote_command_arg(arg))
+    Ok(quoted)
 }
 
 /// Join a tool and arguments into a `CreateProcessW` command line.
@@ -383,20 +378,18 @@ pub(crate) fn win32_status(error: &io::Error) -> Option<u32> {
     error.raw_os_error().map(i32::cast_unsigned)
 }
 
-pub(crate) fn is_missing_status(status: u32) -> bool {
-    status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND
-}
-
-pub(crate) fn is_locked_status(status: u32) -> bool {
-    status == ERROR_SHARING_VIOLATION || status == ERROR_ACCESS_DENIED
-}
-
 pub(crate) fn is_missing_error(error: &io::Error) -> bool {
-    win32_status(error).is_some_and(is_missing_status)
+    matches!(
+        win32_status(error),
+        Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+    )
 }
 
 pub(crate) fn is_locked_error(error: &io::Error) -> bool {
-    win32_status(error).is_some_and(is_locked_status)
+    matches!(
+        win32_status(error),
+        Some(ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED)
+    )
 }
 
 /// Format an ACL apply failure for `path`.

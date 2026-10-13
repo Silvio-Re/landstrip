@@ -6,7 +6,7 @@
 use super::state;
 use super::{
     OwnedSecurityDescriptor, ToWideNul, current_process_token, join_command_line, own_handle,
-    quote_command_text, sid_string, token_user, wait_process_exit,
+    quote_command_arg, sid_string, token_user, wait_process_exit,
 };
 use crate::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result, bail};
@@ -110,7 +110,7 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
         let arg = arg
             .to_str()
             .context("restricted-user command line is not valid Unicode")?;
-        quote_command_text(arg)
+        quote_command_arg(arg)
             .map_err(|_| anyhow::anyhow!("restricted-user command line contains an interior NUL"))
     })?;
     let mut command_line = command_line.to_wide_nul();

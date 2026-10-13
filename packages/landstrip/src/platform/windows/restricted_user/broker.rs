@@ -100,12 +100,6 @@ fn quote(value: &OsStr) -> Result<String> {
     let value = value
         .to_str()
         .context("restricted-user worker path is not valid Unicode")?;
-    if value.contains('\0') {
-        return Err(LandstripError::sandbox_setup(
-            Mechanism::Windowsuser,
-            "restricted-user worker path contains an interior NUL",
-        )
-        .into());
-    }
-    Ok(quote_command_arg(value))
+    quote_command_arg(value)
+        .map_err(|msg| LandstripError::sandbox_setup(Mechanism::Windowsuser, msg).into())
 }

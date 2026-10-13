@@ -175,11 +175,11 @@ enum WindowsAction {
 #[derive(Debug, Args)]
 struct WindowsInstallArgs {
     /// Restricted-network account pool size.
-    #[arg(long, default_value_t = 8, value_parser = parse_restricted_accounts)]
+    #[arg(long, default_value_t = 8, value_parser = |v: &str| parse_count(v, 1, "restricted accounts"))]
     restricted_accounts: u16,
 
     /// Unrestricted-network account pool size.
-    #[arg(long, default_value_t = 2, value_parser = parse_unrestricted_accounts)]
+    #[arg(long, default_value_t = 2, value_parser = |v: &str| parse_count(v, 0, "unrestricted accounts"))]
     unrestricted_accounts: u16,
 
     /// Permitted loopback proxy port range.
@@ -380,16 +380,6 @@ fn parse_fd(value: &str) -> Result<i32, String> {
     }
 
     Ok(fd)
-}
-
-#[cfg(target_os = "windows")]
-fn parse_restricted_accounts(value: &str) -> Result<u16, String> {
-    parse_count(value, 1, "restricted accounts")
-}
-
-#[cfg(target_os = "windows")]
-fn parse_unrestricted_accounts(value: &str) -> Result<u16, String> {
-    parse_count(value, 0, "unrestricted accounts")
 }
 
 #[cfg(target_os = "windows")]
