@@ -57,9 +57,12 @@ impl TrapFd {
     }
 
     pub(crate) fn write(&self, trap: &Trap) -> io::Result<()> {
-        self.write_json(&trap.to_string())
+        let mut line = trap.to_json();
+        line.push('\n');
+        self.write_all(line.as_bytes())
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn write_json(&self, json: &str) -> io::Result<()> {
         let mut line = String::with_capacity(json.len() + 1);
         line.push_str(json);

@@ -236,6 +236,17 @@ impl Trap {
         })
     }
 
+    pub(crate) fn to_json(&self) -> String {
+        match serde_json::to_string(self) {
+            Ok(line) => line,
+            Err(error) => {
+                log::error!("trap: serialize: {error}");
+                r#"{"kind":"internal","code":"INTERNAL_ERROR","message":"failed to serialize trap"}"#
+                    .to_owned()
+            }
+        }
+    }
+
     pub(crate) fn emit(&self) {
         let _ = writeln!(io::stderr().lock(), "{self}");
     }
@@ -276,15 +287,7 @@ impl From<&Error> for Trap {
 
 impl fmt::Display for Trap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match serde_json::to_string(self) {
-            Ok(line) => f.write_str(&line),
-            Err(error) => {
-                log::error!("trap: serialize: {error}");
-                f.write_str(
-                    r#"{"kind":"internal","code":"INTERNAL_ERROR","message":"failed to serialize trap"}"#,
-                )
-            }
-        }
+        f.write_str(&self.to_json())
     }
 }
 
