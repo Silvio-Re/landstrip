@@ -71,11 +71,11 @@ fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
     match &invocation.command {
         Command::Run(command) => run(command),
         Command::Policy(command) => inspect_policy(command),
-        Command::Doctor => platform::doctor().map(CommandOutcome::Doctor),
+        Command::Doctor => platform::doctor().map(CommandOutcome::from),
         #[cfg(target_os = "windows")]
-        Command::Windows(command) => platform::manage_windows(command).map(CommandOutcome::Windows),
+        Command::Windows(command) => platform::manage_windows(command).map(CommandOutcome::from),
         #[cfg(target_os = "windows")]
-        Command::Worker { request } => platform::run_worker(request).map(CommandOutcome::Exit),
+        Command::Worker { request } => platform::run_worker(request).map(CommandOutcome::from),
     }
 }
 
@@ -97,7 +97,7 @@ fn run(command: &RunCommand) -> Result<CommandOutcome> {
     #[cfg(not(unix))]
     let result = platform::execute(&policy, &command.tool, &command.tool_args);
 
-    result.map(CommandOutcome::Exit)
+    result.map(CommandOutcome::from)
 }
 
 fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
@@ -105,11 +105,11 @@ fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
         PolicyCommand::Validate(request) => {
             let result = load_policy(&request.policy, request.tool.as_deref())
                 .and_then(|policy| platform::validate(&policy));
-            policy_validation_report(result).map(CommandOutcome::PolicyValidated)
+            policy_validation_report(result).map(CommandOutcome::from)
         }
         PolicyCommand::Resolve(request) => {
             let policy = load_policy(&request.policy, request.tool.as_deref())?;
-            Ok(CommandOutcome::PolicyResolved(Box::new(policy)))
+            Ok(CommandOutcome::from(policy))
         }
     }
 }

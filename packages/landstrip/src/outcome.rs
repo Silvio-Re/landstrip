@@ -119,17 +119,44 @@ impl CommandOutcome {
 
     pub(crate) fn write_to(&self, mut output: impl Write) -> io::Result<()> {
         match self {
-            Self::Exit(_) => Ok(()),
-            Self::PolicyValidated(report) => write_json(&mut output, report),
-            Self::PolicyResolved(policy) => write_json(&mut output, policy),
-            Self::Doctor(report) => write_json(&mut output, report),
+            Self::Exit(_) => return Ok(()),
+            Self::PolicyValidated(report) => serde_json::to_writer(&mut output, report)?,
+            Self::PolicyResolved(policy) => serde_json::to_writer(&mut output, policy)?,
+            Self::Doctor(report) => serde_json::to_writer(&mut output, report)?,
             #[cfg(target_os = "windows")]
-            Self::Windows(report) => write_json(&mut output, report),
+            Self::Windows(report) => serde_json::to_writer(&mut output, report)?,
         }
+        writeln!(output)
     }
 }
 
-fn write_json(output: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
-    serde_json::to_writer(&mut *output, value)?;
-    writeln!(output)
+impl From<i32> for CommandOutcome {
+    fn from(code: i32) -> Self {
+        Self::Exit(code)
+    }
+}
+
+impl From<PolicyValidationReport> for CommandOutcome {
+    fn from(report: PolicyValidationReport) -> Self {
+        Self::PolicyValidated(report)
+    }
+}
+
+impl From<AccessPolicy> for CommandOutcome {
+    fn from(policy: AccessPolicy) -> Self {
+        Self::PolicyResolved(Box::new(policy))
+    }
+}
+
+impl From<DoctorReport> for CommandOutcome {
+    fn from(report: DoctorReport) -> Self {
+        Self::Doctor(report)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl From<WindowsStatusReport> for CommandOutcome {
+    fn from(report: WindowsStatusReport) -> Self {
+        Self::Windows(report)
+    }
 }
