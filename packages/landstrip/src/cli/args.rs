@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use crate::config::PolicyFormat;
-use crate::error::Error;
+#[allow(unused_imports)]
+use crate::error::{Error, Mechanism};
 #[cfg(target_os = "windows")]
 use crate::platform::WindowsCommand;
 #[cfg(unix)]
@@ -332,7 +333,8 @@ impl From<PolicyRequestArgs> for PolicyRequest {
 
 #[cfg(target_os = "windows")]
 fn is_restricted_user_runner() -> Result<bool, Error> {
-    let executable = env::current_exe()?;
+    let executable = env::current_exe()
+        .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     Ok(executable
         .file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case(RESTRICTED_USER_RUNNER)))

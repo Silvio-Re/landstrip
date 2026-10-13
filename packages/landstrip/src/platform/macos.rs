@@ -4,7 +4,7 @@
 //! macOS Seatbelt (SBPL) sandbox platform.
 
 use super::unix::close_inherited_fds;
-use crate::error::{Error, Mechanism};
+use crate::error::Error;
 use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
@@ -27,31 +27,27 @@ pub(crate) fn execute(
     trap_fd: Option<&TrapFd>,
     inherited_fds: &[std::os::fd::RawFd],
 ) -> Result<i32> {
-    let profile = render_profile(policy).map_err(seatbelt_error)?;
+    let profile = render_profile(policy).map_err(Error::seatbelt)?;
     apply_profile(&profile)?;
     close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd).as_slice(), inherited_fds)
-        .map_err(seatbelt_error)?;
+        .map_err(Error::seatbelt)?;
     let error = Command::new(tool).args(args).exec();
     Err(Error::launch(tool, error).into())
 }
 
 pub(crate) fn doctor() -> Result<()> {
-    let operation = CString::new("file-read-data").map_err(seatbelt_error)?;
+    let operation = CString::new("file-read-data").map_err(Error::seatbelt)?;
     let result =
         unsafe { ffi::sandbox_check(libc::getpid(), operation.as_ptr(), SANDBOX_FILTER_NONE) };
     if result < 0 {
-        return Err(seatbelt_error(io::Error::last_os_error()));
+        return Err(Error::seatbelt(io::Error::last_os_error()).into());
     }
     Ok(())
 }
 
-fn seatbelt_error(source: impl Into<crate::error::Cause>) -> anyhow::Error {
-    Error::sandbox_setup(Mechanism::Seatbelt, source).into()
-}
-
 fn apply_profile(profile: &str) -> Result<()> {
     let profile = CString::new(profile).map_err(|source| {
-        seatbelt_error(format!(
+        Error::seatbelt(format!(
             "profile: interior nul at offset {}",
             source.nul_position()
         ))
@@ -64,7 +60,7 @@ fn apply_profile(profile: &str) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(seatbelt_error(take_sandbox_error(errorbuf)))
+        Err(Error::seatbelt(take_sandbox_error(errorbuf)).into())
     }
 }
 

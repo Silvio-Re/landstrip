@@ -132,6 +132,16 @@ impl Error {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn seatbelt(source: impl Into<Cause>) -> Self {
+        Self::sandbox_setup(Mechanism::Seatbelt, source)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn landlock(source: impl Into<Cause>) -> Self {
+        Self::sandbox_setup(Mechanism::Landlock, source)
+    }
+
     /// Supervising the sandboxed child failed.
     #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     pub(crate) fn supervise(source: impl Into<Cause>) -> Self {
@@ -292,12 +302,6 @@ impl StdError for Error {
             | Self::HostJobIncompatible { source } => Some(&**source),
             _ => None,
         }
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(source: io::Error) -> Self {
-        Self::PolicyIoFailed { source }
     }
 }
 

@@ -7,7 +7,7 @@
 //! This gives deny traversal snapshot semantics: a removed and recreated path is
 //! a new object unless an allowed ancestor covers it.
 
-use crate::error::{Error, Mechanism, PathIo};
+use crate::error::{Error, PathIo};
 use crate::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use landlock::{
@@ -45,11 +45,11 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy, restrict_read: bool) 
 
     let mut ruleset = Ruleset::default()
         .handle_access(handled_access_fs)
-        .map_err(landlock_error)?;
+        .map_err(Error::landlock)?;
     if !handled_access_net.is_empty() {
         ruleset = ruleset
             .handle_access(handled_access_net)
-            .map_err(landlock_error)?;
+            .map_err(Error::landlock)?;
     }
     // Host-created abstract Unix sockets (D-Bus, systemd) and signals to processes
     // outside the sandbox stay out of reach even when allowNetwork /
@@ -57,8 +57,8 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy, restrict_read: bool) 
     // Best-effort: kernels before ABI 6 ignore this and still get the seccomp denylist.
     ruleset = ruleset
         .scope(Scope::AbstractUnixSocket | Scope::Signal)
-        .map_err(landlock_error)?;
-    let mut created = ruleset.create().map_err(landlock_error)?;
+        .map_err(Error::landlock)?;
+    let mut created = ruleset.create().map_err(Error::landlock)?;
 
     created = add_path_rules(
         created,
@@ -75,7 +75,7 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy, restrict_read: bool) 
         created = add_network_rules(created, policy)?;
     }
 
-    let status = created.restrict_self().map_err(landlock_error)?;
+    let status = created.restrict_self().map_err(Error::landlock)?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => {}
         RulesetStatus::PartiallyEnforced => log::debug!(
@@ -83,10 +83,11 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy, restrict_read: bool) 
             partial_enforcement_warning(status.landlock, handled_access_fs, handled_access_net)
         ),
         RulesetStatus::NotEnforced => {
-            return Err(landlock_error(
+            return Err(Error::landlock(
                 "not enforced by the kernel (Linux 5.13+ with CONFIG_SECURITY_LANDLOCK required, \
                  and not disabled via the lsm= boot parameter)",
-            ));
+            )
+            .into());
         }
     }
     // Keep Scope::Signal even when unfixed: the erratum over-restricts same-process
@@ -100,10 +101,6 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy, restrict_read: bool) 
     }
 
     Ok(())
-}
-
-fn landlock_error(source: impl Into<crate::error::Cause>) -> anyhow::Error {
-    Error::sandbox_setup(Mechanism::Landlock, source).into()
 }
 
 fn partial_enforcement_warning(
@@ -183,7 +180,7 @@ fn add_path_rules(
                 );
                 continue;
             }
-            Err(error) => return Err(landlock_error(error)),
+            Err(error) => return Err(Error::landlock(error).into()),
         };
 
         let path_access = if fd_is_dir(&fd)? {
@@ -197,7 +194,7 @@ fn add_path_rules(
 
         ruleset = ruleset
             .add_rule(PathBeneath::new(fd, path_access))
-            .map_err(landlock_error)?;
+            .map_err(Error::landlock)?;
     }
 
     Ok(ruleset)
@@ -211,7 +208,7 @@ fn add_network_rules(mut ruleset: RulesetCreated, policy: &AccessPolicy) -> Resu
     for port in policy.network_access.connect_tcp_ports() {
         ruleset = ruleset
             .add_rule(NetPort::new(*port, AccessNet::ConnectTcp))
-            .map_err(landlock_error)?;
+            .map_err(Error::landlock)?;
     }
 
     Ok(ruleset)
@@ -223,7 +220,7 @@ fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {
         Err(error) if error.is_transport_failed() => {
             return Ok(false);
         }
-        Err(error) => return Err(landlock_error(error)),
+        Err(error) => return Err(Error::landlock(error).into()),
     };
 
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFDIR)
