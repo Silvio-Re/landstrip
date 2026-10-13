@@ -5,7 +5,6 @@ use crate::error::Error;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
-use std::error::Error as StdError;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
@@ -21,25 +20,25 @@ pub(crate) enum PolicyFormat {
 impl PolicyFormat {
     pub(crate) fn parse_document(self, document: &str) -> std::result::Result<Value, Error> {
         let mut value: Value = match self {
-            Self::Json => serde_json::from_str(document).map_err(parse_failed)?,
-            Self::Yaml => serde_yml::from_str(document).map_err(parse_failed)?,
+            Self::Json => serde_json::from_str(document).map_err(Error::parse_failed)?,
+            Self::Yaml => serde_yml::from_str(document).map_err(Error::parse_failed)?,
         };
         if !value.is_object()
             || value
                 .get("filesystem")
                 .is_some_and(|filesystem| !filesystem.is_object())
         {
-            return Err(parse_failed(io::Error::new(
+            return Err(Error::parse_failed(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "policy root and filesystem must be objects",
             )));
         }
         if let Some(paths) = value.pointer_mut("/filesystem/denyReadAlways") {
-            let resolved = deserialize_paths(paths.take()).map_err(parse_failed)?;
+            let resolved = deserialize_paths(paths.take()).map_err(Error::parse_failed)?;
             *paths = Value::Array(resolved.into_iter().map(Value::String).collect());
         }
         if let Some(paths) = value.pointer_mut("/filesystem/denyWriteAlways") {
-            let resolved = deserialize_paths(paths.take()).map_err(parse_failed)?;
+            let resolved = deserialize_paths(paths.take()).map_err(Error::parse_failed)?;
             *paths = Value::Array(resolved.into_iter().map(Value::String).collect());
         }
         Ok(value)
@@ -137,7 +136,7 @@ pub(crate) fn load_settings(
     }
 
     serde_json::from_value(merged)
-        .map_err(parse_failed)
+        .map_err(Error::parse_failed)
         .context("policy")
 }
 
@@ -161,7 +160,7 @@ fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<V
     };
 
     let document = String::from_utf8(bytes)
-        .map_err(parse_failed)
+        .map_err(Error::parse_failed)
         .with_context(|| format!("executable policy {}", exe.display()))?;
     let value = format
         .parse_document(&document)
@@ -199,22 +198,31 @@ const EXECUTABLE_POLICY_STREAM: &str = "landstrip.policy";
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn locate_executable(path: &Path) -> Option<PathBuf> {
-    is_executable_file(path).then(|| path.to_path_buf())
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .then(|| path.to_path_buf())
 }
 
 #[cfg(target_os = "windows")]
-fn locate_executable(path: &Path) -> Option<PathBuf> {
-    resolve_with_extensions(path)
+fn locate_executable(base: &Path) -> Option<PathBuf> {
+    if base.extension().is_some() {
+        return base.is_file().then(|| base.to_path_buf());
+    }
+
+    let pathext = std::env::var_os("PATHEXT")
+        .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD"));
+    std::env::split_paths(&pathext).find_map(|ext| {
+        let mut candidate = base.as_os_str().to_os_string();
+        candidate.push(ext);
+        let candidate = PathBuf::from(candidate);
+        candidate.is_file().then_some(candidate)
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn locate_executable(_path: &Path) -> Option<PathBuf> {
     None
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_policy_bytes(exe: &Path) -> Result<Option<Vec<u8>>> {
-    Ok(read_xattr(exe, EXECUTABLE_POLICY_XATTR)?)
 }
 
 #[cfg(target_os = "windows")]
@@ -235,30 +243,7 @@ fn read_policy_bytes(_exe: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(target_os = "windows")]
-fn resolve_with_extensions(base: &Path) -> Option<PathBuf> {
-    if base.extension().is_some() {
-        return base.is_file().then(|| base.to_path_buf());
-    }
-
-    let pathext = std::env::var_os("PATHEXT")
-        .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD"));
-    std::env::split_paths(&pathext).find_map(|ext| {
-        let mut candidate = base.as_os_str().to_os_string();
-        candidate.push(ext);
-        let candidate = PathBuf::from(candidate);
-        candidate.is_file().then_some(candidate)
-    })
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_xattr(path: &Path, name: &str) -> std::result::Result<Option<Vec<u8>>, Error> {
+fn read_policy_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -266,7 +251,7 @@ fn read_xattr(path: &Path, name: &str) -> std::result::Result<Option<Vec<u8>>, E
         CString::new(path.as_os_str().as_bytes()).map_err(|source| Error::PolicyIoFailed {
             source: io::Error::new(io::ErrorKind::InvalidInput, source),
         })?;
-    let c_name = CString::new(name).map_err(|source| Error::PolicyIoFailed {
+    let c_name = CString::new(EXECUTABLE_POLICY_XATTR).map_err(|source| Error::PolicyIoFailed {
         source: io::Error::new(io::ErrorKind::InvalidInput, source),
     })?;
 
@@ -311,7 +296,7 @@ fn read_xattr(path: &Path, name: &str) -> std::result::Result<Option<Vec<u8>>, E
 /// file — fails the invocation instead of silently skipping a policy that
 /// might have tightened access.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn classify_xattr_error() -> std::result::Result<Option<Vec<u8>>, Error> {
+fn classify_xattr_error() -> Result<Option<Vec<u8>>> {
     #[cfg(target_os = "linux")]
     let missing = libc::ENODATA;
     #[cfg(target_os = "macos")]
@@ -320,7 +305,7 @@ fn classify_xattr_error() -> std::result::Result<Option<Vec<u8>>, Error> {
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
         Some(code) if code == missing || code == libc::ENOENT => Ok(None),
-        _ => Err(Error::PolicyIoFailed { source: error }),
+        _ => Err(Error::PolicyIoFailed { source: error }.into()),
     }
 }
 
@@ -344,12 +329,6 @@ unsafe fn platform_getxattr(
     unsafe { libc::getxattr(path, name, value, size, 0, 0) }
 }
 
-fn parse_failed(source: impl StdError + Send + Sync + 'static) -> Error {
-    Error::PolicyParseFailed {
-        source: Box::new(source),
-    }
-}
-
 fn reject_windows_backend<'de, D>(deserializer: D) -> std::result::Result<(), D::Error>
 where
     D: Deserializer<'de>,
@@ -367,17 +346,7 @@ where
     D: Deserializer<'de>,
 {
     let input = Option::<PathInput>::deserialize(deserializer)?;
-
-    Ok(match input {
-        Some(PathInput::List(paths)) => paths,
-        Some(PathInput::Lines(lines)) => lines
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
-            .collect(),
-        None => Vec::new(),
-    })
+    Ok(input.map_or_else(Vec::new, PathInput::into_paths))
 }
 
 #[derive(Deserialize)]
@@ -385,6 +354,20 @@ where
 enum PathInput {
     List(Vec<String>),
     Lines(String),
+}
+
+impl PathInput {
+    fn into_paths(self) -> Vec<String> {
+        match self {
+            Self::List(paths) => paths,
+            Self::Lines(lines) => lines
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+        }
+    }
 }
 
 fn merge_json(base: &mut Value, overlay: Value) {

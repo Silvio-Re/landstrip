@@ -148,6 +148,12 @@ impl Error {
         }
     }
 
+    pub(crate) fn parse_failed(source: impl StdError + Send + Sync + 'static) -> Self {
+        Self::PolicyParseFailed {
+            source: Box::new(source),
+        }
+    }
+
     /// The stable, machine-routable code.
     pub(crate) fn code(&self) -> &'static str {
         self.into()
