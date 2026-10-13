@@ -946,7 +946,8 @@ function createLandstripIntegrationWithPrompts(
       typeof result !== 'object' ||
       result === null ||
       !('decision' in result) ||
-      !['allow', 'deny', 'abstain'].includes(String(result.decision)) ||
+      typeof result.decision !== 'string' ||
+      !['allow', 'deny', 'abstain'].includes(result.decision) ||
       ('reason' in result && result.reason !== undefined && typeof result.reason !== 'string')
     ) {
       throw new Error(`Permission ask provider "${provider.id}" returned an invalid decision`);

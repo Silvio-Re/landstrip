@@ -405,7 +405,8 @@ export function contextFromEnvironment(
       value.version !== LANDSTRIP_RUNTIME_VERSION ||
       value.host !== 'pi' ||
       value.role !== 'subagent' ||
-      !['enabled', 'disabled', 'unavailable'].includes(String(value.sandbox)) ||
+      typeof value.sandbox !== 'string' ||
+      !['enabled', 'disabled', 'unavailable'].includes(value.sandbox) ||
       typeof value.cwd !== 'string' ||
       !Number.isInteger(value.depth) ||
       (value.depth as number) < 0 ||
