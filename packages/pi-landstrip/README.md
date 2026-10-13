@@ -115,6 +115,8 @@ and tests; building requires Bun). For a read-only formatting check: `npm run ci
 Extension consumers can import `createLandstrip` from `pi-landstrip/api`.
 Its `prepareProcess` returns `undefined` without a loaded runtime; callers dispose
 prepared processes separately from the discovery handle.
+Generic process spawning returns a Node.js `ChildProcess`, including its PID and
+`close` event. RPC workers retain their separate piped-stream child contract.
 
 ## License
 

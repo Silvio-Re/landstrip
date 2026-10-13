@@ -117,6 +117,7 @@ import {
   type LandstripShellInvocation,
   type LandstripShellPrepareOptions,
   type LandstripShellProvider,
+  type LandstripSpawn,
   type LandstripWorkerExtension,
   LANDSTRIP_RUNTIME_VERSION,
   type PiLandstripRuntimeV2,
@@ -787,7 +788,7 @@ export interface LandstripRpcWorkerOptions extends LandstripProcessOptions {
   readonly domains?: readonly string[];
 }
 
-export interface LandstripRpcWorkerLaunch extends LandstripPreparedProcess {
+export interface LandstripRpcWorkerLaunch extends Omit<LandstripPreparedProcess, 'spawn'> {
   readonly spawn: RpcSpawn;
 }
 
@@ -1555,14 +1556,12 @@ function createLandstripIntegrationWithPrompts(
     });
   }
 
-  function prepareUnsandboxedRpcWorker(
-    options: LandstripRpcWorkerOptions,
-  ): LandstripRpcWorkerLaunch {
+  function prepareUnsandboxedProcess(options: LandstripRpcWorkerOptions): LandstripPreparedProcess {
     let spawned = false;
     let disposed = false;
     let disposePromise: Promise<void> | undefined;
     let preparedChild: ChildProcess | undefined;
-    const spawnWorker: RpcSpawn = (command, args, spawnOptions) => {
+    const spawnWorker: LandstripSpawn = (command, args, spawnOptions) => {
       if (disposed) throw new Error('Prepared process has been disposed');
       if (spawned) throw new Error('Prepared process can only be spawned once');
       spawned = true;
@@ -1574,7 +1573,7 @@ function createLandstripIntegrationWithPrompts(
       });
       patchProcessGroupKill(child);
       preparedChild = child;
-      return child as ReturnType<RpcSpawn>;
+      return child;
     };
 
     return {
@@ -1593,9 +1592,9 @@ function createLandstripIntegrationWithPrompts(
     };
   }
 
-  async function prepareRpcWorker(
+  async function prepareManagedProcess(
     options: LandstripRpcWorkerOptions,
-  ): Promise<LandstripRpcWorkerLaunch> {
+  ): Promise<LandstripPreparedProcess> {
     if (options.signal?.aborted) throw new Error('Task cancelled');
     if (!ensureSandboxState(options.ctx)) {
       if (sandboxState === 'unavailable') {
@@ -1609,7 +1608,7 @@ function createLandstripIntegrationWithPrompts(
         );
         unsandboxedWorkerWarningShown = true;
       }
-      return prepareUnsandboxedRpcWorker(options);
+      return prepareUnsandboxedProcess(options);
     }
     const allowances: ExecutionAllowances = {
       permissionPromptLabel: options.permissionPromptLabel,
@@ -1713,7 +1712,7 @@ function createLandstripIntegrationWithPrompts(
     const workerEnv = createProxyEnvironment(proxy?.port ?? null, proxyToken, options.env ?? {});
     let spawned = false;
     let disposePromise: Promise<void> | undefined;
-    const spawnWorker: RpcSpawn = (_command, _args, spawnOptions) => {
+    const spawnWorker: LandstripSpawn = (_command, _args, spawnOptions) => {
       if (disposed) throw new Error('Prepared process has been disposed');
       if (spawned) throw new Error('Prepared process can only be spawned once');
       spawned = true;
@@ -1747,7 +1746,7 @@ function createLandstripIntegrationWithPrompts(
       preparedChild = child;
       patchProcessGroupKill(child);
       workerChildEnd?.destroy();
-      return child as ReturnType<RpcSpawn>;
+      return child;
     };
 
     return {
@@ -1769,13 +1768,25 @@ function createLandstripIntegrationWithPrompts(
     };
   }
 
+  async function prepareRpcWorker(
+    options: LandstripRpcWorkerOptions,
+  ): Promise<LandstripRpcWorkerLaunch> {
+    const prepared = await prepareManagedProcess(options);
+    return {
+      ...prepared,
+      spawn(command, args, spawnOptions) {
+        return prepared.spawn(command, args, spawnOptions) as ReturnType<RpcSpawn>;
+      },
+    };
+  }
+
   async function prepareProcess(
     options: LandstripProcessOptions,
   ): Promise<LandstripPreparedProcess> {
     if (process.platform === 'win32' && (getNoSandboxFlag() || !loadConfig(options.cwd).enabled)) {
       throw new Error('Generic process preparation requires sandboxing on Windows');
     }
-    return prepareRpcWorker({
+    return prepareManagedProcess({
       ...options,
       env: options.env ?? process.env,
       readPaths: options.readPaths ?? [],

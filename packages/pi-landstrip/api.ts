@@ -131,7 +131,7 @@ export type LandstripSpawn = (
   command: string,
   args: readonly string[],
   options: SpawnOptions,
-) => ChildProcess | LandstripRpcChildProcess;
+) => ChildProcess;
 
 export type LandstripEvent =
   | { readonly type: 'sandbox.changed'; readonly context: LandstripContextV2 }
