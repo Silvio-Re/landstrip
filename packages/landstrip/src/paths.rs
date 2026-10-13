@@ -28,13 +28,18 @@ impl PathCoverage for Path {
     }
 }
 
-pub(crate) fn normalize_roots(paths: &mut Vec<PathBuf>) {
-    for path in paths.iter_mut() {
-        *path = normalize_path_lexically(path);
-    }
+pub(crate) trait NormalizeRoots {
+    fn normalize_roots(&mut self);
+}
 
-    paths.sort_unstable();
-    paths.dedup();
+impl NormalizeRoots for Vec<PathBuf> {
+    fn normalize_roots(&mut self) {
+        for path in self.iter_mut() {
+            *path = normalize_path_lexically(path);
+        }
+        self.sort_unstable();
+        self.dedup();
+    }
 }
 
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {

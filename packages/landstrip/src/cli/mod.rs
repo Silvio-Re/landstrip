@@ -148,12 +148,7 @@ fn load_policy(input: &PolicyInput, tool: Option<&std::ffi::OsStr>) -> Result<Ac
     let cwd = std::env::current_dir()?;
     log::debug!("cli: cwd: {}", cwd.display());
     let settings = load_settings(&input.paths, format, tool)?;
-    crate::policy::resolve_policy(
-        &settings.filesystem,
-        &settings.network,
-        &settings.windows,
-        &cwd,
-    )
+    settings.resolve(&cwd)
 }
 
 fn exit_with_error(

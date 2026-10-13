@@ -15,9 +15,9 @@
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
 //! while lowering the policy.
 
-use crate::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows};
+use crate::config::{AppContainerMode, SandboxNetwork, Settings};
 use crate::error::{Error, PathIo};
-use crate::paths::{PathCoverage, normalize_path, normalize_path_lexically, normalize_roots};
+use crate::paths::{NormalizeRoots, PathCoverage, normalize_path, normalize_path_lexically};
 use anyhow::Result;
 use serde::Serialize;
 use std::env;
@@ -68,7 +68,7 @@ impl AccessPolicy {
             || self
                 .write_denied_patterns
                 .iter()
-                .any(|pattern| path_matches_glob_str(lexical, pattern))
+                .any(|pattern| GlobPattern::new(pattern).matches_path(lexical))
     }
 
     /// Why a write to `canonical` is mediated, or `None` when the policy permits
@@ -284,100 +284,121 @@ impl UnixSocketAccess {
     }
 }
 
-pub(crate) fn resolve_policy(
-    filesystem: &SandboxFilesystem,
-    network: &SandboxNetwork,
-    windows: &SandboxWindows,
-    policy_base: &Path,
-) -> Result<AccessPolicy> {
-    #[cfg(target_os = "windows")]
-    if !filesystem.deny_read_always.is_empty() {
-        return Err(Error::PolicyDenyReadAlwaysUnsupported.into());
+impl Settings {
+    pub(crate) fn resolve(&self, policy_base: &Path) -> Result<AccessPolicy> {
+        let filesystem = &self.filesystem;
+        let network = &self.network;
+        let windows = &self.windows;
+
+        #[cfg(target_os = "windows")]
+        if !filesystem.deny_read_always.is_empty() {
+            return Err(Error::PolicyDenyReadAlwaysUnsupported.into());
+        }
+        #[cfg(target_os = "windows")]
+        if !filesystem.deny_write_always.is_empty() {
+            return Err(Error::PolicyDenyWriteAlwaysUnsupported.into());
+        }
+        let home_dir = dirs::home_dir();
+        let home = home_dir.as_deref();
+        let policy_base = if policy_base.is_absolute() {
+            policy_base.to_path_buf()
+        } else {
+            env::current_dir()?.join(policy_base)
+        };
+        let policy_base = normalize_path_lexically(&policy_base);
+
+        let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
+        // Missing Windows allow roots cannot receive ACL entries. Dropping them is
+        // fail-closed because sandbox SIDs receive no access to those paths.
+        #[cfg(target_os = "windows")]
+        let write_allow = write_allow
+            .into_iter()
+            .filter(|path| path.try_exists().unwrap_or(false))
+            .collect::<Vec<_>>();
+        let resolved_deny = resolve_deny_paths(&filesystem.deny_write, &policy_base, home)?;
+        let mut write_deny = resolved_deny.concrete;
+        let write_denied_patterns = resolved_deny.patterns;
+        let mut write_denied_links =
+            collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
+        let write_denied_always_roots =
+            resolve_paths(&filesystem.deny_write_always, &policy_base, home)?;
+        let write_allow: Vec<_> = write_allow
+            .into_iter()
+            .filter(|path| !path.is_under_any(&write_denied_always_roots))
+            .collect();
+        write_deny.extend(write_denied_always_roots.iter().cloned());
+        write_deny.normalize_roots();
+        let write_always_links =
+            collect_symlink_ancestors(&filesystem.deny_write_always, &policy_base, home)?;
+        write_denied_links.extend(write_always_links);
+        write_denied_links.sort_unstable();
+        write_denied_links.dedup();
+
+        let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
+        #[cfg(target_os = "windows")]
+        let read_allow = read_allow
+            .into_iter()
+            .filter(|path| path.try_exists().unwrap_or(false))
+            .collect::<Vec<_>>();
+
+        let mut read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
+        let mut read_denied_roots = effective_denied_roots(&read_deny, &read_allow);
+        let read_denied_always_roots =
+            resolve_paths(&filesystem.deny_read_always, &policy_base, home)?;
+        let read_allow: Vec<_> = read_allow
+            .into_iter()
+            .filter(|path| !path.is_under_any(&read_denied_always_roots))
+            .collect();
+        read_deny.extend(read_denied_always_roots.iter().cloned());
+        read_deny.normalize_roots();
+        // Windows cannot attach deny entries to missing paths.
+        #[cfg(target_os = "windows")]
+        read_denied_roots.retain(|path| path.try_exists().unwrap_or(true));
+
+        #[cfg(target_os = "windows")]
+        let (write_allow, write_deny) = {
+            let write_roots = lower_windows_write_access(&write_allow, write_deny, &read_deny)?;
+            (write_roots.allow, write_roots.deny)
+        };
+
+        let lowered_read = lower_read_access(&read_allow, &read_deny, &mut read_denied_roots)?;
+        let (read_access, read_symlinks) = (lowered_read.access, lowered_read.symlinks);
+        read_denied_roots.extend(read_denied_always_roots.iter().cloned());
+        read_denied_roots.normalize_roots();
+        let policy = AccessPolicy {
+            write_roots: write_allow,
+            write_denied_roots: write_deny,
+            write_denied_always_roots: write_denied_always_roots.into_boxed_slice(),
+            write_denied_patterns,
+            write_denied_links,
+            read_access,
+            read_denied_roots,
+            read_denied_always_roots: read_denied_always_roots.into_boxed_slice(),
+            read_symlinks,
+            network_access: lower_network_policy(network, &policy_base, home)?,
+            app_container_mode: windows.app_container_mode,
+            allow_windows_loopback: windows.allow_loopback,
+        };
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        policy.validate()?;
+        Ok(policy)
     }
-    #[cfg(target_os = "windows")]
-    if !filesystem.deny_write_always.is_empty() {
-        return Err(Error::PolicyDenyWriteAlwaysUnsupported.into());
-    }
-    let home_dir = dirs::home_dir();
-    let home = home_dir.as_deref();
-    let policy_base = if policy_base.is_absolute() {
-        policy_base.to_path_buf()
-    } else {
-        env::current_dir()?.join(policy_base)
-    };
-    let policy_base = normalize_path_lexically(&policy_base);
+}
 
-    let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
-    // Missing Windows allow roots cannot receive ACL entries. Dropping them is
-    // fail-closed because sandbox SIDs receive no access to those paths.
-    #[cfg(target_os = "windows")]
-    let write_allow = write_allow
-        .into_iter()
-        .filter(|path| path.try_exists().unwrap_or(false))
-        .collect::<Vec<_>>();
-    let (mut write_deny, write_denied_patterns) =
-        resolve_deny_paths(&filesystem.deny_write, &policy_base, home)?;
-    let mut write_denied_links =
-        collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
-    let write_denied_always_roots =
-        resolve_paths(&filesystem.deny_write_always, &policy_base, home)?;
-    let write_allow: Vec<_> = write_allow
-        .into_iter()
-        .filter(|path| !path.is_under_any(&write_denied_always_roots))
-        .collect();
-    write_deny.extend(write_denied_always_roots.iter().cloned());
-    normalize_roots(&mut write_deny);
-    let write_always_links =
-        collect_symlink_ancestors(&filesystem.deny_write_always, &policy_base, home)?;
-    write_denied_links.extend(write_always_links);
-    write_denied_links.sort_unstable();
-    write_denied_links.dedup();
+struct LoweredReadAccess {
+    access: ReadAccess,
+    symlinks: Vec<PathBuf>,
+}
 
-    let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
-    #[cfg(target_os = "windows")]
-    let read_allow = read_allow
-        .into_iter()
-        .filter(|path| path.try_exists().unwrap_or(false))
-        .collect::<Vec<_>>();
+struct ResolvedDenyPaths {
+    concrete: Vec<PathBuf>,
+    patterns: Vec<String>,
+}
 
-    let mut read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
-    let mut read_denied_roots = effective_denied_roots(&read_deny, &read_allow);
-    let read_denied_always_roots = resolve_paths(&filesystem.deny_read_always, &policy_base, home)?;
-    let read_allow: Vec<_> = read_allow
-        .into_iter()
-        .filter(|path| !path.is_under_any(&read_denied_always_roots))
-        .collect();
-    read_deny.extend(read_denied_always_roots.iter().cloned());
-    normalize_roots(&mut read_deny);
-    // Windows cannot attach deny entries to missing paths.
-    #[cfg(target_os = "windows")]
-    read_denied_roots.retain(|path| path.try_exists().unwrap_or(true));
-
-    #[cfg(target_os = "windows")]
-    let (write_allow, write_deny) =
-        lower_windows_write_access(&write_allow, write_deny, &read_deny)?;
-
-    let (read_access, read_symlinks) =
-        lower_read_access(&read_allow, &read_deny, &mut read_denied_roots)?;
-    read_denied_roots.extend(read_denied_always_roots.iter().cloned());
-    normalize_roots(&mut read_denied_roots);
-    let policy = AccessPolicy {
-        write_roots: write_allow,
-        write_denied_roots: write_deny,
-        write_denied_always_roots: write_denied_always_roots.into_boxed_slice(),
-        write_denied_patterns,
-        write_denied_links,
-        read_access,
-        read_denied_roots,
-        read_denied_always_roots: read_denied_always_roots.into_boxed_slice(),
-        read_symlinks,
-        network_access: lower_network_policy(network, &policy_base, home)?,
-        app_container_mode: windows.app_container_mode,
-        allow_windows_loopback: windows.allow_loopback,
-    };
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    policy.validate()?;
-    Ok(policy)
+#[cfg(target_os = "windows")]
+struct WindowsWriteRoots {
+    allow: Vec<PathBuf>,
+    deny: Vec<PathBuf>,
 }
 
 #[cfg(target_os = "windows")]
@@ -385,7 +406,7 @@ fn lower_windows_write_access(
     write_allow: &[PathBuf],
     write_deny: Vec<PathBuf>,
     read_deny: &[PathBuf],
-) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+) -> Result<WindowsWriteRoots> {
     // Windows ACLs cannot attach deny entries to paths that do not exist. Glob
     // denials have the same snapshot limitation on both Windows backends.
     let write_deny: Vec<PathBuf> = write_deny
@@ -401,7 +422,7 @@ fn lower_windows_write_access(
             carve_denials.push(deny.clone());
         }
     }
-    normalize_roots(&mut carve_denials);
+    carve_denials.normalize_roots();
 
     let mut carved_writes = Vec::new();
     for allow in write_allow {
@@ -417,7 +438,7 @@ fn lower_windows_write_access(
             carved_writes.push(allow.clone());
         }
     }
-    normalize_roots(&mut carved_writes);
+    carved_writes.normalize_roots();
 
     // Independent denyWrite roots stay as DENY ACEs for defense in depth.
     let write_deny = write_deny
@@ -428,14 +449,17 @@ fn lower_windows_write_access(
                 .any(|allow| deny.is_strictly_under(allow))
         })
         .collect();
-    Ok((carved_writes, write_deny))
+    Ok(WindowsWriteRoots {
+        allow: carved_writes,
+        deny: write_deny,
+    })
 }
 
 fn lower_read_access(
     read_allow: &[PathBuf],
     read_deny: &[PathBuf],
     read_denied_roots: &mut Vec<PathBuf>,
-) -> Result<(ReadAccess, Vec<PathBuf>)> {
+) -> Result<LoweredReadAccess> {
     let fs_root = normalize_path(Path::new("/"));
     // Reject a full-volume Windows grant because propagating it over `C:\`
     // can hang while walking the volume.
@@ -445,7 +469,10 @@ fn lower_read_access(
     }
 
     if read_deny.is_empty() {
-        Ok((ReadAccess::Unrestricted, Vec::new()))
+        Ok(LoweredReadAccess {
+            access: ReadAccess::Unrestricted,
+            symlinks: Vec::new(),
+        })
     } else if read_allow.contains(&fs_root)
         && !read_deny
             .iter()
@@ -453,7 +480,10 @@ fn lower_read_access(
     {
         // Layer surviving denyRead roots over a full-tree allowRead grant.
         // Windows rejects the full-volume grant above.
-        Ok((ReadAccess::AllowRoots(vec![fs_root]), Vec::new()))
+        Ok(LoweredReadAccess {
+            access: ReadAccess::AllowRoots(vec![fs_root]),
+            symlinks: Vec::new(),
+        })
     } else {
         lower_restricted_read_access(read_allow, read_deny, read_denied_roots)
     }
@@ -464,11 +494,11 @@ fn lower_restricted_read_access(
     read_allow: &[PathBuf],
     read_deny: &[PathBuf],
     read_denied_roots: &mut Vec<PathBuf>,
-) -> Result<(ReadAccess, Vec<PathBuf>)> {
+) -> Result<LoweredReadAccess> {
     // Grant explicit roots and carve nested denials out of inheriting ALLOW
     // entries.
     let mut denied = read_deny.to_vec();
-    normalize_roots(&mut denied);
+    denied.normalize_roots();
     let mut roots = Vec::new();
     let mut symlinks = Vec::new();
     for allow in read_allow {
@@ -481,10 +511,13 @@ fn lower_restricted_read_access(
             roots.push(allow.clone());
         }
     }
-    normalize_roots(&mut roots);
-    normalize_roots(&mut symlinks);
+    roots.normalize_roots();
+    symlinks.normalize_roots();
     read_denied_roots.clear();
-    Ok((ReadAccess::AllowRoots(roots), symlinks))
+    Ok(LoweredReadAccess {
+        access: ReadAccess::AllowRoots(roots),
+        symlinks,
+    })
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -492,9 +525,9 @@ fn lower_restricted_read_access(
     read_allow: &[PathBuf],
     read_deny: &[PathBuf],
     _read_denied_roots: &mut Vec<PathBuf>,
-) -> Result<(ReadAccess, Vec<PathBuf>)> {
+) -> Result<LoweredReadAccess> {
     let mut denied = read_deny.to_vec();
-    normalize_roots(&mut denied);
+    denied.normalize_roots();
     let scan = scan_allowed_root(Path::new("/"), &denied, true, 0)?;
     let mut roots = scan.roots;
     let mut symlinks = scan.symlinks;
@@ -505,9 +538,12 @@ fn lower_restricted_read_access(
             roots.push(allow.clone());
         }
     }
-    normalize_roots(&mut roots);
-    normalize_roots(&mut symlinks);
-    Ok((ReadAccess::AllowRoots(roots), symlinks))
+    roots.normalize_roots();
+    symlinks.normalize_roots();
+    Ok(LoweredReadAccess {
+        access: ReadAccess::AllowRoots(roots),
+        symlinks,
+    })
 }
 
 fn lower_network_policy(
@@ -520,8 +556,15 @@ fn lower_network_policy(
     }
 
     let mut connect_tcp_ports = Vec::new();
-    push_proxy_port(&mut connect_tcp_ports, network.http_proxy_port)?;
-    push_proxy_port(&mut connect_tcp_ports, network.socks_proxy_port)?;
+    for port in [network.http_proxy_port, network.socks_proxy_port]
+        .into_iter()
+        .flatten()
+    {
+        if port == 0 {
+            return Err(Error::PolicyInvalidPort.into());
+        }
+        connect_tcp_ports.push(port);
+    }
     connect_tcp_ports.sort_unstable();
     connect_tcp_ports.dedup();
 
@@ -546,19 +589,6 @@ fn lower_network_policy(
     })
 }
 
-fn push_proxy_port(ports: &mut Vec<u16>, port: Option<u16>) -> Result<()> {
-    let Some(port) = port else {
-        return Ok(());
-    };
-
-    if port == 0 {
-        return Err(Error::PolicyInvalidPort.into());
-    }
-
-    ports.push(port);
-    Ok(())
-}
-
 fn resolve_paths(
     paths: &[String],
     policy_base: &Path,
@@ -567,8 +597,9 @@ fn resolve_paths(
     let mut resolved = Vec::new();
     for path in paths {
         let path = resolve_sandbox_path(path, policy_base, home)?;
-        if path.to_string_lossy().bytes().any(is_glob_byte) {
-            let matches = expand_glob_path(&path)?;
+        let path_str = path.to_string_lossy();
+        if GlobPattern::is_glob_str(&path_str) {
+            let matches = GlobPattern::new(&path_str).expand()?;
             if matches.is_empty() && fs::symlink_metadata(&path).is_ok() {
                 push_path_variants(&mut resolved, &path);
             } else {
@@ -581,7 +612,7 @@ fn resolve_paths(
         }
     }
 
-    normalize_roots(&mut resolved);
+    resolved.normalize_roots();
 
     Ok(resolved)
 }
@@ -590,18 +621,18 @@ fn resolve_deny_paths(
     paths: &[String],
     policy_base: &Path,
     home: Option<&Path>,
-) -> Result<(Vec<PathBuf>, Vec<String>)> {
+) -> Result<ResolvedDenyPaths> {
     let mut concrete: Vec<PathBuf> = Vec::new();
     let mut patterns: Vec<String> = Vec::new();
 
     for path in paths {
         let resolved = resolve_sandbox_path(path, policy_base, home)?;
         let resolved_str = resolved.to_string_lossy();
-        if resolved_str.bytes().any(is_glob_byte) {
+        if GlobPattern::is_glob_str(&resolved_str) {
             patterns.push(resolved_str.clone().into_owned());
             #[cfg(target_os = "macos")]
             {
-                let base = glob_base(&resolved_str);
+                let base = GlobPattern::new(&resolved_str).base();
                 if let Ok(canonical) = fs::canonicalize(&base) {
                     let base_str = base.to_string_lossy();
                     let canonical_str = canonical.to_string_lossy();
@@ -619,11 +650,11 @@ fn resolve_deny_paths(
         }
     }
 
-    normalize_roots(&mut concrete);
+    concrete.normalize_roots();
     patterns.sort_unstable();
     patterns.dedup();
 
-    Ok((concrete, patterns))
+    Ok(ResolvedDenyPaths { concrete, patterns })
 }
 
 const MAX_TRAVERSAL_DEPTH: u32 = 40;
@@ -782,246 +813,254 @@ fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<
     Ok(normalize_path_lexically(&resolved))
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn path_matches_glob_str(path: &Path, pattern: &str) -> bool {
-    let path_bytes = path.to_string_lossy();
-    let pattern_bytes = pattern.as_bytes();
-    let path_len = path_bytes.len();
-    let pattern_len = pattern_bytes.len();
-    let mut memo = vec![None; (pattern_len + 1) * (path_len + 1)];
-    glob_matches_at(pattern_bytes, path_bytes.as_bytes(), 0, 0, &mut memo)
+pub(crate) struct GlobPattern<'a> {
+    pattern: &'a str,
 }
 
-pub(crate) fn expand_glob_path(pattern: &Path) -> Result<Vec<PathBuf>> {
-    let pattern = pattern.to_string_lossy();
-    let base = glob_base(&pattern);
-    let mut matches = Vec::new();
-
-    match fs::symlink_metadata(&base) {
-        Ok(_) => collect_glob_matches(&base, &pattern, &mut matches, 0)?,
-        Err(error) if error.is_opaque() => {}
-        Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
+impl<'a> GlobPattern<'a> {
+    pub(crate) fn new(pattern: &'a str) -> Self {
+        Self { pattern }
     }
 
-    Ok(matches)
-}
-
-fn is_glob_byte(byte: u8) -> bool {
-    matches!(byte, b'*' | b'?' | b'[' | b']')
-}
-
-fn glob_base(pattern: &str) -> PathBuf {
-    let Some(glob_at) = pattern.bytes().position(is_glob_byte) else {
-        return PathBuf::from(pattern);
-    };
-    let prefix = &pattern[..glob_at];
-    let base = if prefix.ends_with('/') {
-        Path::new(prefix.trim_end_matches('/'))
-    } else {
-        Path::new(prefix).parent().unwrap_or(Path::new("/"))
-    };
-
-    if base.as_os_str().is_empty() {
-        PathBuf::from("/")
-    } else {
-        base.to_path_buf()
-    }
-}
-
-fn collect_glob_matches(
-    path: &Path,
-    pattern: &str,
-    matches: &mut Vec<PathBuf>,
-    depth: u32,
-) -> Result<()> {
-    const LIMIT: u32 = 40;
-
-    if depth >= LIMIT {
-        return Err(Error::PolicyTraversalDepth.into());
+    pub(crate) fn is_glob_byte(byte: u8) -> bool {
+        matches!(byte, b'*' | b'?' | b'[' | b']')
     }
 
-    let candidate = normalize_path_lexically(path);
-    let candidate_text = candidate.to_string_lossy();
-    let pattern_bytes = pattern.as_bytes();
-    let candidate_bytes = candidate_text.as_bytes();
-    let mut memo = vec![None; (pattern_bytes.len() + 1) * (candidate_bytes.len() + 1)];
-
-    if glob_matches_at(pattern_bytes, candidate_bytes, 0, 0, &mut memo) {
-        matches.push(candidate.clone());
+    pub(crate) fn is_glob_str(s: &str) -> bool {
+        s.bytes().any(Self::is_glob_byte)
     }
 
-    // A directory the broker cannot stat or read contributes no further glob
-    // matches. Skip it rather than aborting the whole policy: an unreadable
-    // directory is also unreadable to the sandboxed child, and the seccomp
-    // broker still enforces denied paths regardless of glob expansion.
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.is_opaque() => {
+    pub(crate) fn base(&self) -> PathBuf {
+        let Some(glob_at) = self.pattern.bytes().position(Self::is_glob_byte) else {
+            return PathBuf::from(self.pattern);
+        };
+        let prefix = &self.pattern[..glob_at];
+        let base = if prefix.ends_with('/') {
+            Path::new(prefix.trim_end_matches('/'))
+        } else {
+            Path::new(prefix).parent().unwrap_or(Path::new("/"))
+        };
+
+        if base.as_os_str().is_empty() {
+            PathBuf::from("/")
+        } else {
+            base.to_path_buf()
+        }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn matches_path(&self, path: &Path) -> bool {
+        let path_bytes = path.to_string_lossy();
+        let pattern_bytes = self.pattern.as_bytes();
+        let path_len = path_bytes.len();
+        let pattern_len = pattern_bytes.len();
+        let mut memo = vec![None; (pattern_len + 1) * (path_len + 1)];
+        self.matches_at(pattern_bytes, path_bytes.as_bytes(), 0, 0, &mut memo)
+    }
+
+    pub(crate) fn expand(&self) -> Result<Vec<PathBuf>> {
+        let base = self.base();
+        let mut matches = Vec::new();
+
+        match fs::symlink_metadata(&base) {
+            Ok(_) => self.collect_matches(&base, &mut matches, 0)?,
+            Err(error) if error.is_opaque() => {}
+            Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
+        }
+
+        Ok(matches)
+    }
+
+    fn collect_matches(&self, path: &Path, matches: &mut Vec<PathBuf>, depth: u32) -> Result<()> {
+        const LIMIT: u32 = 40;
+
+        if depth >= LIMIT {
+            return Err(Error::PolicyTraversalDepth.into());
+        }
+
+        let candidate = normalize_path_lexically(path);
+        let candidate_text = candidate.to_string_lossy();
+        let pattern_bytes = self.pattern.as_bytes();
+        let candidate_bytes = candidate_text.as_bytes();
+        let mut memo = vec![None; (pattern_bytes.len() + 1) * (candidate_bytes.len() + 1)];
+
+        if self.matches_at(pattern_bytes, candidate_bytes, 0, 0, &mut memo) {
+            matches.push(candidate.clone());
+        }
+
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.is_opaque() => return Ok(()),
+            Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Ok(());
         }
-        Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
-    };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Ok(());
-    }
 
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(error)
-            if error.kind() == io::ErrorKind::PermissionDenied || error.is_transport_failed() =>
-        {
-            return Ok(());
-        }
-        Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) if error.is_transport_failed() => {
-                continue;
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.is_transport_failed() =>
+            {
+                return Ok(());
             }
             Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
         };
-        collect_glob_matches(&entry.path(), pattern, matches, depth + 1)?;
-    }
-
-    Ok(())
-}
-fn glob_matches_at(
-    pattern: &[u8],
-    text: &[u8],
-    pattern_at: usize,
-    text_at: usize,
-    memo: &mut [Option<bool>],
-) -> bool {
-    let memo_at = pattern_at * (text.len() + 1) + text_at;
-    if let Some(result) = memo[memo_at] {
-        return result;
-    }
-
-    let result = if pattern_at == pattern.len() {
-        text_at == text.len()
-    } else if pattern[pattern_at..].starts_with(b"**/") {
-        globstar_slash_matches(pattern, text, pattern_at, text_at, memo)
-    } else if pattern[pattern_at..].starts_with(b"**") {
-        globstar_matches(pattern, text, pattern_at, text_at, memo)
-    } else {
-        match pattern[pattern_at] {
-            b'*' => star_matches(pattern, text, pattern_at, text_at, memo),
-            b'?' => {
-                text_at < text.len()
-                    && text[text_at] != b'/'
-                    && glob_matches_at(pattern, text, pattern_at + 1, text_at + 1, memo)
-            }
-            b'[' => class_matches(pattern, text, pattern_at, text_at, memo),
-            byte => {
-                text_at < text.len()
-                    && text[text_at] == byte
-                    && glob_matches_at(pattern, text, pattern_at + 1, text_at + 1, memo)
-            }
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.is_transport_failed() => continue,
+                Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
+            };
+            self.collect_matches(&entry.path(), matches, depth + 1)?;
         }
-    };
 
-    memo[memo_at] = Some(result);
-    result
-}
-
-fn globstar_slash_matches(
-    pattern: &[u8],
-    text: &[u8],
-    pattern_at: usize,
-    text_at: usize,
-    memo: &mut [Option<bool>],
-) -> bool {
-    if glob_matches_at(pattern, text, pattern_at + 3, text_at, memo) {
-        return true;
+        Ok(())
     }
 
-    for next in text_at..text.len() {
-        if text[next] == b'/' && glob_matches_at(pattern, text, pattern_at + 3, next + 1, memo) {
-            return true;
+    fn matches_at(
+        &self,
+        pattern: &[u8],
+        text: &[u8],
+        pattern_at: usize,
+        text_at: usize,
+        memo: &mut [Option<bool>],
+    ) -> bool {
+        let memo_at = pattern_at * (text.len() + 1) + text_at;
+        if let Some(result) = memo[memo_at] {
+            return result;
         }
-    }
 
-    false
-}
-
-fn globstar_matches(
-    pattern: &[u8],
-    text: &[u8],
-    pattern_at: usize,
-    text_at: usize,
-    memo: &mut [Option<bool>],
-) -> bool {
-    for next in text_at..=text.len() {
-        if glob_matches_at(pattern, text, pattern_at + 2, next, memo) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn star_matches(
-    pattern: &[u8],
-    text: &[u8],
-    pattern_at: usize,
-    text_at: usize,
-    memo: &mut [Option<bool>],
-) -> bool {
-    let mut next = text_at;
-    while next <= text.len() {
-        if glob_matches_at(pattern, text, pattern_at + 1, next, memo) {
-            return true;
-        }
-        if next == text.len() || text[next] == b'/' {
-            break;
-        }
-        next += 1;
-    }
-
-    false
-}
-
-fn class_matches(
-    pattern: &[u8],
-    text: &[u8],
-    pattern_at: usize,
-    text_at: usize,
-    memo: &mut [Option<bool>],
-) -> bool {
-    let Some(class_end) = pattern[pattern_at + 1..]
-        .iter()
-        .position(|byte| *byte == b']')
-        .map(|offset| pattern_at + 1 + offset)
-    else {
-        return text_at < text.len()
-            && text[text_at] == b'['
-            && glob_matches_at(pattern, text, pattern_at + 1, text_at + 1, memo);
-    };
-
-    text_at < text.len()
-        && text[text_at] != b'/'
-        && byte_in_class(text[text_at], &pattern[pattern_at + 1..class_end])
-        && glob_matches_at(pattern, text, class_end + 1, text_at + 1, memo)
-}
-
-fn byte_in_class(byte: u8, class: &[u8]) -> bool {
-    let mut at = 0;
-
-    while at < class.len() {
-        if at + 2 < class.len() && class[at + 1] == b'-' {
-            if byte >= class[at] && byte <= class[at + 2] {
-                return true;
-            }
-            at += 3;
+        let result = if pattern_at == pattern.len() {
+            text_at == text.len()
+        } else if pattern[pattern_at..].starts_with(b"**/") {
+            self.globstar_slash_matches(pattern, text, pattern_at, text_at, memo)
+        } else if pattern[pattern_at..].starts_with(b"**") {
+            self.globstar_matches(pattern, text, pattern_at, text_at, memo)
         } else {
-            if byte == class[at] {
-                return true;
+            match pattern[pattern_at] {
+                b'*' => self.star_matches(pattern, text, pattern_at, text_at, memo),
+                b'?' => {
+                    text_at < text.len()
+                        && text[text_at] != b'/'
+                        && self.matches_at(pattern, text, pattern_at + 1, text_at + 1, memo)
+                }
+                b'[' => self.class_matches(pattern, text, pattern_at, text_at, memo),
+                byte => {
+                    text_at < text.len()
+                        && text[text_at] == byte
+                        && self.matches_at(pattern, text, pattern_at + 1, text_at + 1, memo)
+                }
             }
-            at += 1;
-        }
+        };
+
+        memo[memo_at] = Some(result);
+        result
     }
 
-    false
+    fn globstar_slash_matches(
+        &self,
+        pattern: &[u8],
+        text: &[u8],
+        pattern_at: usize,
+        text_at: usize,
+        memo: &mut [Option<bool>],
+    ) -> bool {
+        if self.matches_at(pattern, text, pattern_at + 3, text_at, memo) {
+            return true;
+        }
+
+        for next in text_at..text.len() {
+            if text[next] == b'/' && self.matches_at(pattern, text, pattern_at + 3, next + 1, memo)
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn globstar_matches(
+        &self,
+        pattern: &[u8],
+        text: &[u8],
+        pattern_at: usize,
+        text_at: usize,
+        memo: &mut [Option<bool>],
+    ) -> bool {
+        for next in text_at..=text.len() {
+            if self.matches_at(pattern, text, pattern_at + 2, next, memo) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn star_matches(
+        &self,
+        pattern: &[u8],
+        text: &[u8],
+        pattern_at: usize,
+        text_at: usize,
+        memo: &mut [Option<bool>],
+    ) -> bool {
+        let mut next = text_at;
+        while next <= text.len() {
+            if self.matches_at(pattern, text, pattern_at + 1, next, memo) {
+                return true;
+            }
+            if next == text.len() || text[next] == b'/' {
+                break;
+            }
+            next += 1;
+        }
+
+        false
+    }
+
+    fn class_matches(
+        &self,
+        pattern: &[u8],
+        text: &[u8],
+        pattern_at: usize,
+        text_at: usize,
+        memo: &mut [Option<bool>],
+    ) -> bool {
+        let Some(class_end) = pattern[pattern_at + 1..]
+            .iter()
+            .position(|byte| *byte == b']')
+            .map(|offset| pattern_at + 1 + offset)
+        else {
+            return text_at < text.len()
+                && text[text_at] == b'['
+                && self.matches_at(pattern, text, pattern_at + 1, text_at + 1, memo);
+        };
+
+        text_at < text.len()
+            && text[text_at] != b'/'
+            && Self::byte_in_class(text[text_at], &pattern[pattern_at + 1..class_end])
+            && self.matches_at(pattern, text, class_end + 1, text_at + 1, memo)
+    }
+
+    fn byte_in_class(byte: u8, class: &[u8]) -> bool {
+        let mut at = 0;
+
+        while at < class.len() {
+            if at + 2 < class.len() && class[at + 1] == b'-' {
+                if byte >= class[at] && byte <= class[at + 2] {
+                    return true;
+                }
+                at += 3;
+            } else {
+                if byte == class[at] {
+                    return true;
+                }
+                at += 1;
+            }
+        }
+
+        false
+    }
 }
