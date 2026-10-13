@@ -9,37 +9,31 @@ opencode plugin install opencode-landstrip          # project
 opencode plugin install opencode-landstrip --global # global
 ```
 
-Installation configures server and TUI plugins. `/landstrip` opens the management
-pane; Pi's agent/task subcommands are unavailable.
+Installation configures server/TUI plugins; `/landstrip` opens the management pane.
 
 ## Permissions and configuration
 
-OpenCode authorizes tool dispatch; Landstrip enforces filesystem/network access.
-Approval never bypasses hard denials. Interactive requests without a live
-presenter remain denied. Only AI `bash` receives OS isolation: OpenCode's plugin
-API cannot replace direct user shell commands.
+Only AI `bash` is OS-isolated; the plugin API cannot replace user shell commands.
+Tool approval never overrides hard sandbox denials. Interactive requests without
+a live presenter remain denied.
 
-Policy precedence: bundled [`sandbox.json`](sandbox.json) → global →
-`.opencode/sandbox.json` → plugin options. The global file is
-`$XDG_CONFIG_HOME/opencode/sandbox.json` (`~/.config` when unset, empty, or relative).
-Persistent approvals update the chosen project/global file.
+Configuration: bundled [`sandbox.json`](sandbox.json) → global →
+`.opencode/sandbox.json` → plugin options. Global:
+`$XDG_CONFIG_HOME/opencode/sandbox.json`, with `~/.config` as fallback for an unset,
+empty, or relative `XDG_CONFIG_HOME`. Arrays combine; later scalars win.
+Persistent approvals update the selected global/project file.
 
-Arrays combine; later scalar values win. Defaults allow project writes, deny
-sensitive-file writes, and block network access. Enabled sandboxing fails closed
-on unusable binaries/platforms; `enabled: false` explicitly permits unsandboxed Bash.
+Defaults allow project writes, deny sensitive-file writes, and block networking.
+Unusable sandboxing fails closed; `enabled: false` permits unsandboxed Bash.
 
-`filesystem.denyReadAlways` and `filesystem.denyWriteAlways` block approvals and
-equal/nested grants. Non-empty hard-denial lists are unsupported on Windows.
-
-See [landstrip(1)](../landstrip/man/man1/landstrip.1) for native CLI/policy semantics.
-Runtime seccomp traps/query approval are Linux-only. Native macOS `--trap` reports
-setup/launch errors only and closes on successful exec—not runtime violations.
+See [landstrip(1)](../landstrip/man/man1/landstrip.1) for hard-denial rules,
+native traps, and platform limits.
 
 ## Development
 
-From this package: `npm ci`, then `npm run all` (format, lint, typecheck, tests).
-Read-only formatting check: `npm run ci:fmt`.
+From this package: `npm ci && npm run all`; `npm run ci:fmt` checks formatting
+without edits.
 
 ## License
 
-Apache-2.0; see [LICENSE](LICENSE).
+[Apache-2.0](LICENSE).
