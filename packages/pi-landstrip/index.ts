@@ -1668,7 +1668,27 @@ function createLandstripIntegrationWithPrompts(
     let policy: ReturnType<typeof writePolicyFile> | undefined;
     let trapSocket: NetSocket | undefined;
     let childEnd: NetSocket | undefined;
+    let preparedChild: ChildProcess | undefined;
     let disposed = false;
+    const cleanup = async (): Promise<unknown[]> => {
+      const errors: unknown[] = [];
+      for (const release of [
+        () => stopPreparedChild(preparedChild),
+        () => trapSocket?.destroy(),
+        () => childEnd?.destroy(),
+        () => {
+          if (policy) rmSync(policy.dir, { recursive: true, force: true });
+        },
+        () => proxy?.stop(),
+      ]) {
+        try {
+          await release();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      return errors;
+    };
     try {
       if (options.signal?.aborted) throw new Error('Task cancelled');
       policy = writePolicyFile(options.cwd, proxy?.port ?? null, 'worker', processAllowances);
@@ -1678,20 +1698,21 @@ function createLandstripIntegrationWithPrompts(
         attachWorkerTrap(trapSocket, options.ctx, options.cwd, processAllowances, options.signal);
       }
     } catch (error) {
-      trapSocket?.destroy();
-      childEnd?.destroy();
-      if (policy) rmSync(policy.dir, { recursive: true, force: true });
-      await proxy?.stop();
+      const cleanupErrors = await cleanup();
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          'Landstrip process preparation cleanup failed',
+        );
+      }
       throw error;
     }
 
     const workerPolicy = policy;
-    const workerTrapSocket = trapSocket;
     const workerChildEnd = childEnd;
     const workerEnv = createProxyEnvironment(proxy?.port ?? null, proxyToken, options.env ?? {});
     let spawned = false;
     let disposePromise: Promise<void> | undefined;
-    let preparedChild: ChildProcess | undefined;
     const spawnWorker: RpcSpawn = (_command, _args, spawnOptions) => {
       if (disposed) throw new Error('Prepared process has been disposed');
       if (spawned) throw new Error('Prepared process can only be spawned once');
@@ -1723,9 +1744,9 @@ function createLandstripIntegrationWithPrompts(
         detached: true,
         stdio,
       });
-      workerChildEnd?.destroy();
-      patchProcessGroupKill(child);
       preparedChild = child;
+      patchProcessGroupKill(child);
+      workerChildEnd?.destroy();
       return child as ReturnType<RpcSpawn>;
     };
 
@@ -1738,11 +1759,10 @@ function createLandstripIntegrationWithPrompts(
       dispose() {
         disposePromise ??= (async () => {
           disposed = true;
-          await stopPreparedChild(preparedChild);
-          workerTrapSocket?.destroy();
-          workerChildEnd?.destroy();
-          rmSync(workerPolicy.dir, { recursive: true, force: true });
-          await proxy?.stop();
+          const cleanupErrors = await cleanup();
+          if (cleanupErrors.length > 0) {
+            throw new AggregateError(cleanupErrors, 'Landstrip process disposal cleanup failed');
+          }
         })();
         return disposePromise;
       },
