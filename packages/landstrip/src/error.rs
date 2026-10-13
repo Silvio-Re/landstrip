@@ -333,3 +333,10 @@ impl Serialize for Error {
         serializer.serialize_str(self.code())
     }
 }
+
+#[cfg(target_os = "linux")]
+impl From<nix::errno::Errno> for Error {
+    fn from(errno: nix::errno::Errno) -> Self {
+        Self::supervise(io::Error::from_raw_os_error(errno as i32))
+    }
+}
