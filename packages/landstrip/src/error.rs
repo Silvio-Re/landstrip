@@ -3,7 +3,7 @@
 
 use serde::{Serialize, Serializer};
 use std::error::Error as StdError;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io;
 use std::path::PathBuf;
 
@@ -237,11 +237,34 @@ impl Error {
             _ => None,
         }
     }
+
+    pub(crate) fn errno_name(&self) -> Option<&'static str> {
+        self.errno().and_then(errno_name)
+    }
+
+    pub(crate) fn message(&self) -> String {
+        let mut message = self.detail().unwrap_or_default();
+        let mut cause = StdError::source(self);
+
+        while let Some(source) = cause {
+            if !message.is_empty() {
+                message.push_str(": ");
+            }
+            let _ = write!(message, "{source}");
+            cause = source.source();
+        }
+
+        if message.is_empty() {
+            return self.code().to_owned();
+        }
+
+        message
+    }
 }
 
 /// The symbolic name of `errno`, or `None` when it has no POSIX name (a Win32
 /// status, say).
-pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
+fn errno_name(errno: i32) -> Option<&'static str> {
     match errno {
         libc::E2BIG => Some("E2BIG"),
         libc::EACCES => Some("EACCES"),

@@ -4,13 +4,11 @@
 //! The trap record: one JSON object per landstrip event, tagged by `kind` and
 //! carrying the stable [`Error`] code of the event it reports.
 
-use crate::error::{Error, Mechanism, errno_name};
+use crate::error::{Error, Mechanism};
 #[cfg(target_os = "linux")]
 use crate::policy::DenialReason;
 use serde::Serialize;
-use std::error::Error as StdError;
-
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::io::{self, Write};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -55,14 +53,14 @@ pub(crate) struct SuggestedGrant {
 }
 
 #[cfg(target_os = "linux")]
-impl SuggestedGrant {
-    fn from_operation(operation: TrapOperation, path: &str) -> Self {
-        match operation {
-            TrapOperation::Read => Self {
+impl TrapOperation {
+    fn suggested_grant(self, path: &str) -> SuggestedGrant {
+        match self {
+            Self::Read => SuggestedGrant {
                 allow_read: Some(path.to_owned()),
                 allow_write: None,
             },
-            TrapOperation::Write => Self {
+            Self::Write => SuggestedGrant {
                 allow_read: None,
                 allow_write: Some(path.to_owned()),
             },
@@ -117,6 +115,30 @@ pub(crate) struct FilesystemDenial {
     pub(crate) flags: Vec<&'static str>,
     pub(crate) reason: DenialReason,
     pub(crate) process: ProcessContext,
+}
+
+#[cfg(target_os = "linux")]
+impl FilesystemDenial {
+    pub(crate) fn into_trap(self, query_id: Option<u64>) -> Trap {
+        let path = self.path.to_string_lossy();
+        let suggested_grant = self.operation.suggested_grant(&path);
+        let (state, query_id) = TrapState::from_query_id(query_id);
+        Trap::Filesystem(Box::new(FilesystemTrap {
+            code: Error::FilesystemDenied.code(),
+            state,
+            query_id,
+            operation: self.operation,
+            path: path.into_owned(),
+            requested_path: self.requested_path.to_string_lossy().into_owned(),
+            syscall: self.syscall,
+            errno: "EACCES",
+            flags: self.flags,
+            reason: self.reason,
+            suggested_grant,
+            process: self.process,
+            mechanism: Mechanism::Seccomp,
+        }))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -175,34 +197,7 @@ pub(crate) enum Trap {
 impl Trap {
     #[cfg(target_os = "linux")]
     pub(crate) fn filesystem(denial: FilesystemDenial, query_id: Option<u64>) -> Self {
-        let FilesystemDenial {
-            operation,
-            path,
-            requested_path,
-            syscall,
-            flags,
-            reason,
-            process,
-        } = denial;
-        let path = path.to_string_lossy();
-        let requested_path = requested_path.to_string_lossy().into_owned();
-        let suggested_grant = SuggestedGrant::from_operation(operation, &path);
-        let (state, query_id) = TrapState::from_query_id(query_id);
-        Self::Filesystem(Box::new(FilesystemTrap {
-            code: Error::FilesystemDenied.code(),
-            state,
-            query_id,
-            operation,
-            path: path.into_owned(),
-            requested_path,
-            syscall,
-            errno: "EACCES",
-            flags,
-            reason,
-            suggested_grant,
-            process,
-            mechanism: Mechanism::Seccomp,
-        }))
+        denial.into_trap(query_id)
     }
 
     #[cfg(target_os = "linux")]
@@ -268,18 +263,18 @@ impl From<&Error> for Trap {
             Error::LaunchFailed { tool, source } => Self::Launch(LaunchTrap {
                 code: error.code(),
                 program: tool.to_string_lossy().into_owned(),
-                errno: error.errno().and_then(errno_name),
+                errno: error.errno_name(),
                 message: source.to_string(),
             }),
             Error::SandboxSetupFailed { mechanism, .. } => Self::Internal(InternalTrap {
                 code: error.code(),
                 mechanism: Some(*mechanism),
-                message: message(error),
+                message: error.message(),
             }),
             _ => Self::Internal(InternalTrap {
                 code: error.code(),
                 mechanism: None,
-                message: message(error),
+                message: error.message(),
             }),
         }
     }
@@ -289,25 +284,4 @@ impl fmt::Display for Trap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_json())
     }
-}
-
-/// The detail behind the code: the variant's data and its causes as one line,
-/// for a human reading the trap. The code itself is the `code` field.
-fn message(error: &Error) -> String {
-    let mut message = error.detail().unwrap_or_default();
-    let mut cause = StdError::source(error);
-
-    while let Some(source) = cause {
-        if !message.is_empty() {
-            message.push_str(": ");
-        }
-        let _ = write!(message, "{source}");
-        cause = source.source();
-    }
-
-    if message.is_empty() {
-        return error.code().to_owned();
-    }
-
-    message
 }
