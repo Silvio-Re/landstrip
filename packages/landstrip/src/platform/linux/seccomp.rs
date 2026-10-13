@@ -1836,33 +1836,32 @@ fn handle_openat(
     let hard_write_denied = wants_write && resolved.is_under_any(&policy.write_denied_always_roots);
     let query_enabled = query_enabled && !hard_read_denied && !hard_write_denied;
 
-    if wants_write && !hard_read_denied {
-        let lexical = normalize_path_lexically(&raw);
-        let reason = policy.write_reason(&resolved, &lexical, true);
-        if let Some(reason) = reason {
-            if flags & libc::O_CREAT == 0 && !resolved.try_exists()? {
-                return Err(BrokerError::SystemCall {
-                    errno: libc::ENOENT,
-                });
-            }
-            return deny_open(
-                OpenDenial {
-                    operation: TrapOperation::Write,
-                    path: resolved,
-                    requested_path: path,
-                    syscall,
-                    flags,
-                    mode,
-                    grant: open_grant,
-                    reason,
-                    pid: request.pid,
-                    report: reports_write,
-                },
-                denials,
-                query_enabled,
-                next_query_id,
-            );
+    if wants_write
+        && !hard_read_denied
+        && let Some(reason) = policy.write_reason(&resolved, &normalize_path_lexically(&raw), true)
+    {
+        if flags & libc::O_CREAT == 0 && !resolved.try_exists()? {
+            return Err(BrokerError::SystemCall {
+                errno: libc::ENOENT,
+            });
         }
+        return deny_open(
+            OpenDenial {
+                operation: TrapOperation::Write,
+                path: resolved,
+                requested_path: path,
+                syscall,
+                flags,
+                mode,
+                grant: open_grant,
+                reason,
+                pid: request.pid,
+                report: reports_write,
+            },
+            denials,
+            query_enabled,
+            next_query_id,
+        );
     }
     if wants_read && let Some(reason) = policy.read_reason(&resolved) {
         if !resolved.try_exists()? {
