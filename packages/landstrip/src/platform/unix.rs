@@ -111,13 +111,17 @@ fn close_inherited_except(excluded: &[RawFd]) {
 
         fds.sort_unstable();
         for fd in fds {
-            close_fd(fd, excluded);
+            if !excluded.contains(&fd) {
+                unsafe { libc::close(fd) };
+            }
         }
         return;
     }
 
     for fd in FIRST_INHERITED_FD..open_fd_limit(FALLBACK_FD_LIMIT) {
-        close_fd(fd, excluded);
+        if !excluded.contains(&fd) {
+            unsafe { libc::close(fd) };
+        }
     }
 }
 
@@ -128,11 +132,4 @@ fn open_fd_limit(fallback: RawFd) -> RawFd {
         return fallback;
     }
     RawFd::try_from(limit).map_or(fallback, |limit| limit.min(fallback))
-}
-
-#[cfg(target_os = "macos")]
-fn close_fd(fd: RawFd, excluded: &[RawFd]) {
-    if fd >= FIRST_INHERITED_FD && !excluded.contains(&fd) {
-        unsafe { libc::close(fd) };
-    }
 }
