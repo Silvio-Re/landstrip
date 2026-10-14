@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import { join } from 'node:path';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { parseTrapLine } from '@landstrip/landstrip-api/shared';
 import { afterEach, expect, test, vi } from 'vitest';
 
 import {
@@ -228,7 +229,27 @@ sandboxTest.for(
         try {
           expect(integration.getContext(f.ctx).sandbox).toBe('enabled');
           const { code, stdout, stderr } = await workerOutput(launch, workerTimeout);
-          expect({ code, stderr }).toEqual({ code: 0, stderr: '' });
+          expect({ code, stderr }).toMatchObject({ code: 0 });
+          if (process.platform === 'linux') {
+            // Hard-denied writes are reported even when the worker exits successfully.
+            const traps = stderr.trim().split('\n').map(parseTrapLine);
+            expect(traps).toEqual(
+              [authPath, `${authPath}.lock`].map((path) =>
+                expect.objectContaining({
+                  kind: 'filesystem',
+                  code: 'FILESYSTEM_DENIED',
+                  state: 'info',
+                  query_id: '0',
+                  operation: 'write',
+                  path,
+                  errno: 'EACCES',
+                  reason: 'deny_match',
+                }),
+              ),
+            );
+          } else {
+            expect(stderr).toBe('');
+          }
           const response = JSON.parse(stdout);
           expect(response.status).toBe(denied ? 403 : 200);
           if (!denied) expect(response.body).toBe('effective-endpoint-ok');
