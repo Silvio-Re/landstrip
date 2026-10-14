@@ -178,33 +178,35 @@ function eventBus(pi: ExtensionAPI): EventBusLike | undefined {
 function isRuntime(value: unknown): value is PiLandstripRuntimeV2 {
   return (
     isRecord(value) &&
-    value.version === LANDSTRIP_RUNTIME_VERSION &&
-    typeof value.getContext === 'function' &&
-    typeof value.registerShellProvider === 'function' &&
-    typeof value.registerPermissionAskProvider === 'function' &&
-    typeof value.prepareProcess === 'function' &&
-    typeof value.registerWorkerExtension === 'function' &&
-    typeof value.getWorkerExtensions === 'function' &&
-    typeof value.on === 'function'
+    value['version'] === LANDSTRIP_RUNTIME_VERSION &&
+    typeof value['getContext'] === 'function' &&
+    typeof value['registerShellProvider'] === 'function' &&
+    typeof value['registerPermissionAskProvider'] === 'function' &&
+    typeof value['prepareProcess'] === 'function' &&
+    typeof value['registerWorkerExtension'] === 'function' &&
+    typeof value['getWorkerExtensions'] === 'function' &&
+    typeof value['on'] === 'function'
   );
 }
 
 function isDisposableProcess(value: unknown): value is Pick<LandstripPreparedProcess, 'dispose'> {
-  return isRecord(value) && typeof value.dispose === 'function';
+  return isRecord(value) && typeof value['dispose'] === 'function';
 }
 
 function isPreparedProcess(value: unknown): value is LandstripPreparedProcess {
   return (
     isRecord(value) &&
-    typeof value.command === 'string' &&
-    value.command.trim().length > 0 &&
-    Array.isArray(value.args) &&
-    [...value.args].every((arg: unknown) => typeof arg === 'string') &&
-    typeof value.cwd === 'string' &&
-    value.cwd.length > 0 &&
-    isRecord(value.env) &&
-    Object.values(value.env).every((entry) => entry === undefined || typeof entry === 'string') &&
-    typeof value.spawn === 'function' &&
+    typeof value['command'] === 'string' &&
+    value['command'].trim().length > 0 &&
+    Array.isArray(value['args']) &&
+    [...value['args']].every((arg: unknown) => typeof arg === 'string') &&
+    typeof value['cwd'] === 'string' &&
+    value['cwd'].length > 0 &&
+    isRecord(value['env']) &&
+    Object.values(value['env']).every(
+      (entry) => entry === undefined || typeof entry === 'string',
+    ) &&
+    typeof value['spawn'] === 'function' &&
     isDisposableProcess(value)
   );
 }
@@ -231,11 +233,11 @@ function discoverLandstrip(
   };
   const unsubscribe = events.on(RUNTIME_REGISTER_EVENT, (value) => {
     if (disposed) return;
-    if (!isRecord(value) || value.version !== LANDSTRIP_RUNTIME_VERSION) {
+    if (!isRecord(value) || value['version'] !== LANDSTRIP_RUNTIME_VERSION) {
       onInvalid?.(new Error('Invalid Landstrip runtime v2 registration'));
       return;
     }
-    register(value.runtime);
+    register(value['runtime']);
   });
   const dispose = (): void => {
     if (disposed) return;
@@ -373,8 +375,8 @@ export function publishLandstripRuntime(
   if (!events) return () => undefined;
 
   const unsubscribe = events.on(RUNTIME_DISCOVER_EVENT, (value) => {
-    if (!isRecord(value) || value.version !== LANDSTRIP_RUNTIME_VERSION) return;
-    if (typeof value.register === 'function') value.register(runtime);
+    if (!isRecord(value) || value['version'] !== LANDSTRIP_RUNTIME_VERSION) return;
+    if (typeof value['register'] === 'function') value['register'](runtime);
   });
   try {
     events.emit(RUNTIME_REGISTER_EVENT, {
@@ -402,14 +404,14 @@ export function contextFromEnvironment(
     const value: unknown = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
     if (
       !isRecord(value) ||
-      value.version !== LANDSTRIP_RUNTIME_VERSION ||
-      value.host !== 'pi' ||
-      value.role !== 'subagent' ||
-      typeof value.sandbox !== 'string' ||
-      !['enabled', 'disabled', 'unavailable'].includes(value.sandbox) ||
-      typeof value.cwd !== 'string' ||
-      !Number.isInteger(value.depth) ||
-      (value.depth as number) < 0 ||
+      value['version'] !== LANDSTRIP_RUNTIME_VERSION ||
+      value['host'] !== 'pi' ||
+      value['role'] !== 'subagent' ||
+      typeof value['sandbox'] !== 'string' ||
+      !['enabled', 'disabled', 'unavailable'].includes(value['sandbox']) ||
+      typeof value['cwd'] !== 'string' ||
+      !Number.isInteger(value['depth']) ||
+      (value['depth'] as number) < 0 ||
       ['sessionId', 'taskId', 'parentTaskId', 'agent'].some(
         (key) => value[key] !== undefined && typeof value[key] !== 'string',
       )
