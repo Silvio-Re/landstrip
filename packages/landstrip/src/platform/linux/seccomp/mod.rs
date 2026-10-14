@@ -38,7 +38,7 @@ use anyhow::Result;
 use fs::MUTATION_SYSCALLS;
 use nix::errno::Errno;
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
-use nix::unistd::{ForkResult, Pid, fork};
+use nix::unistd::{ForkResult, Pid, fork, read, write};
 use process::{Subreaper, TargetProcess, cleanup_descendants};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
@@ -68,15 +68,38 @@ fn send_fd(socket: &UnixStream, fd: BorrowedFd<'_>) -> Result<()> {
     }
 }
 
+fn write_all(fd: BorrowedFd<'_>, mut buf: &[u8]) -> Result<()> {
+    while !buf.is_empty() {
+        match write(fd, buf) {
+            Ok(0) => return Err(LandstripError::supervise("write: zero bytes").into()),
+            Ok(n) => buf = &buf[n..],
+            Err(Errno::EINTR) => {}
+            Err(error) => return Err(LandstripError::from(error).into()),
+        }
+    }
+    Ok(())
+}
+
+fn read_exact(fd: BorrowedFd<'_>, mut buf: &mut [u8]) -> Result<()> {
+    while !buf.is_empty() {
+        match read(fd, buf) {
+            Ok(0) => return Err(LandstripError::supervise("read: unexpected eof").into()),
+            Ok(n) => {
+                let tmp = buf;
+                buf = &mut tmp[n..];
+            }
+            Err(Errno::EINTR) => {}
+            Err(error) => return Err(LandstripError::from(error).into()),
+        }
+    }
+    Ok(())
+}
+
 fn send_listener(socket: &mut UnixStream, fd: BorrowedFd<'_>) -> Result<()> {
-    socket
-        .write_all(&[0_u8])
-        .and_then(|()| socket.write_all(&fd.as_raw_fd().to_ne_bytes()))
-        .map_err(LandstripError::supervise)?;
+    write_all(socket.as_fd(), &[0_u8])?;
+    write_all(socket.as_fd(), &fd.as_raw_fd().to_ne_bytes())?;
     let mut ack = [0_u8];
-    socket
-        .read_exact(&mut ack)
-        .map_err(LandstripError::supervise)?;
+    read_exact(socket.as_fd(), &mut ack)?;
     if ack != [0] {
         return Err(LandstripError::supervise("notify: invalid acknowledgment").into());
     }
@@ -88,15 +111,9 @@ fn send_trap(socket: &mut UnixStream, trap: &Trap) -> Result<()> {
     let length = u32::try_from(payload.len())
         .map_err(|_| LandstripError::supervise("notify: trap is too large"))?;
 
-    socket
-        .write_all(&[1_u8])
-        .map_err(LandstripError::supervise)?;
-    socket
-        .write_all(&length.to_be_bytes())
-        .map_err(LandstripError::supervise)?;
-    socket
-        .write_all(payload.as_bytes())
-        .map_err(LandstripError::supervise)?;
+    write_all(socket.as_fd(), &[1_u8])?;
+    write_all(socket.as_fd(), &length.to_be_bytes())?;
+    write_all(socket.as_fd(), payload.as_bytes())?;
     Ok(())
 }
 
