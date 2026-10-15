@@ -329,11 +329,13 @@ if ! git merge-base --is-ancestor "$tag_commit" "$head_commit"; then
   die "tag $version is not an ancestor of HEAD"
 fi
 
-if [[ "$tag_commit" != "$head_commit" ]] \
-  && ! git diff --quiet "$tag_commit" "$head_commit" -- \
-    packages/landstrip/Cargo.toml packages/landstrip/Cargo.lock \
-    rust-toolchain.toml packages/landstrip/src; then
-  die "Rust package sources changed since tag $version"
+if [[ "$tag_commit" != "$head_commit" ]]; then
+  # Provenance refers to the tagged source: never package a newer tip
+  # tree with different content than the tag.
+  if ! git diff --quiet "$tag_commit" "$head_commit" -- \
+    npm packages package-lock.json; then
+    die "packaged sources changed since tag $version"
+  fi
 fi
 
 workdir="$(mktemp -d)"
@@ -346,14 +348,17 @@ if github_release_exists; then
   exit 0
 fi
 
-[[ "$tag_commit" == "$head_commit" ]] \
-  || die "checkout the exact tag commit before packing a new release"
-
 remote_commit="$(git ls-remote origin "refs/tags/$version^{}" | awk '{print $1}')"
 [[ -n "$remote_commit" && "$remote_commit" == "$tag_commit" ]] \
   || die "push the signed tag $version to origin before staging the release"
 remote_main="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
-[[ "$remote_main" == "$tag_commit" ]] \
+if ! git cat-file -e "$remote_main^{commit}" >/dev/null 2>&1; then
+  git fetch --quiet origin main \
+    || die "cannot fetch origin main to verify the release commit"
+  git cat-file -e "$remote_main^{commit}" >/dev/null 2>&1 \
+    || die "cannot verify origin/main contains the release commit"
+fi
+git merge-base --is-ancestor "$tag_commit" "$remote_main" \
   || die "push the release commit to origin/main before staging the release"
 cargo_root="$repo_root"
 printf 'staging tag %s\n' "$version"
