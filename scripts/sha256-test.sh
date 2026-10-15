@@ -25,7 +25,7 @@ cleanup() {
 trap cleanup EXIT
 
 workdir="$(mktemp -d)"
-asset="landstrip-0.0.0-linux-x64-musl.tar.gz"
+asset="landstrip-0.0.0-linux-x64.AppImage"
 printf 'payload\n' >"$workdir/$asset"
 write_sha256_sidecar "$workdir/$asset"
 

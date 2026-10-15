@@ -7,10 +7,10 @@
 #   other triples — cargo-zigbuild (Zig linker)
 #
 # Platforms:
-#   linux-x64, linux-arm64 — x86_64/aarch64-unknown-linux-musl (static)
-#   darwin-arm64, darwin-x64 — aarch64/x86_64-apple-darwin
+#   linux-x64, linux-arm64 — x86_64/aarch64-unknown-linux-gnu (AppImage)
 #   win32-x64 — x86_64-pc-windows-gnu
 #   win32-arm64 — aarch64-pc-windows-gnullvm
+#   darwin-arm64, darwin-x64 — aarch64/x86_64-apple-darwin
 #
 # Exit 0 if every requested platform was packaged.
 # Exit 2 if a requested build fails while another succeeds.
@@ -26,6 +26,7 @@ source "$script_dir/package-target.sh"
 CARGO="${CARGO:-cargo}"
 RUSTC="${RUSTC:-rustc}"
 CARGO_ZIGBUILD="${CARGO_ZIGBUILD:-cargo-zigbuild}"
+CONTAINER="${CONTAINER:-docker}"
 NODE="${NODE:-node}"
 FILE="${FILE:-file}"
 GZIP="${GZIP:-gzip}"
@@ -127,8 +128,8 @@ package_target_root="${CARGO_TARGET_DIR:-$repo_root/packages/landstrip/target/pa
 
 # platform|rust-triple|binary-name
 platforms=(
-  'linux-x64|x86_64-unknown-linux-musl|landstrip'
-  'linux-arm64|aarch64-unknown-linux-musl|landstrip'
+  'linux-x64|x86_64-unknown-linux-gnu|landstrip'
+  'linux-arm64|aarch64-unknown-linux-gnu|landstrip'
   'win32-x64|x86_64-pc-windows-gnu|landstrip.exe'
   'win32-arm64|aarch64-pc-windows-gnullvm|landstrip.exe'
   'darwin-arm64|aarch64-apple-darwin|landstrip'
@@ -162,29 +163,6 @@ host_platform() {
   "$NODE" -e 'process.stdout.write(process.platform + "-" + process.arch)'
 }
 
-verify_linux_static() {
-  local bin="$1"
-  local description
-
-  description="$($FILE -b "$bin")"
-  printf '%s\n' "$description"
-  if [[ "$description" != *"static-pie linked"* && "$description" != *"statically linked"* ]]; then
-    printf 'Linux musl release is not statically linked: %s\n' "$bin" >&2
-    return 1
-  fi
-  if command -v "$READELF" >/dev/null 2>&1; then
-    if "$READELF" -l "$bin" 2>/dev/null | grep -q 'INTERP'; then
-      printf 'Linux musl release declares a dynamic ELF interpreter: %s\n' "$bin" >&2
-      return 1
-    fi
-    if "$READELF" -d "$bin" 2>/dev/null | grep -q '(NEEDED)'; then
-      printf 'Linux musl release has dynamic dependencies: %s\n' "$bin" >&2
-      return 1
-    fi
-  fi
-  return 0
-}
-
 smoke_host_binary() {
   local platform="$1"
   local bin="$2"
@@ -194,7 +172,11 @@ smoke_host_binary() {
     if [[ "$platform" == darwin-* ]] && command -v codesign >/dev/null 2>&1; then
       codesign --force -s - "$bin" >/dev/null 2>&1 || true
     fi
-    "$bin" --version >/dev/null
+    if [[ "$platform" == linux-* ]]; then
+      APPIMAGE_EXTRACT_AND_RUN=1 "$bin" --version >/dev/null
+    else
+      "$bin" --version >/dev/null
+    fi
   fi
 }
 
@@ -346,18 +328,19 @@ for platform in "${requested[@]}"; do
     continue
   fi
 
-  case "$platform" in
-    linux-*)
-      if ! verify_linux_static "$source_bin"; then
-        failed+=("$platform: not statically linked")
-        continue
-      fi
-      ;;
-  esac
-
   mkdir -p "$stage_package_dir/bin"
-  cp "$source_bin" "$stage_package_dir/bin/$binary"
-  artifact="landstrip-$version-$platform.tar.gz"
+  if [[ "$platform" == linux-* ]]; then
+    if ! CONTAINER="$CONTAINER" "$script_dir/make-appimage.sh" \
+      "$platform" "$source_bin" "$stage_package_dir/bin/$binary"; then
+      failed+=("$platform: AppImage packaging failed")
+      printf 'fail: %s (AppImage packaging failed)\n' "$platform" >&2
+      continue
+    fi
+    artifact="landstrip-$version-$platform.AppImage"
+  else
+    cp "$source_bin" "$stage_package_dir/bin/$binary"
+    artifact="landstrip-$version-$platform.tar.gz"
+  fi
   chmod 755 "$stage_package_dir/bin/$binary"
 
   if ! smoke_host_binary "$platform" "$stage_package_dir/bin/$binary"; then
@@ -366,8 +349,12 @@ for platform in "${requested[@]}"; do
     continue
   fi
 
-  create_tar_artifact \
-    "$stage_package_dir/bin" "$binary" "$stage_root/artifacts/$artifact"
+  if [[ "$platform" == linux-* ]]; then
+    cp "$stage_package_dir/bin/$binary" "$stage_root/artifacts/$artifact"
+  else
+    create_tar_artifact \
+      "$stage_package_dir/bin" "$binary" "$stage_root/artifacts/$artifact"
+  fi
   digest="$(sha256_digest "$stage_root/artifacts/$artifact")"
   printf '%s  %s\n' "$digest" "$artifact" \
     >"$stage_root/artifacts/$artifact.sha256"
@@ -398,8 +385,13 @@ fi
 for platform in "${built[@]}"; do
   entry="$(platform_entry "$platform")"
   IFS='|' read -r _ _ binary <<<"$entry"
-  artifact="landstrip-$version-$platform.tar.gz"
-  stale_artifact="artifacts/landstrip-$version-$platform.AppImage"
+  if [[ "$platform" == linux-* ]]; then
+    artifact="landstrip-$version-$platform.AppImage"
+    stale_artifact="artifacts/landstrip-$version-$platform.tar.gz"
+  else
+    artifact="landstrip-$version-$platform.tar.gz"
+    stale_artifact="artifacts/landstrip-$version-$platform.AppImage"
+  fi
 
   [[ -f "$stage_root/npm/$platform/bin/$binary" ]] \
     || die "staged binary is missing for $platform"
@@ -426,8 +418,13 @@ for platform in "${built[@]}"; do
   entry="$(platform_entry "$platform")"
   IFS='|' read -r _ _ binary <<<"$entry"
   package_dir="npm/$platform"
-  artifact="landstrip-$version-$platform.tar.gz"
-  stale_artifact="artifacts/landstrip-$version-$platform.AppImage"
+  if [[ "$platform" == linux-* ]]; then
+    artifact="landstrip-$version-$platform.AppImage"
+    stale_artifact="artifacts/landstrip-$version-$platform.tar.gz"
+  else
+    artifact="landstrip-$version-$platform.tar.gz"
+    stale_artifact="artifacts/landstrip-$version-$platform.AppImage"
+  fi
 
   mkdir -p "$package_dir/bin" artifacts \
     || die "cannot prepare release output for $platform"
@@ -446,7 +443,11 @@ publication_committed=1
 for platform in "${built[@]}"; do
   entry="$(platform_entry "$platform")"
   IFS='|' read -r _ _ binary <<<"$entry"
-  artifact="landstrip-$version-$platform.tar.gz"
+  if [[ "$platform" == linux-* ]]; then
+    artifact="landstrip-$version-$platform.AppImage"
+  else
+    artifact="landstrip-$version-$platform.tar.gz"
+  fi
   printf 'packaged %s -> npm/%s/bin/%s and artifacts/%s{,.sha256,.commit}\n' \
     "$platform" "$platform" "$binary" "$artifact"
 done

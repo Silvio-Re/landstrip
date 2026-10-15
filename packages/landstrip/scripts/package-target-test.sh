@@ -29,7 +29,7 @@ expect_driver cargo \
 expect_driver cargo \
   x86_64-apple-darwin x86_64-apple-darwin
 expect_driver zigbuild \
-  x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
+  x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 expect_driver zigbuild \
   aarch64-apple-darwin x86_64-apple-darwin
 expect_driver zigbuild \

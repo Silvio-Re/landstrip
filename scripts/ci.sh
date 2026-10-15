@@ -34,6 +34,9 @@ printf '==> package target selection test\n'
 printf '==> package transaction test\n'
 ./packages/landstrip/scripts/package-transaction-test.sh
 
+printf '==> AppImage packaging test\n'
+./packages/landstrip/scripts/make-appimage-test.sh
+
 printf '==> sha256 sidecar test\n'
 ./scripts/sha256-test.sh
 

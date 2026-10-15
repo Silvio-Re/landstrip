@@ -3,6 +3,7 @@
 
 CARGO ?= cargo
 CARGO_ZIGBUILD ?= cargo-zigbuild
+CONTAINER ?= docker
 GH ?= gh
 NODE ?= node
 NPM ?= npm
@@ -33,7 +34,7 @@ clippy: ## Lint with clippy
 
 package: ## Package release binaries
 	$(MAKE) -C packages/landstrip $@ CARGO="$(CARGO)" \
-		CARGO_ZIGBUILD="$(CARGO_ZIGBUILD)" NODE="$(NODE)"
+		CARGO_ZIGBUILD="$(CARGO_ZIGBUILD)" CONTAINER="$(CONTAINER)" NODE="$(NODE)"
 
 install: ## Install landstrip
 	$(MAKE) -C packages/landstrip $@ CARGO="$(CARGO)" \

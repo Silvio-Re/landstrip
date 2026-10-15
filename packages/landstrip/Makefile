@@ -6,6 +6,7 @@ BINDIR ?= $(PREFIX)/bin
 MANDIR ?= $(PREFIX)/share/man
 CARGO ?= cargo
 CARGO_ZIGBUILD ?= cargo-zigbuild
+CONTAINER ?= docker
 INSTALL ?= install
 NODE ?= node
 RM ?= rm -f
@@ -26,7 +27,7 @@ clippy:
 	$(CARGO) clippy --all-targets
 
 package:
-	CARGO_ZIGBUILD="$(CARGO_ZIGBUILD)" NODE="$(NODE)" ./scripts/package.sh $(PLATFORMS)
+	CARGO_ZIGBUILD="$(CARGO_ZIGBUILD)" CONTAINER="$(CONTAINER)" NODE="$(NODE)" ./scripts/package.sh $(PLATFORMS)
 
 install:
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
