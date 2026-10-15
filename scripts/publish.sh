@@ -378,7 +378,7 @@ for platform in "${platforms[@]}"; do
   extension="$(platform_extension "$platform")"
   case "$platform" in
     darwin-arm64) expected_arch=arm64 ;;
-    darwin-x64)   expected_arch=x86-64 ;;
+    darwin-x64)   expected_arch=x86_64 ;;
     linux-arm64)  expected_arch=aarch64 ;;
     linux-x64)    expected_arch=x86-64 ;;
     win32-arm64)  expected_arch=aarch64 ;;
