@@ -31,8 +31,8 @@ cd "$repo_root"
 printf '==> package target selection test\n'
 ./packages/landstrip/scripts/package-target-test.sh
 
-printf '==> package freshness test\n'
-./packages/landstrip/scripts/package-freshness-test.sh
+printf '==> package transaction test\n'
+./packages/landstrip/scripts/package-transaction-test.sh
 
 printf '==> sha256 sidecar test\n'
 ./scripts/sha256-test.sh

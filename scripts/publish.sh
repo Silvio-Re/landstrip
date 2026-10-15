@@ -14,9 +14,18 @@ source "$script_dir/sha256.sh"
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--no-deprecation"
 
 CARGO="${CARGO:-cargo}"
+FILE="${FILE:-file}"
 GH="${GH:-gh}"
 NODE="${NODE:-node}"
 NPM="${NPM:-npm}"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256=(shasum -a 256)
+else
+  die "neither sha256sum nor shasum is available"
+fi
 
 platforms=(
   darwin-arm64
@@ -152,7 +161,11 @@ github_release_exists() {
 stage_github_release() {
   local asset name downloaded
   local missing=()
-  local assets=("$workdir"/release/*.tar.gz "$workdir"/release/*.sha256 "$workdir"/release/*.tgz)
+  local assets=()
+  for pattern in "$workdir"/release/*.tar.gz \
+    "$workdir"/release/*.sha256 "$workdir"/release/*.commit "$workdir"/release/*.tgz; do
+    [[ -f "$pattern" ]] && assets+=("$pattern")
+  done
 
   if github_release_exists; then
     $NODE -e '
@@ -261,7 +274,7 @@ platform_binary() {
   fi
 }
 
-for command in "$CARGO" "$GH" "$NODE" "$NPM" tar; do
+for command in "$CARGO" "$GH" "$NODE" "$NPM" git tar "$FILE"; do
   require_command "$command"
 done
 if ! command -v sha256sum >/dev/null 2>&1 && \
@@ -348,31 +361,55 @@ cargo_version="${cargo_version%%$'\n'*}"
 [[ "$version" == "$cargo_version" ]] \
   || die "tag $version Cargo.toml version is $cargo_version"
 
-printf '%s\n' "assembling platform packages from local npm/*/bin binaries"
-npm_package_dirs=()
+printf '%s\n' "validating packaged artifacts from tag $version"
 missing=()
+npm_package_dirs=()
 for platform in "${platforms[@]}"; do
   binary="$(platform_binary "$platform")"
+  case "$platform" in
+    darwin-arm64) expected_arch=arm64 ;;
+    darwin-x64)   expected_arch=x86-64 ;;
+    linux-arm64)  expected_arch=aarch64 ;;
+    linux-x64)    expected_arch=x86-64 ;;
+    win32-arm64)  expected_arch=aarch64 ;;
+    win32-x64)    expected_arch=x86-64 ;;
+  esac
+
   source_bin="npm/$platform/bin/$binary"
-  digest_file="artifacts/${platform}.bin.sha256"
-  if [[ ! -f "$source_bin" || ! -f "$digest_file" ]]; then
-    missing+=("$platform binary or checksum")
+  asset="landstrip-$version-$platform.tar.gz"
+  asset_path="artifacts/$asset"
+  checksum_path="$asset_path.sha256"
+  commit_path="$asset_path.commit"
+  if [[ ! -f "$source_bin" || ! -f "$asset_path" || \
+    ! -f "$checksum_path" || ! -f "$commit_path" ]]; then
+    missing+=("$platform binary, artifact, checksum, or commit provenance")
     continue
   fi
 
-  verify_binary_receipt "$digest_file" "$source_bin" "$version" "$head_commit" \
-    || die "stale or mismatched platform binary for $platform; rerun make package"
+  read -r expected_digest expected_asset extra <"$checksum_path"
+  [[ -n "$expected_digest" && "$expected_asset" == "$asset" && -z "${extra:-}" ]] \
+    || die "invalid checksum file: $checksum_path"
+  actual_digest="$("${SHA256[@]}" "$asset_path" | awk '{print $1}')"
+  [[ "$actual_digest" == "$expected_digest" ]] \
+    || die "checksum mismatch: $asset_path"
+  [[ "$(<"$commit_path")" == "$tag_commit" ]] \
+    || die "$asset was not built from tag $version"
+
+  description="$("$FILE" -b "$source_bin")"
+  [[ "${description,,}" == *"$expected_arch"* ]] \
+    || die "$source_bin has the wrong architecture: $description"
+  archive_binary="$workdir/$platform-$binary"
+  tar -xOzf "$asset_path" "$binary" >"$archive_binary" \
+    || die "cannot extract $binary from $asset_path"
+  cmp "$source_bin" "$archive_binary" >/dev/null \
+    || die "$source_bin differs from $asset_path contents"
 
   package_dir="$workdir/packages/$platform"
   cp -a "npm/$platform" "$package_dir"
   mkdir -p "$package_dir/bin"
   cp "$source_bin" "$package_dir/bin/$binary"
-  chmod 755 "$package_dir/bin/$binary" 2>/dev/null || true
-  asset_platform="$platform"
-  [[ "$platform" == linux-* ]] && asset_platform="$platform-musl"
-  asset_path="$workdir/release/landstrip-$version-$asset_platform.tar.gz"
-  tar -C "$package_dir/bin" -czf "$asset_path" "$binary"
-  write_sha256_sidecar "$asset_path"
+  chmod 755 "$package_dir/bin/$binary"
+  cp "$asset_path" "$checksum_path" "$commit_path" "$workdir/release/"
   npm_package_dirs+=("$package_dir")
 done
 

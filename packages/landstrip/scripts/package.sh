@@ -28,7 +28,9 @@ RUSTC="${RUSTC:-rustc}"
 CARGO_ZIGBUILD="${CARGO_ZIGBUILD:-cargo-zigbuild}"
 NODE="${NODE:-node}"
 FILE="${FILE:-file}"
+GZIP="${GZIP:-gzip}"
 READELF="${READELF:-readelf}"
+TAR="${TAR:-tar}"
 ZIG="${ZIG:-zig}"
 
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--no-deprecation"
@@ -43,36 +45,84 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-for command in "$CARGO" "$RUSTC" "$NODE" git tar "$FILE"; do
+sha256_digest() {
+  local output
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum "$1")"
+  else
+    output="$(shasum -a 256 "$1")"
+  fi
+  printf '%s\n' "${output%% *}"
+}
+
+create_tar_artifact() {
+  local source_dir="$1" binary="$2" output="$3"
+  local temporary="$output.tmp.$$"
+
+  "$NODE" -e '
+    const {utimesSync} = require("node:fs");
+    const seconds = Number(process.argv[2]);
+    utimesSync(process.argv[1], seconds, seconds);
+  ' "$source_dir/$binary" "$SOURCE_DATE_EPOCH"
+
+  if [[ "$tar_flavor" == gnu ]]; then
+    if ! "$TAR" --format=ustar --owner=0 --group=0 --numeric-owner \
+      -C "$source_dir" -cf - "$binary" | "$GZIP" -n >"$temporary"; then
+      rm -f "$temporary"
+      return 1
+    fi
+  else
+    if ! COPYFILE_DISABLE=1 "$TAR" --format ustar --uid 0 --gid 0 \
+      --uname root --gname root -C "$source_dir" -cf - "$binary" \
+      | "$GZIP" -n >"$temporary"; then
+      rm -f "$temporary"
+      return 1
+    fi
+  fi
+  mv "$temporary" "$output"
+}
+
+for command in "$CARGO" "$RUSTC" "$NODE" git "$TAR" "$GZIP" "$FILE"; do
   require_command "$command"
 done
 if ! command -v sha256sum >/dev/null 2>&1 && \
   ! command -v shasum >/dev/null 2>&1; then
   die "required command not found: sha256sum or shasum"
 fi
+tar_version="$("$TAR" --version 2>&1)" || die "cannot identify $TAR"
+case "$tar_version" in
+  *"GNU tar"*) tar_flavor=gnu ;;
+  *bsdtar*|*libarchive*) tar_flavor=bsd ;;
+  *) die "unsupported tar implementation: ${tar_version%%$'\n'*}" ;;
+esac
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
   || die "not inside a Git repository"
-# shellcheck source=../../../scripts/sha256.sh
-source "$repo_root/scripts/sha256.sh"
 cd "$repo_root"
-
 [[ -z "$(git status --porcelain)" ]] || die "working directory is not clean"
-package_commit="$(git rev-parse HEAD)"
 
-version="$("$NODE" -p "require('$repo_root/packages/landstrip-api/package.json').version")"
+head_commit="$(git rev-parse HEAD)"
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$head_commit")"
+export SOURCE_DATE_EPOCH
+
+cargo_root="$repo_root/packages/landstrip"
+package_json="$repo_root/packages/landstrip-api/package.json"
+[[ -f "$cargo_root/Cargo.toml" ]] || die "missing $cargo_root/Cargo.toml"
+[[ -f "$package_json" ]] || die "missing $package_json"
+
+version="$("$NODE" -p "require('$package_json').version")"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid package.json version: $version"
-
 cargo_version="$(
   sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
-    "$repo_root/packages/landstrip/Cargo.toml" | head -1
+    "$cargo_root/Cargo.toml" | head -1
 )"
 [[ "$version" == "$cargo_version" ]] \
   || die "package.json version $version does not match Cargo.toml $cargo_version"
+printf 'packaging landstrip %s (%s)\n' "$version" "${head_commit:0:12}"
 rust_host_triple="$("$RUSTC" --print host-tuple)"
 [[ -n "$rust_host_triple" ]] || die "cannot determine rustc host triple"
 
-# Keep packaging builds out of the developer target tree.
 package_target_root="${CARGO_TARGET_DIR:-$repo_root/packages/landstrip/target/package}"
 
 # platform|rust-triple|binary-name
@@ -151,15 +201,15 @@ smoke_host_binary() {
 rustup_has_target() {
   local triple="$1"
   command -v rustup >/dev/null 2>&1 || return 0
-  rustup target list --installed | grep -Fxq "$triple"
+  rustup target list --installed | grep -Fx "$triple" >/dev/null
 }
 
 # Host ~/.cargo/config.toml (mold/clang for all Linux) sets -C linker and
 # opts cargo-zigbuild out of zig cc. Use a dedicated CARGO_HOME with no config.
 package_cargo_home() {
   local cargo_home="${XDG_CACHE_HOME:-$HOME/.cache}/landstrip/package-cargo"
-  mkdir -p "$cargo_home"
-  rm -f "$cargo_home/config.toml" "$cargo_home/config"
+  mkdir -p "$cargo_home" || return 1
+  rm -f "$cargo_home/config.toml" "$cargo_home/config" || return 1
   printf '%s\n' "$cargo_home"
 }
 
@@ -167,11 +217,11 @@ build_with_zigbuild() {
   local triple="$1"
   local target_dir="$package_target_root/$triple"
   local cargo_home zig_path
-  cargo_home="$(package_cargo_home)"
-  zig_path="$(command -v "$ZIG")"
+  cargo_home="$(package_cargo_home)" || return 1
+  zig_path="$(command -v "$ZIG")" || return 1
 
   (
-    cd "$repo_root/packages/landstrip" || exit 1
+    cd "$cargo_root" || exit 1
     export CARGO_HOME="$cargo_home"
     export CARGO_TARGET_DIR="$target_dir"
     export CARGO_ZIGBUILD_ZIG_PATH="$zig_path"
@@ -185,30 +235,24 @@ build_native() {
   local target_dir="$package_target_root/$triple"
 
   (
-    cd "$repo_root/packages/landstrip" || exit 1
+    cd "$cargo_root" || exit 1
     CARGO_TARGET_DIR="$target_dir" "$CARGO" build --release --target "$triple"
   )
 }
 
 needs_zigbuild=0
+validated=()
 for platform in "${requested[@]}"; do
   entry="$(platform_entry "$platform")" \
     || die "unknown platform: $platform (supported: $supported_platforms)"
+  for previous in "${validated[@]}"; do
+    [[ "$platform" != "$previous" ]] || die "duplicate platform: $platform"
+  done
+  validated+=("$platform")
   IFS='|' read -r _ triple _ <<<"$entry"
   if [[ "$(package_build_driver "$rust_host_triple" "$triple")" == zigbuild ]]; then
     needs_zigbuild=1
   fi
-done
-mkdir -p artifacts
-
-# Invalidate every platform so a subset or partial build cannot mix runs.
-for entry in "${platforms[@]}"; do
-  IFS='|' read -r platform _ binary <<<"$entry"
-  rm -f "npm/$platform/bin/$binary" \
-    "artifacts/${platform}.bin.sha256" \
-    "artifacts/${platform}.bin.sha256.tmp" \
-    "artifacts/${platform}.tar.gz" \
-    "artifacts/${platform}.tar.gz.sha256"
 done
 
 if ((needs_zigbuild)); then
@@ -217,8 +261,46 @@ if ((needs_zigbuild)); then
 fi
 
 built=()
-skipped=()
 failed=()
+
+stage_root="$(mktemp -d "$repo_root/.package-stage.XXXXXX")"
+publication_started=0
+publication_committed=0
+publish_paths=()
+backup_root="$stage_root/backup"
+cleanup() {
+  local status=$? path backup rollback_failed=0
+
+  trap - EXIT
+  trap '' HUP INT TERM
+  if ((publication_started && !publication_committed)); then
+    for path in "${publish_paths[@]}"; do
+      backup="$backup_root/$path"
+      if [[ -f "$backup" ]]; then
+        mkdir -p "$(dirname "$path")" || rollback_failed=1
+        mv -f "$backup" "$path" || rollback_failed=1
+      else
+        rm -f "$path" || rollback_failed=1
+      fi
+    done
+    if ((rollback_failed)); then
+      printf 'release publication and rollback failed; backups preserved at %s\n' \
+        "$stage_root" >&2
+      status=1
+    else
+      printf 'previous release outputs restored\n' >&2
+    fi
+  fi
+  if ((rollback_failed == 0)); then
+    rm -rf -- "$stage_root" || status=1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir -p "$stage_root/artifacts"
 
 for platform in "${requested[@]}"; do
   entry="$(platform_entry "$platform")" \
@@ -226,10 +308,10 @@ for platform in "${requested[@]}"; do
 
   IFS='|' read -r _ triple binary <<<"$entry"
   package_dir="npm/$platform"
+  stage_package_dir="$stage_root/$package_dir"
   [[ -f "$package_dir/package.json" ]] || die "missing $package_dir/package.json"
 
   # Compare Rust triples because Node's platform omits the libc/toolchain ABI
-  # (for example, linux-x64 can target x86_64-unknown-linux-musl).
   if [[ "$(package_build_driver "$rust_host_triple" "$triple")" == cargo ]]; then
     printf '==> %s (%s via cargo)\n' "$platform" "$triple"
     if ! build_native "$triple"; then
@@ -273,23 +355,25 @@ for platform in "${requested[@]}"; do
       ;;
   esac
 
-  mkdir -p "$package_dir/bin"
-  cp "$source_bin" "$package_dir/bin/$binary"
-  chmod 755 "$package_dir/bin/$binary" 2>/dev/null || true
+  mkdir -p "$stage_package_dir/bin"
+  cp "$source_bin" "$stage_package_dir/bin/$binary"
+  artifact="landstrip-$version-$platform.tar.gz"
+  chmod 755 "$stage_package_dir/bin/$binary"
 
-  if ! smoke_host_binary "$platform" "$package_dir/bin/$binary"; then
+  if ! smoke_host_binary "$platform" "$stage_package_dir/bin/$binary"; then
     failed+=("$platform: host smoke test failed")
     printf 'fail: %s (host smoke test failed)\n' "$platform" >&2
     continue
   fi
 
-  tar -C "$package_dir/bin" -czf "artifacts/${platform}.tar.gz" "$binary"
-  write_sha256_sidecar "artifacts/${platform}.tar.gz"
-  write_binary_receipt "artifacts/${platform}.bin.sha256" \
-    "$package_dir/bin/$binary" "$version" "$package_commit"
+  create_tar_artifact \
+    "$stage_package_dir/bin" "$binary" "$stage_root/artifacts/$artifact"
+  digest="$(sha256_digest "$stage_root/artifacts/$artifact")"
+  printf '%s  %s\n' "$digest" "$artifact" \
+    >"$stage_root/artifacts/$artifact.sha256"
+  printf '%s\n' "$head_commit" >"$stage_root/artifacts/$artifact.commit"
   built+=("$platform")
-  printf 'packaged %s -> npm/%s/bin/%s and artifacts/%s.tar.gz\n' \
-    "$platform" "$platform" "$binary" "$platform"
+  printf 'staged %s\n' "$platform"
 done
 
 printf '\n'
@@ -297,10 +381,6 @@ if ((${#built[@]})); then
   printf 'built: %s\n' "${built[*]}"
 else
   printf 'built: (none)\n'
-fi
-if ((${#skipped[@]})); then
-  printf 'skipped:\n'
-  printf '  %s\n' "${skipped[@]}"
 fi
 if ((${#failed[@]})); then
   printf 'failed:\n' >&2
@@ -311,12 +391,65 @@ if ((${#built[@]} == 0)); then
   die "no platforms were packaged"
 fi
 
-if [[ "${PACKAGE_STRICT:-0}" == 1 ]]; then
-  if ((${#skipped[@]} + ${#failed[@]} > 0)); then
-    die "PACKAGE_STRICT=1 and some platforms were skipped or failed"
-  fi
+if [[ "${PACKAGE_STRICT:-0}" == 1 ]] && ((${#failed[@]} > 0)); then
+  die "PACKAGE_STRICT=1 and some platforms failed"
 fi
 
+for platform in "${built[@]}"; do
+  entry="$(platform_entry "$platform")"
+  IFS='|' read -r _ _ binary <<<"$entry"
+  artifact="landstrip-$version-$platform.tar.gz"
+  stale_artifact="artifacts/landstrip-$version-$platform.AppImage"
+
+  [[ -f "$stage_root/npm/$platform/bin/$binary" ]] \
+    || die "staged binary is missing for $platform"
+  publish_paths+=("npm/$platform/bin/$binary")
+  for suffix in '' .sha256 .commit; do
+    [[ -f "$stage_root/artifacts/$artifact$suffix" ]] \
+      || die "staged artifact is missing: $artifact$suffix"
+    publish_paths+=("artifacts/$artifact$suffix" "$stale_artifact$suffix")
+  done
+done
+
+for path in "${publish_paths[@]}"; do
+  if [[ -f "$path" ]]; then
+    mkdir -p "$backup_root/$(dirname "$path")"
+    cp -p "$path" "$backup_root/$path" \
+      || die "cannot back up release output: $path"
+  elif [[ -e "$path" ]]; then
+    die "release output is not a regular file: $path"
+  fi
+done
+
+publication_started=1
+for platform in "${built[@]}"; do
+  entry="$(platform_entry "$platform")"
+  IFS='|' read -r _ _ binary <<<"$entry"
+  package_dir="npm/$platform"
+  artifact="landstrip-$version-$platform.tar.gz"
+  stale_artifact="artifacts/landstrip-$version-$platform.AppImage"
+
+  mkdir -p "$package_dir/bin" artifacts \
+    || die "cannot prepare release output for $platform"
+  mv -f "$stage_root/$package_dir/bin/$binary" "$package_dir/bin/$binary" \
+    || die "cannot publish binary for $platform"
+  for suffix in '' .sha256 .commit; do
+    mv -f "$stage_root/artifacts/$artifact$suffix" \
+      "artifacts/$artifact$suffix" \
+      || die "cannot publish artifact: $artifact$suffix"
+    rm -f "$stale_artifact$suffix" \
+      || die "cannot remove stale artifact: $stale_artifact$suffix"
+  done
+done
+publication_committed=1
+
+for platform in "${built[@]}"; do
+  entry="$(platform_entry "$platform")"
+  IFS='|' read -r _ _ binary <<<"$entry"
+  artifact="landstrip-$version-$platform.tar.gz"
+  printf 'packaged %s -> npm/%s/bin/%s and artifacts/%s{,.sha256,.commit}\n' \
+    "$platform" "$platform" "$binary" "$artifact"
+done
 if ((${#failed[@]} > 0)); then
   exit 2
 fi
