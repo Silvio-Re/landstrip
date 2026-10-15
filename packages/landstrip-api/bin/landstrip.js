@@ -8,7 +8,11 @@ const { binaryPath } = require('../lib');
 let child;
 
 try {
-  child = spawn(binaryPath(), process.argv.slice(2), { stdio: 'inherit' });
+  const options = { stdio: 'inherit' };
+  if (process.platform === 'linux') {
+    options.env = { ...process.env, APPIMAGE_EXTRACT_AND_RUN: '1' };
+  }
+  child = spawn(binaryPath(), process.argv.slice(2), options);
 } catch (error) {
   console.error(error.message);
   process.exit(1);
