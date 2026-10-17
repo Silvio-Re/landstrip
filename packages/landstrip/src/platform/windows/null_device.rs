@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::{NamedMutex, OwnedLocal, ToWideNul, own_handle, win32_error};

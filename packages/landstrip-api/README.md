@@ -46,4 +46,4 @@ Run `make ci` from the repository root.
 ## License
 
 [Apache-2.0](LICENSE); bundled native binaries are
-[LGPL-3.0-or-later](../landstrip/LICENSE).
+[LGPL-2.1-or-later](../landstrip/LICENSE).
