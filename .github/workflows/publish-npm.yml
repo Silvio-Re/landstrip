@@ -57,6 +57,16 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: .npm-publisher/scripts/publish-npm-provenance.sh verify "$VERSION" "$RUNNER_TEMP/npm-release"
+      - name: Smoke test the packaged Linux binary without FUSE
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          smoke_dir="$(mktemp -d)"
+          trap 'rm -rf "$smoke_dir"' EXIT
+          tar -xzf "$RUNNER_TEMP/npm-release/landstrip-landstrip-linux-x64-$VERSION.tgz" \
+            -C "$smoke_dir" package/bin/landstrip
+          actual="$(APPIMAGE_EXTRACT_AND_RUN=1 "$smoke_dir/package/bin/landstrip" --version)"
+          test "$actual" = "landstrip $VERSION"
       - name: Publish exact tarballs to npm with provenance
         env:
           VERSION: ${{ inputs.version }}
