@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright (C) Jarkko Sakkinen 2026
 #
-# Build a type-2 AppImage around a packaged static landstrip binary.
+# Build a type-2 AppImage around a packaged landstrip binary.
 # Usage: make-appimage.sh <linux-x64|linux-arm64> <binary> <output>
 set -euo pipefail
 
@@ -172,6 +172,29 @@ verify_elf_architecture() {
   fi
 }
 
+verify_squashfs_payload() {
+  local path="$1" offset file_size magic compression major minor bytes_used
+
+  offset="$(wc -c <"$runtime")" || return 1
+  file_size="$(wc -c <"$path")" || return 1
+  if ((offset > file_size || file_size - offset < 96)); then
+    printf 'AppImage has no complete SquashFS superblock: %s\n' "$path" >&2
+    return 1
+  fi
+  magic="$(od -An -tx1 -j "$offset" -N4 "$path" | tr -d ' \n')" || return 1
+  if ! read_uint_le "$path" $((offset + 20)) 2 compression ||
+    ! read_uint_le "$path" $((offset + 28)) 2 major ||
+    ! read_uint_le "$path" $((offset + 30)) 2 minor ||
+    ! read_uint_le "$path" $((offset + 40)) 8 bytes_used; then
+    return 1
+  fi
+  if [[ "$magic" != 68737173 ]] ||
+    ((compression != 1 || major != 4 || minor != 0 || bytes_used < 96 || bytes_used > file_size - offset)); then
+    printf 'AppImage has an invalid, truncated or non-gzip SquashFS payload: %s\n' "$path" >&2
+    return 1
+  fi
+}
+
 (($# == 3)) || die "usage: $0 <linux-x64|linux-arm64> <binary> <output>"
 platform="$1"
 binary="$2"
@@ -213,50 +236,33 @@ fi
 runtime="$(cd "$(dirname "$runtime")" && pwd)/$(basename "$runtime")"
 
 runner=direct
-if [[ -n "${APPIMAGETOOL:-}" ]]; then
-  appimagetool="$(command -v "$APPIMAGETOOL" 2>/dev/null)" \
-    || die "required command not found: $APPIMAGETOOL"
+if [[ -n "${MKSQUASHFS:-}" || "$(uname -s)" == Linux ]]; then
+  mksquashfs="$(command -v "${MKSQUASHFS:-mksquashfs}" 2>/dev/null)" \
+    || die "required command not found: ${MKSQUASHFS:-mksquashfs} (install squashfs-tools)"
 else
   case "$(uname -m)" in
-    x86_64|amd64)
-      tool_arch=x86_64
-      container_platform=linux/amd64
-      tool_sha=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
-      ;;
-    aarch64|arm64)
-      tool_arch=aarch64
-      container_platform=linux/arm64
-      tool_sha=f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
-      ;;
+    x86_64|amd64) container_platform=linux/amd64 ;;
+    aarch64|arm64) container_platform=linux/arm64 ;;
     *) die "unsupported build architecture: $(uname -m)" ;;
   esac
-  appimagetool="$cache_dir/appimagetool-1.9.1-$tool_arch.AppImage"
-  download_verified \
-    "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-$tool_arch.AppImage" \
-    "$tool_sha" "$appimagetool"
-  chmod 755 "$appimagetool"
-  if [[ "$(uname -s)" != Linux ]]; then
-    if [[ -n "${CONTAINER:-}" && "${CONTAINER:-}" != docker ]]; then
-      if command -v "$CONTAINER" >/dev/null 2>&1; then
-        container_cmd="$CONTAINER"
-      else
-        die "required command not found: $CONTAINER"
-      fi
-    elif command -v docker >/dev/null 2>&1; then
-      container_cmd=docker
-    elif command -v container >/dev/null 2>&1; then
-      container_cmd=container
-    elif command -v podman >/dev/null 2>&1; then
-      container_cmd=podman
-    else
-      die "required command not found: docker or container"
-    fi
-    runner=container
+  if [[ -n "${CONTAINER:-}" && "${CONTAINER:-}" != docker ]]; then
+    command -v "$CONTAINER" >/dev/null 2>&1 || die "required command not found: $CONTAINER"
+    container_cmd="$CONTAINER"
+  elif command -v docker >/dev/null 2>&1; then
+    container_cmd=docker
+  elif command -v container >/dev/null 2>&1; then
+    container_cmd=container
+  elif command -v podman >/dev/null 2>&1; then
+    container_cmd=podman
+  else
+    die "required command not found: docker or container"
   fi
+  runner=container
 fi
 
 appdir="$(mktemp -d "$output_dir/.landstrip-appdir.XXXXXX")"
-trap 'rm -rf "$appdir"' EXIT
+payload="$appdir.squashfs"
+trap 'rm -rf "$appdir"; rm -f "$payload"' EXIT
 mkdir -p "$appdir/usr/bin" "$appdir/usr/share/licenses/landstrip"
 cp "$binary" "$appdir/usr/bin/landstrip"
 chmod 755 "$appdir/usr/bin/landstrip"
@@ -279,9 +285,10 @@ EOF
 ln -s landstrip.png "$appdir/.DirIcon"
 rm -f "$output"
 
+# appimagetool 1.9.1 bundles a Zstandard-only compressor. Build gzip SquashFS
+# directly: both the pinned runtime and older AppImageLauncher support zlib.
 if [[ "$runner" == direct ]]; then
-  ARCH="$arch" APPIMAGE_EXTRACT_AND_RUN=1 "$appimagetool" \
-    --runtime-file "$runtime" "$appdir" "$output"
+  "$mksquashfs" "$appdir" "$payload" -comp gzip -noappend -all-root
 else
   container_args=()
   if [[ -n "${CONTAINER_CPUS:-}" ]]; then
@@ -292,26 +299,24 @@ else
   fi
   "$container_cmd" run --rm --platform "$container_platform" \
     "${container_args[@]}" \
-    -e ARCH="$arch" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-    -e OUTPUT_NAME="$(basename "$output")" \
+    -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+    -e OUTPUT_NAME="$(basename "$payload")" \
     -v "$appdir:/AppDir:ro" \
     -v "$output_dir:/out" \
-    -v "$appimagetool:/tools/appimagetool:ro" \
-    -v "$runtime:/tools/runtime:ro" \
     alpine:3.22 sh -ceu '
-      apk add --no-cache file >/dev/null
-      APPIMAGE_EXTRACT_AND_RUN=1 /tools/appimagetool \
-        --runtime-file /tools/runtime /AppDir "/out/$OUTPUT_NAME"
+      apk add --no-cache squashfs-tools >/dev/null
+      mksquashfs /AppDir "/out/$OUTPUT_NAME" -comp gzip -noappend -all-root
       chown "$HOST_UID:$HOST_GID" "/out/$OUTPUT_NAME"
     '
 fi
 
-[[ -f "$output" ]] || die "appimagetool did not create $output"
+[[ -f "$payload" ]] || die "mksquashfs did not create $payload"
+cat "$runtime" "$payload" >"$output"
 if ! is_type2_appimage "$output"; then
   rm -f "$output"
   die "not a type-2 AppImage: $output"
 fi
-if ! verify_elf_architecture "$output" "AppImage"; then
+if ! verify_elf_architecture "$output" "AppImage" || ! verify_squashfs_payload "$output"; then
   rm -f "$output"
   exit 1
 fi
