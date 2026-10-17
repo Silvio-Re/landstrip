@@ -690,6 +690,7 @@ export function createLandstripLauncherEnvironment(
   hostEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
+  if (platform === 'linux') return { ...providerEnv, APPIMAGE_EXTRACT_AND_RUN: '1' };
   if (platform !== 'win32') return providerEnv;
   const result: NodeJS.ProcessEnv = { ...providerEnv };
   for (const name of WINDOWS_LAUNCHER_ENVIRONMENT) {
@@ -1740,7 +1741,7 @@ function createLandstripIntegrationWithPrompts(
       const child = spawn(binaryPath(), landstripArgs, {
         ...spawnOptions,
         cwd: options.cwd,
-        env: workerEnv,
+        env: createLandstripLauncherEnvironment(workerEnv),
         detached: true,
         stdio,
       });
