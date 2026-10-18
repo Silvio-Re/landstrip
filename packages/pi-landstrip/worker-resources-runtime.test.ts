@@ -77,7 +77,7 @@ async function checkResourceStartup(): Promise<void> {
     expect(resourcePaths).toContain(promptFile);
     expect(resourcePaths).not.toContain(promptDir);
     expect(resourcePaths).not.toContain(excluded);
-    const prompts = vi.fn(async () => undefined);
+    const prompts = vi.fn(async (): Promise<string | undefined> => undefined);
     const ctx = {
       cwd,
       hasUI: true,
@@ -92,7 +92,90 @@ async function checkResourceStartup(): Promise<void> {
       ui: { select: prompts, custom: prompts, notify() {}, setStatus() {} },
     } as unknown as ExtensionContext;
     const integration = createLandstripIntegration({ registerBashTool: false, cwd });
-    for (const includeResources of [false, true]) {
+    const sandboxPath = join(agentDir, 'sandbox.json');
+    const startup = {
+      ctx,
+      cwd,
+      command: process.execPath,
+      args: [],
+      env: {},
+      readPaths: [cwd, process.execPath],
+      writePaths: [],
+    };
+    for (const mode of ['rejected', 'broad-allow', 'headless', 'hard', 'protected', 'cancelled']) {
+      writeFileSync(
+        sandboxPath,
+        JSON.stringify({
+          enabled: true,
+          filesystem: {
+            denyRead: [mode === 'broad-allow' ? cwd : root],
+            allowRead: mode === 'broad-allow' ? [root] : [],
+            denyReadAlways: mode === 'hard' ? [cwd] : [],
+          },
+        }),
+      );
+      prompts.mockClear();
+      await expect(
+        integration.prepareRpcWorker({
+          ...startup,
+          ctx: mode === 'headless' ? { ...ctx, hasUI: false } : ctx,
+          protectedPaths: mode === 'protected' ? [cwd] : [],
+          signal: mode === 'cancelled' ? AbortSignal.abort() : undefined,
+        }),
+      ).rejects.toThrow(/denied|cancelled/);
+      expect(prompts).toHaveBeenCalledTimes(['rejected', 'broad-allow'].includes(mode) ? 1 : 0);
+    }
+    for (const mode of ['once', 'session', 'saved', 'global']) {
+      writeFileSync(
+        sandboxPath,
+        JSON.stringify({
+          enabled: true,
+          filesystem: {
+            denyRead: [mode === 'global' ? root : cwd],
+            allowRead: mode === 'saved' ? [cwd] : [],
+          },
+        }),
+      );
+      const choices: Record<string, string> = {
+        once: 'Allow once',
+        session: 'Allow for this session',
+        global: 'Allow for all projects — save to ~/.pi/agent/sandbox.json',
+      };
+      prompts.mockImplementation(async () => choices[mode]);
+      ctx.ui.confirm = async () => true;
+      prompts.mockClear();
+      const scoped = createLandstripIntegration({ registerBashTool: false, cwd });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const prepared = await scoped.prepareRpcWorker(startup);
+        await prepared.dispose();
+      }
+      expect(prompts).toHaveBeenCalledTimes(mode === 'saved' ? 0 : mode === 'once' ? 2 : 1);
+      if (mode === 'global') {
+        expect(JSON.parse(readFileSync(sandboxPath, 'utf8')).filesystem.allowRead).toContain(cwd);
+        expect(JSON.parse(readFileSync(sandboxPath, 'utf8')).filesystem.allowRead).not.toContain(
+          root,
+        );
+        const fresh = createLandstripIntegration({ registerBashTool: false, cwd });
+        const prepared = await fresh.prepareRpcWorker({
+          ...startup,
+          ctx: { ...ctx, hasUI: false },
+        });
+        await prepared.dispose();
+      }
+    }
+    for (const [includeResources, explicitDeny] of [
+      [false, false],
+      [true, false],
+      [true, true],
+    ]) {
+      writeFileSync(
+        sandboxPath,
+        JSON.stringify({
+          enabled: true,
+          filesystem: { denyRead: explicitDeny ? [root] : [] },
+        }),
+      );
+      prompts.mockImplementation(async () => (explicitDeny ? 'Allow once' : undefined));
       prompts.mockClear();
       const finished = new Error('resource fixture finished');
       const runtime = new SubagentRuntime(
@@ -111,6 +194,11 @@ async function checkResourceStartup(): Promise<void> {
                 ? options.readPaths
                 : options.readPaths.filter((path) => !resourcePaths.includes(path)),
             });
+            const startupPromptCount = prompts.mock.calls.length;
+            if (includeResources) {
+              if (explicitDeny) expect(startupPromptCount).toBeGreaterThan(0);
+              else expect(startupPromptCount).toBe(0);
+            }
             const rpc = new RpcProcess({
               ...launch,
               requestTimeoutMs: timeout,
@@ -155,7 +243,7 @@ async function checkResourceStartup(): Promise<void> {
                   );
                 expect(existsSync(marker)).toBe(false);
               }
-              if (includeResources) expect(prompts).not.toHaveBeenCalled();
+              if (includeResources) expect(prompts).toHaveBeenCalledTimes(startupPromptCount);
             } finally {
               try {
                 await rpc.stop();

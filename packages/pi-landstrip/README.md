@@ -32,9 +32,11 @@ and platform limits, including Windows read grants and hard-denial restrictions.
 
 Worker boundaries:
 
-- Bootstrap grants override bundled `denyRead`, never global/trusted-project
-  denies. Denied startup resources prevent launch. Legacy `/home` or `/Users`
-  denies are explicit overrides; remove them only if unintended.
+- Workers can read their startup files despite the bundled `denyRead` defaults.
+  If your own sandbox settings block a needed path with `denyRead`, Pi asks for
+  approval before starting the worker. Declining prevents startup. Existing
+  `allowRead` grants and session approvals are reused. `denyReadAlways` blocks
+  startup without asking.
 - Hard read denials also apply to shell host reads. Private workers protect
   parent auth-file/lock roots with `denyReadAlways` and `denyWrite`;
   private worker authentication is unsupported on Windows.

@@ -167,8 +167,12 @@ interface LandstripBashCallbacks {
 
 interface ExecutionAllowances {
   readonly permissionPromptLabel?: string;
-  // Present only for worker launches; never let a broker approve these rules.
-  explicitDenyRead?: { patterns: string[]; globRoots: Map<string, string[]> };
+  // Bootstrap grants must not silently override configured read denials.
+  explicitDenyRead?: {
+    patterns: string[];
+    globRoots: Map<string, string[]>;
+    approvedPaths: string[];
+  };
   readonly protectedPaths?: string[];
   readonly domains: string[];
   readonly readPaths: string[];
@@ -219,7 +223,7 @@ const NETWORK_PERMISSION_OPTIONS: PromptOption[] = [
 function loadSandboxConfig(
   cwd: string,
   includeProject: boolean,
-): SandboxConfig & { explicitDenyRead: string[] } {
+): SandboxConfig & { explicitDenyRead: string[]; explicitAllowRead: string[] } {
   const projectConfigPath = join(cwd, '.pi', 'sandbox.json');
   const globalConfigPath = join(getAgentDir(), 'sandbox.json');
 
@@ -241,6 +245,10 @@ function loadSandboxConfig(
     explicitDenyRead: mergeArray(
       globalOverrides.filesystem?.denyRead ?? [],
       projectOverrides.filesystem?.denyRead,
+    ),
+    explicitAllowRead: mergeArray(
+      globalOverrides.filesystem?.allowRead ?? [],
+      projectOverrides.filesystem?.allowRead,
     ),
   };
 }
@@ -1119,9 +1127,22 @@ function createLandstripIntegrationWithPrompts(
     filePath: string,
     cwd: string,
     allowances?: ExecutionAllowances,
+    scope = sessionScopeFor(filePath, cwd),
   ): Promise<void> {
     const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
-    const scope = sessionScopeFor(filePath, cwd);
+    if (
+      allowances?.explicitDenyRead &&
+      !readAllowed(
+        filePath,
+        [scope],
+        mergeArray(loadConfig(cwd).filesystem.denyRead, [
+          ...allowances.explicitDenyRead.patterns,
+          ...[...allowances.explicitDenyRead.globRoots.values()].flat(),
+        ]),
+        cwd,
+      )
+    )
+      scope = filePath;
     const configPath =
       choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
     if (configPath) {
@@ -1136,6 +1157,7 @@ function createLandstripIntegrationWithPrompts(
     }
     const target = choice === 'once' ? allowances?.readPaths : sessionAllowedReadPaths;
     if (target && !target.includes(scope)) target.push(scope);
+    allowances?.explicitDenyRead?.approvedPaths.push(scope);
     noteScope(ctx, 'Read', choice, filePath, scope);
   }
 
@@ -1383,19 +1405,20 @@ function createLandstripIntegrationWithPrompts(
   }
 
   async function resolveTrapQuery(
-    trap: LandstripQueryTrap,
+    trap: LandstripQueryTrap | { kind: 'filesystem'; operation: 'read'; path: string },
     ctx: ExtensionContext,
     cwd: string,
     allowances: ExecutionAllowances,
     promptOnBlock: boolean,
     signal?: AbortSignal,
+    readScope?: string,
   ): Promise<TrapQueryResult> {
     // The broker knows only address:port, and no sandbox field can express a grant
     // for one non-loopback endpoint: allowedDomains is enforced by the proxy,
     // allowLocalBinding grants all loopback endpoints, and allowNetwork disables
     // network enforcement. So a non-loopback connection is granted for the session
     // or not at all.
-    if (!isFilesystemTrap(trap)) {
+    if (trap.kind !== 'filesystem') {
       const key = `${trap.operation}\u0000${trap.target}`;
       const current = (): TrapQueryResult | undefined =>
         sessionAllowedTargets.includes(key) || allowances.targets.includes(key)
@@ -1447,7 +1470,21 @@ function createLandstripIntegrationWithPrompts(
           allowances.explicitDenyRead.globRoots,
         )
       ) {
-        return { action: 'deny', reason: 'hard-deny' };
+        return isPathReadAllowed(
+          path,
+          mergeArray(config.explicitAllowRead, [
+            ...sessionAllowedReadPaths,
+            ...allowances.explicitDenyRead.approvedPaths,
+          ]),
+          mergeArray(config.explicitDenyRead, [
+            ...allowances.explicitDenyRead.patterns,
+            ...[...allowances.explicitDenyRead.globRoots.values()].flat(),
+          ]),
+          cwd,
+          { requireAllowMatch: true },
+        )
+          ? { action: 'allow' }
+          : undefined;
       }
       if (
         trap.operation === 'write' &&
@@ -1496,7 +1533,7 @@ function createLandstripIntegrationWithPrompts(
         if (choice === 'abort' || promptSignal.aborted)
           return { action: 'deny', reason: 'rejected' };
         if (trap.operation === 'read') {
-          await applyReadChoice(ctx, choice, path, cwd, allowances);
+          await applyReadChoice(ctx, choice, path, cwd, allowances, readScope);
         } else {
           await applyWriteChoice(ctx, choice, path, cwd, allowances);
         }
@@ -1641,18 +1678,37 @@ function createLandstripIntegrationWithPrompts(
     processAllowances.explicitDenyRead = {
       patterns: config.explicitDenyRead,
       globRoots: explicitDenyGlobRoots,
+      approvedPaths: [],
     };
-    for (const path of [options.cwd, options.command, ...processAllowances.readPaths]) {
+    const startupPaths = [
+      ...new Set([options.cwd, options.command, ...processAllowances.readPaths]),
+    ];
+    for (const path of startupPaths) {
       if (/[*?[\]]/.test(path)) {
         throw new Error(`Worker startup read path "${path}" must be a concrete path, not a glob`);
       }
-      const deny = config.explicitDenyRead.find((pattern) =>
-        matchesPattern(path, [pattern], options.cwd, explicitDenyGlobRoots),
+      if (
+        matchesPattern(
+          path,
+          mergeArray(config.filesystem.denyReadAlways, processAllowances.protectedPaths),
+          options.cwd,
+        )
+      ) {
+        throw new Error(`Worker startup read path "${path}" is denied by sandbox policy`);
+      }
+    }
+    for (const path of startupPaths) {
+      const result = await resolveTrapQuery(
+        { kind: 'filesystem', operation: 'read', path },
+        options.ctx,
+        options.cwd,
+        processAllowances,
+        true,
+        options.signal,
+        normalizeBlockedPath(path, options.cwd),
       );
-      if (deny !== undefined) {
-        throw new Error(
-          `Worker startup read path "${path}" conflicts with explicit filesystem.denyRead "${deny}"; change the configured deny or the worker startup paths`,
-        );
+      if (result.action !== 'allow') {
+        throw new Error(`Worker startup read access denied: ${path} (${result.reason})`);
       }
     }
     const { token: proxyToken, authorization: proxyAuthorization } = createProxyCredentials();
