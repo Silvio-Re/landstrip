@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::{
-    AppContainerProfile, ProcThreadAttributeList, current_process_in_job, update_attribute,
+    AppContainerProfile, LookupRoots, ProcThreadAttributeList, current_process_in_job,
+    update_attribute,
 };
 use crate::config::AppContainerMode;
 use crate::error::Mechanism;
@@ -298,10 +299,11 @@ impl ProbeToken {
                     bail!("probe token does not have the requested AppContainer mode");
                 }
                 let _impersonation = self.impersonate()?;
-                null_device::probe()
+                null_device::probe()?;
+                LookupRoots::discover().probe()
             })
-            .context("spawn null-device probe thread")?
+            .context("spawn AppContainer probe thread")?
             .join()
-            .map_err(|_| anyhow!("null-device probe thread panicked"))?
+            .map_err(|_| anyhow!("AppContainer probe thread panicked"))?
     }
 }

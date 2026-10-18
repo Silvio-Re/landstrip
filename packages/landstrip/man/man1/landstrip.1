@@ -31,7 +31,7 @@ Report sandbox health.
 .It Cm windows install
 Install restricted-user isolation; requires elevation.
 .It Cm windows prepare-appcontainer
-Prepare null-device read/write access for standard AppContainer and LPAC;
+Prepare null-device and root directory lookup access for standard AppContainer and LPAC;
 requires elevation and verifies both modes without changing restricted users.
 .It Cm windows status
 Report the active implementation and its health.
@@ -208,7 +208,7 @@ In AppContainer mode,
 .Cm doctor
 and
 .Cm windows status
-probe fresh null-device opens, reads, and writes with standard and LPAC tokens.
+probe fresh null-device and root directory lookup access with standard and LPAC tokens.
 Setup/access failures produce unhealthy reports with mode-specific errors,
 not certification that every tool or dependency can start.
 Integration tests require null-device preparation and do not request elevation.

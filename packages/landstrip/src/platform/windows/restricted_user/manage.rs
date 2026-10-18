@@ -63,6 +63,7 @@ pub(crate) fn manage(command: &WindowsCommand) -> Result<WindowsStatusReport> {
         WindowsCommand::PrepareAppContainer => {
             if is_elevated()? {
                 null_device::prepare()?;
+                appcontainer::LookupRoots::discover().prepare()?;
             } else {
                 elevate("windows prepare-appcontainer")?;
             }

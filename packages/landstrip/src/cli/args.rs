@@ -162,7 +162,7 @@ enum WindowsAction {
     Install(WindowsInstallArgs),
     #[command(
         name = "prepare-appcontainer",
-        about = "Grant AppContainer read/write access to NUL until reboot (requests elevation)"
+        about = "Grant AppContainer access to NUL and root directories (requests elevation)"
     )]
     PrepareAppContainer,
     /// Report the active Windows isolation implementation and its health.

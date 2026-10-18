@@ -8,14 +8,14 @@ mod doctor;
 pub(super) use doctor::{probe_null_device, status};
 
 use super::{
-    NamedMutex, SandboxJob, ToWideNul, is_locked_error, join_command_line, own_handle,
+    NamedMutex, OwnedLocal, SandboxJob, ToWideNul, is_locked_error, join_command_line, own_handle,
     path_access_failed, quote_command_arg, set_path_access, wait_process_exit, win32_error,
     win32_status,
 };
 use crate::config::AppContainerMode;
 use crate::error::{Cause, Error as LandstripError, Mechanism};
 use crate::policy::{AccessPolicy, ReadAccess};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::{self, OpenOptions};
@@ -36,7 +36,7 @@ use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
     NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, DENY_ACCESS, GRANT_ACCESS, REVOKE_ACCESS,
+    ACCESS_MODE, ConvertStringSidToSidW, DENY_ACCESS, GRANT_ACCESS, REVOKE_ACCESS,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -48,9 +48,10 @@ use windows_sys::Win32::Security::{
     WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK,
-    FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING,
+    CreateFileW, DELETE, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
@@ -549,6 +550,158 @@ fn grant_root_access(granted: &mut GrantedAccess, path: &Path, access: u32) -> R
         propagate: true,
     });
     Ok(())
+}
+
+const APP_CONTAINER_GROUP_SIDS: [&str; 2] = ["S-1-15-2-1", "S-1-15-2-2"];
+
+struct LocalSid(OwnedLocal);
+
+impl TryFrom<&str> for LocalSid {
+    type Error = anyhow::Error;
+
+    fn try_from(sid: &str) -> Result<Self> {
+        let wide = sid.to_wide_nul();
+        let mut raw = ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &raw mut raw) } == 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("convert AppContainer group SID {sid}"));
+        }
+        Ok(Self(unsafe { OwnedLocal::from_raw(raw) }))
+    }
+}
+
+impl LocalSid {
+    fn as_ptr(&self) -> PSID {
+        self.0.as_ptr()
+    }
+}
+
+/// Roots requiring lookup permissions for `AppContainer` sandboxes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LookupRoots(Vec<PathBuf>);
+
+impl std::ops::Deref for LookupRoots {
+    type Target = [PathBuf];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl IntoIterator for LookupRoots {
+    type Item = PathBuf;
+    type IntoIter = std::vec::IntoIter<PathBuf>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a LookupRoots {
+    type Item = &'a PathBuf;
+    type IntoIter = std::slice::Iter<'a, PathBuf>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Default for LookupRoots {
+    fn default() -> Self {
+        Self::discover()
+    }
+}
+
+impl LookupRoots {
+    pub(crate) fn discover() -> Self {
+        let mut roots = Vec::new();
+        let system_drive = std::env::var_os("SystemDrive").map_or_else(
+            || r"C:\".to_string(),
+            |drive| {
+                format!(
+                    "{}:\\",
+                    drive.to_string_lossy().trim_end_matches([':', '\\', '/'])
+                )
+            },
+        );
+        let system_root = PathBuf::from(&system_drive);
+        roots.push(system_root.clone());
+
+        if let Some(home) = dirs::home_dir() {
+            if let Some(profiles) = home.parent() {
+                roots.push(profiles.to_path_buf());
+            }
+            for ancestor in home.ancestors() {
+                if ancestor.parent().is_none() {
+                    roots.push(ancestor.to_path_buf());
+                    break;
+                }
+            }
+        } else {
+            roots.push(system_root.join("Users"));
+        }
+        roots.push(system_root.join("Users"));
+
+        let mut seen = std::collections::HashSet::new();
+        roots.retain(|p| p.is_dir() && seen.insert(p.clone()));
+        Self(roots)
+    }
+
+    // ponytail: prepare standard system and profile roots; workspaces outside these need elevation
+    pub(crate) fn prepare(&self) -> Result<()> {
+        let sids = APP_CONTAINER_GROUP_SIDS
+            .into_iter()
+            .map(LocalSid::try_from)
+            .collect::<Result<Vec<_>>>()?;
+
+        let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+        for root in &self.0 {
+            for sid in &sids {
+                set_path_access(
+                    root,
+                    sid.as_ptr(),
+                    ancestor_access,
+                    GRANT_ACCESS,
+                    false,
+                    false,
+                )
+                .map_err(|(api, error)| {
+                    anyhow::anyhow!(
+                        "grant AppContainer lookup access on {}: {api} failed: {error}",
+                        root.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn probe(&self) -> Result<()> {
+        for root in &self.0 {
+            let path_wide = root.to_wide_nul();
+            let handle = unsafe {
+                CreateFileW(
+                    path_wide.as_ptr(),
+                    FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "open {} for AppContainer path lookup; run landstrip windows prepare-appcontainer",
+                        root.display()
+                    )
+                });
+            }
+            unsafe { CloseHandle(handle) };
+        }
+        Ok(())
+    }
 }
 
 struct GrantedPath {
