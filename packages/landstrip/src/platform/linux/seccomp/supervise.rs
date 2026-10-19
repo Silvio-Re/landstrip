@@ -90,13 +90,7 @@ impl<'a> Denials<'a> {
             .into_iter()
             .filter(|denial| code != 0 || denial.report_on_success())
         {
-            let trap = Trap::from(denial);
-            if let Some(trap_fd) = trap_fd
-                && let Err(error) = trap_fd.write(&trap)
-            {
-                log::debug!("trap fd write failed: {error}");
-            }
-            trap.emit();
+            Trap::from(denial).emit_with_fd(trap_fd);
         }
         code
     }

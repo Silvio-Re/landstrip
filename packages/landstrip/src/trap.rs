@@ -7,6 +7,8 @@
 use crate::error::{Error, Mechanism};
 #[cfg(target_os = "linux")]
 use crate::policy::DenialReason;
+#[cfg(unix)]
+use crate::trap_fd::TrapFd;
 use serde::Serialize;
 use std::fmt;
 use std::io::{self, Write};
@@ -240,6 +242,16 @@ impl Trap {
                     .to_owned()
             }
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn emit_with_fd(&self, trap_fd: Option<&TrapFd>) {
+        if let Some(trap_fd) = trap_fd
+            && let Err(error) = trap_fd.write(self)
+        {
+            log::debug!("trap fd write failed: {error}");
+        }
+        self.emit();
     }
 
     pub(crate) fn emit(&self) {

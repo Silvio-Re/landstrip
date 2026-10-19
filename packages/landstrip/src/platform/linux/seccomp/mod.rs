@@ -296,12 +296,7 @@ pub(super) fn run_broker(
                     .find_map(|e| e.downcast_ref::<LandstripError>())
                     .map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from);
                 if handed_off || send_trap(&mut child_sock, &trap).is_err() {
-                    if let Some(trap_fd) = trap_fd
-                        && let Err(error) = trap_fd.write(&trap)
-                    {
-                        log::debug!("trap fd write failed: {error}");
-                    }
-                    trap.emit();
+                    trap.emit_with_fd(trap_fd);
                 }
             }
 

@@ -156,11 +156,8 @@ fn exit_with_error(
 ) -> ! {
     let (trap, exit_code) = error_trap(error);
     #[cfg(unix)]
-    if let Some(trap_fd) = trap_fd
-        && let Err(error) = trap_fd.write(&trap)
-    {
-        log::debug!("trap fd write failed: {error}");
-    }
+    trap.emit_with_fd(trap_fd);
+    #[cfg(not(unix))]
     trap.emit();
     process::exit(exit_code)
 }
