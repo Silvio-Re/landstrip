@@ -39,12 +39,14 @@ impl Denial {
             Self::Network(_, _, _) => true,
         }
     }
+}
 
-    fn into_trap(self) -> Trap {
-        match self {
-            Self::Filesystem(denial) => Trap::filesystem(denial, None),
-            Self::Network(operation, target, process) => {
-                Trap::network(operation, target, process, None)
+impl From<Denial> for Trap {
+    fn from(denial: Denial) -> Self {
+        match denial {
+            Denial::Filesystem(denial) => Self::filesystem(denial, None),
+            Denial::Network(operation, target, process) => {
+                Self::network(operation, target, process, None)
             }
         }
     }
@@ -88,7 +90,7 @@ impl<'a> Denials<'a> {
             .into_iter()
             .filter(|denial| code != 0 || denial.report_on_success())
         {
-            let trap = denial.into_trap();
+            let trap = Trap::from(denial);
             if let Some(trap_fd) = trap_fd
                 && let Err(error) = trap_fd.write(&trap)
             {
