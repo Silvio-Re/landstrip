@@ -224,11 +224,7 @@ pub(super) fn parse_cli() -> Result<ParseOutcome, Error> {
 }
 
 fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Error> {
-    let mut command_line = Vec::with_capacity(args.len() + 1);
-    command_line.push(program);
-    command_line.extend(args);
-
-    let cli = match Cli::try_parse_from(command_line) {
+    let cli = match Cli::try_parse_from(std::iter::once(program).chain(args)) {
         Ok(cli) => cli,
         Err(error)
             if matches!(
