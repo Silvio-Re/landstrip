@@ -49,7 +49,6 @@ it.runIf(['linux', 'darwin', 'win32'].includes(process.platform))(
     const rpc = new RpcProcess({
       command: binaryPath(),
       args: [
-        'run',
         '-p',
         policyPath,
         '--',

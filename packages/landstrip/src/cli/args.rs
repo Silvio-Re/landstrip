@@ -36,7 +36,8 @@ pub(super) enum ParseOutcome {
 #[derive(Debug)]
 pub(super) enum Command {
     Run(RunCommand),
-    Policy(PolicyCommand),
+    Check(PolicyRequest),
+    Resolve(PolicyRequest),
     Doctor,
     #[cfg(target_os = "windows")]
     Windows(WindowsCommand),
@@ -58,12 +59,6 @@ pub(super) struct RunCommand {
 }
 
 #[derive(Debug)]
-pub(super) enum PolicyCommand {
-    Validate(PolicyRequest),
-    Resolve(PolicyRequest),
-}
-
-#[derive(Debug)]
 pub(super) struct PolicyRequest {
     pub(super) policy: PolicyInput,
     pub(super) tool: Option<OsString>,
@@ -81,22 +76,33 @@ pub(super) struct PolicyInput {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = PROGRAM_NAME, version, about = "OS-level sandbox runner")]
+#[command(
+    name = PROGRAM_NAME,
+    version,
+    about = "OS-level sandbox runner",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
+    override_usage = "landstrip [OPTIONS] [COMMAND]\n       landstrip [OPTIONS] [--] <PROGRAM> [ARGS...]"
+)]
 struct Cli {
     /// Enable debug logs.
     #[arg(long, global = true)]
     debug: bool,
 
     #[command(subcommand)]
-    command: CliCommand,
+    command: Option<CliCommand>,
+
+    #[command(flatten)]
+    run: RunArgs,
 }
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Run a program inside the sandbox.
-    Run(RunArgs),
-    /// Inspect a policy without running a program.
-    Policy(PolicyArgs),
+    /// Check policy parsing, merging, resolution, and platform support.
+    #[command(alias = "validate")]
+    Check(PolicyRequestArgs),
+    /// Print the final normalized policy as JSON.
+    Resolve(PolicyRequestArgs),
     /// Verify that the current OS sandbox is operational.
     Doctor,
     #[cfg(target_os = "windows")]
@@ -119,23 +125,14 @@ struct RunArgs {
     #[arg(long = "inherit", value_name = "FD[,FD...]", value_delimiter = ',', value_parser = parse_fd)]
     inherited_fds: Vec<i32>,
 
-    /// Program and arguments. The `--` separator is required.
-    #[arg(last = true, required = true, num_args = 1.., value_name = "PROGRAM [ARGS...]")]
+    /// Program and arguments to run.
+    #[arg(
+        required = true,
+        num_args = 1..,
+        trailing_var_arg = true,
+        value_name = "PROGRAM [ARGS...]"
+    )]
     program: Vec<OsString>,
-}
-
-#[derive(Debug, Args)]
-struct PolicyArgs {
-    #[command(subcommand)]
-    command: PolicyAction,
-}
-
-#[derive(Debug, Subcommand)]
-enum PolicyAction {
-    /// Check policy parsing, merging, resolution, and platform support.
-    Validate(PolicyRequestArgs),
-    /// Print the final normalized policy as JSON.
-    Resolve(PolicyRequestArgs),
 }
 
 #[derive(Debug, Args)]
@@ -147,7 +144,6 @@ struct PolicyRequestArgs {
     #[arg(long, value_name = "PROGRAM")]
     tool: Option<OsString>,
 }
-
 #[cfg(target_os = "windows")]
 #[derive(Debug, Args)]
 struct WindowsArgs {
@@ -252,14 +248,11 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
     };
 
     let command = match cli.command {
-        CliCommand::Run(args) => Command::Run(run_command(args)?),
-        CliCommand::Policy(args) => Command::Policy(match args.command {
-            PolicyAction::Validate(args) => PolicyCommand::Validate(args.into()),
-            PolicyAction::Resolve(args) => PolicyCommand::Resolve(args.into()),
-        }),
-        CliCommand::Doctor => Command::Doctor,
+        Some(CliCommand::Check(args)) => Command::Check(args.into()),
+        Some(CliCommand::Resolve(args)) => Command::Resolve(args.into()),
+        Some(CliCommand::Doctor) => Command::Doctor,
         #[cfg(target_os = "windows")]
-        CliCommand::Windows(args) => Command::Windows(match args.command {
+        Some(CliCommand::Windows(args)) => Command::Windows(match args.command {
             WindowsAction::Install(args) => WindowsCommand::Install {
                 restricted_accounts: args.restricted_accounts,
                 unrestricted_accounts: args.unrestricted_accounts,
@@ -270,6 +263,7 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
             WindowsAction::Status => WindowsCommand::Status,
             WindowsAction::Uninstall => WindowsCommand::Uninstall,
         }),
+        None => Command::Run(run_command(cli.run)?),
     };
 
     Ok(ParseOutcome::Invocation(Invocation {
@@ -282,7 +276,7 @@ fn run_command(args: RunArgs) -> Result<RunCommand, Error> {
     let mut program = args.program.into_iter();
     let Some(tool) = program.next() else {
         return Err(Error::Usage {
-            message: "a program is required after --".to_owned(),
+            message: "a program is required".to_owned(),
         });
     };
     #[cfg(unix)]

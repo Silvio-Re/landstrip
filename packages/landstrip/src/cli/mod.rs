@@ -4,7 +4,7 @@
 mod args;
 
 use self::args::{
-    Command, Invocation, ParseOutcome, PolicyCommand, PolicyInput, RunCommand, parse_cli,
+    Command, Invocation, ParseOutcome, PolicyInput, PolicyRequest, RunCommand, parse_cli,
 };
 use crate::config::{PolicyFormat, load_settings};
 use crate::error::Error;
@@ -70,7 +70,8 @@ fn init_logging(debug: bool) {
 fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
     match &invocation.command {
         Command::Run(command) => run(command),
-        Command::Policy(command) => inspect_policy(command),
+        Command::Check(request) => check_policy(request),
+        Command::Resolve(request) => resolve_policy(request),
         Command::Doctor => platform::doctor().map(CommandOutcome::from),
         #[cfg(target_os = "windows")]
         Command::Windows(command) => platform::manage_windows(command).map(CommandOutcome::from),
@@ -100,18 +101,15 @@ fn run(command: &RunCommand) -> Result<CommandOutcome> {
     result.map(CommandOutcome::from)
 }
 
-fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
-    match command {
-        PolicyCommand::Validate(request) => {
-            let result = load_policy(&request.policy, request.tool.as_deref())
-                .and_then(|policy| platform::validate(&policy));
-            policy_validation_report(result).map(CommandOutcome::from)
-        }
-        PolicyCommand::Resolve(request) => {
-            let policy = load_policy(&request.policy, request.tool.as_deref())?;
-            Ok(CommandOutcome::from(policy))
-        }
-    }
+fn check_policy(request: &PolicyRequest) -> Result<CommandOutcome> {
+    let result = load_policy(&request.policy, request.tool.as_deref())
+        .and_then(|policy| platform::validate(&policy));
+    policy_validation_report(result).map(CommandOutcome::from)
+}
+
+fn resolve_policy(request: &PolicyRequest) -> Result<CommandOutcome> {
+    let policy = load_policy(&request.policy, request.tool.as_deref())?;
+    Ok(CommandOutcome::from(policy))
 }
 
 fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport> {

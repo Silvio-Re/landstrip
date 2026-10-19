@@ -420,7 +420,6 @@ impl Case {
         } else {
             Command::new(&ctx.bin)
         };
-        command.arg("run");
         command.args(self.cli.iter().map(|arg| resolver.subst(arg)));
         if self.format == PolicyFormat::Yaml || self.stdin_policy {
             command
@@ -672,7 +671,6 @@ fn non_loopback_ipv4() -> Option<Ipv4Addr> {
 
 fn landstrip_net(ctx: &Context, format: PolicyFormat, policies: &[PathBuf]) -> Command {
     let mut command = Command::new(&ctx.bin);
-    command.arg("run");
     if format == PolicyFormat::Yaml {
         command.args(["--policy-format", "yaml"]);
     }

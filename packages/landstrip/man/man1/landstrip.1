@@ -7,24 +7,34 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl -debug
+.Op Fl p Ar file
+.Op Fl -policy-format Ar format
+.Op Fl -trap Ar FD
+.Op Fl -inherit Ar FD[,FD...]
+.Op Fl -
+.Ar program
+.Op Ar args ...
+.Nm
+.Op Fl -debug
 .Ar command
 .Op Ar options
 .Sh DESCRIPTION
 .Nm
 sandboxes programs using JSON or YAML policies in a supported subset of the
 Anthropic Sandbox Runtime format.
+When no subcommand is given,
+.Nm
+runs
+.Ar program
+under the merged policy.
 Use
 .Nm Ar command Fl -help
 for command help.
 .Sh COMMANDS
-.Bl -tag -width "policy validate"
-.It Cm run
-Run under the merged policy; the
-.Fl -
-separator before the program is required.
-.It Cm policy validate
+.Bl -tag -width "windows prepare-appcontainer"
+.It Cm check
 Check parsing, paths, executable policy, and platform support.
-.It Cm policy resolve
+.It Cm resolve
 Print the normalized merged policy as JSON.
 .It Cm doctor
 Report sandbox health.
@@ -49,8 +59,10 @@ Print the version.
 Print help.
 .El
 .Ss Policy input
-For
-.Cm run , policy validate , policy resolve :
+For program execution,
+.Cm check ,
+and
+.Cm resolve :
 .Bl -tag -width Ds
 .It Fl p Ar file , Fl -policy Ar file
 Read a policy; repeat to merge files.
@@ -239,16 +251,15 @@ or
 .Dq deny .
 An unanswered query holds the syscall.
 .Sh EXIT STATUS
-.Cm run
-returns the program's status.
+Program execution returns the program's status.
 With a Linux seccomp broker, remaining descendants
 are terminated and reaped on exit; background processes cannot outlive the run.
 Other failures, including invalid policies and unhealthy reports, return 1;
 usage errors return 2.
 .Sh EXAMPLES
 .Bd -literal -offset indent
-landstrip run -p policy.json -- cargo test
-landstrip policy validate -p - --policy-format yaml < policy.yaml
+landstrip -p policy.json -- cargo test
+landstrip check -p - --policy-format yaml < policy.yaml
 .Ed
 .Sh SEE ALSO
 .Lk https://github.com/landstrip/landstrip#readme
