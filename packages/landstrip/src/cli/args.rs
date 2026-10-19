@@ -11,6 +11,8 @@ use crate::trap_fd::TrapFd;
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use std::env;
 use std::ffi::OsString;
+#[cfg(target_os = "windows")]
+use std::num::NonZeroU16;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -388,10 +390,9 @@ fn parse_port(value: &str) -> Result<u16, String> {
     let port = value
         .parse::<u16>()
         .map_err(|_| "proxy ports must be integers between 1 and 65535".to_owned())?;
-    if port == 0 {
-        return Err("proxy ports must be between 1 and 65535".to_owned());
-    }
-    Ok(port)
+    NonZeroU16::new(port)
+        .map(NonZeroU16::get)
+        .ok_or_else(|| "proxy ports must be between 1 and 65535".to_owned())
 }
 
 impl TryFrom<&PolicyInput> for PolicyFormat {
