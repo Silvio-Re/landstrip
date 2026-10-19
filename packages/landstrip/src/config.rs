@@ -349,7 +349,7 @@ where
     D: Deserializer<'de>,
 {
     let input = Option::<PathInput>::deserialize(deserializer)?;
-    Ok(input.map_or_else(Vec::new, PathInput::into_paths))
+    Ok(input.map_or_else(Vec::new, Vec::from))
 }
 
 #[derive(Deserialize)]
@@ -359,11 +359,11 @@ enum PathInput {
     Lines(String),
 }
 
-impl PathInput {
-    fn into_paths(self) -> Vec<String> {
-        match self {
-            Self::List(paths) => paths,
-            Self::Lines(lines) => lines
+impl From<PathInput> for Vec<String> {
+    fn from(input: PathInput) -> Self {
+        match input {
+            PathInput::List(paths) => paths,
+            PathInput::Lines(lines) => lines
                 .lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
