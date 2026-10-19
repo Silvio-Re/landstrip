@@ -190,7 +190,7 @@ fn resolve_executable(tool: &OsStr) -> Option<PathBuf> {
 /// supplements. A sysadmin who wants it root-only protects the executable
 /// itself, the same way they would protect a `sandbox.json`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const EXECUTABLE_POLICY_XATTR: &str = "user.landstrip.policy";
+const EXECUTABLE_POLICY_XATTR: &std::ffi::CStr = c"user.landstrip.policy";
 
 /// The alternate data stream carrying the same policy on Windows.
 #[cfg(target_os = "windows")]
@@ -251,14 +251,17 @@ fn read_policy_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
         CString::new(path.as_os_str().as_bytes()).map_err(|source| Error::PolicyIoFailed {
             source: io::Error::new(io::ErrorKind::InvalidInput, source),
         })?;
-    let c_name = CString::new(EXECUTABLE_POLICY_XATTR).map_err(|source| Error::PolicyIoFailed {
-        source: io::Error::new(io::ErrorKind::InvalidInput, source),
-    })?;
 
-    // SAFETY: c_path and c_name are live NUL-terminated C strings; a null
-    // value pointer with size 0 only queries the attribute's length.
-    let needed =
-        unsafe { platform_getxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
+    // SAFETY: c_path and EXECUTABLE_POLICY_XATTR are live NUL-terminated C strings;
+    // a null value pointer with size 0 only queries the attribute's length.
+    let needed = unsafe {
+        platform_getxattr(
+            c_path.as_ptr(),
+            EXECUTABLE_POLICY_XATTR.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
     if needed < 0 {
         return classify_xattr_error();
     }
@@ -275,7 +278,7 @@ fn read_policy_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     let got = unsafe {
         platform_getxattr(
             c_path.as_ptr(),
-            c_name.as_ptr(),
+            EXECUTABLE_POLICY_XATTR.as_ptr(),
             buffer.as_mut_ptr().cast(),
             buffer.len(),
         )
