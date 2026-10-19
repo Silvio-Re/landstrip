@@ -265,12 +265,9 @@ impl TargetProcess {
             .join(self.pid.as_raw().to_string())
             .join("status");
         let status = fs::read_to_string(status_path)?;
-        let line = status
+        let value = status
             .lines()
-            .find(|line| line.starts_with("Tgid:"))
-            .ok_or(BrokerError::InvalidAddress)?;
-        let value = line
-            .strip_prefix("Tgid:")
+            .find_map(|line| line.strip_prefix("Tgid:"))
             .ok_or(BrokerError::InvalidAddress)?;
         let tgid = value
             .trim()
