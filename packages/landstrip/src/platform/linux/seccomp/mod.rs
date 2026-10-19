@@ -38,9 +38,10 @@ use anyhow::Result;
 use fs::MUTATION_SYSCALLS;
 use nix::errno::Errno;
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
-use nix::unistd::{ForkResult, Pid, fork, read, write};
+use nix::unistd::{ForkResult, Pid, fork};
 use process::{Subreaper, TargetProcess, cleanup_descendants};
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -49,7 +50,7 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 use supervise::supervise_child;
 
-fn send_fd(socket: &UnixStream, fd: BorrowedFd<'_>) -> Result<()> {
+fn send_fd(socket: &File, fd: BorrowedFd<'_>) -> Result<()> {
     let byte = [0_u8];
     let iov = [IoSlice::new(&byte)];
     let fds = [fd.as_raw_fd()];
@@ -68,52 +69,37 @@ fn send_fd(socket: &UnixStream, fd: BorrowedFd<'_>) -> Result<()> {
     }
 }
 
-fn write_all(fd: BorrowedFd<'_>, mut buf: &[u8]) -> Result<()> {
-    while !buf.is_empty() {
-        match write(fd, buf) {
-            Ok(0) => return Err(LandstripError::supervise("write: zero bytes").into()),
-            Ok(n) => buf = &buf[n..],
-            Err(Errno::EINTR) => {}
-            Err(error) => return Err(LandstripError::from(error).into()),
-        }
-    }
-    Ok(())
-}
-
-fn read_exact(fd: BorrowedFd<'_>, mut buf: &mut [u8]) -> Result<()> {
-    while !buf.is_empty() {
-        match read(fd, buf) {
-            Ok(0) => return Err(LandstripError::supervise("read: unexpected eof").into()),
-            Ok(n) => {
-                let tmp = buf;
-                buf = &mut tmp[n..];
-            }
-            Err(Errno::EINTR) => {}
-            Err(error) => return Err(LandstripError::from(error).into()),
-        }
-    }
-    Ok(())
-}
-
-fn send_listener(socket: &mut UnixStream, fd: BorrowedFd<'_>) -> Result<()> {
-    write_all(socket.as_fd(), &[0_u8])?;
-    write_all(socket.as_fd(), &fd.as_raw_fd().to_ne_bytes())?;
+fn send_listener(socket: &mut File, fd: BorrowedFd<'_>) -> Result<()> {
+    socket
+        .write_all(&[0_u8])
+        .map_err(LandstripError::supervise)?;
+    socket
+        .write_all(&fd.as_raw_fd().to_ne_bytes())
+        .map_err(LandstripError::supervise)?;
     let mut ack = [0_u8];
-    read_exact(socket.as_fd(), &mut ack)?;
+    socket
+        .read_exact(&mut ack)
+        .map_err(LandstripError::supervise)?;
     if ack != [0] {
         return Err(LandstripError::supervise("notify: invalid acknowledgment").into());
     }
     Ok(())
 }
 
-fn send_trap(socket: &mut UnixStream, trap: &Trap) -> Result<()> {
+fn send_trap(socket: &mut File, trap: &Trap) -> Result<()> {
     let payload = trap.to_string();
     let length = u32::try_from(payload.len())
         .map_err(|_| LandstripError::supervise("notify: trap is too large"))?;
 
-    write_all(socket.as_fd(), &[1_u8])?;
-    write_all(socket.as_fd(), &length.to_be_bytes())?;
-    write_all(socket.as_fd(), payload.as_bytes())?;
+    socket
+        .write_all(&[1_u8])
+        .map_err(LandstripError::supervise)?;
+    socket
+        .write_all(&length.to_be_bytes())
+        .map_err(LandstripError::supervise)?;
+    socket
+        .write_all(payload.as_bytes())
+        .map_err(LandstripError::supervise)?;
     Ok(())
 }
 
@@ -122,7 +108,7 @@ enum NotifyStartup {
     Trap(String),
 }
 
-fn get_notify_fd(socket: &UnixStream, child: Pid, handoff_by_pidfd: bool) -> Result<NotifyStartup> {
+fn get_notify_fd(socket: &File, child: Pid, handoff_by_pidfd: bool) -> Result<NotifyStartup> {
     let mut marker = [0_u8];
     let mut iov = [IoSliceMut::new(&mut marker)];
     let mut control = nix::cmsg_space!([RawFd; 1]);
@@ -259,6 +245,9 @@ pub(super) fn run_broker(
     };
 
     let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::supervise)?;
+    // File uses read/write; UnixStream's sendto would block on our own notify filter.
+    let parent = File::from(OwnedFd::from(parent));
+    let child_sock = File::from(OwnedFd::from(child_sock));
     let subreaper = Subreaper::acquire()?;
 
     // SAFETY: policy lowering is single-threaded; the child either execs the tool or exits.
