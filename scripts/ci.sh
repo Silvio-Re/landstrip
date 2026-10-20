@@ -73,6 +73,9 @@ printf '==> stage host binary for npm/%s\n' "$host_platform"
 mkdir -p "npm/$host_platform/bin"
 cp "packages/landstrip/target/debug/$binary_name" "npm/$host_platform/bin/$binary_name"
 chmod 755 "npm/$host_platform/bin/$binary_name" 2>/dev/null || true
+if [[ "$host_platform" == darwin-* ]]; then
+  codesign -s - -f "npm/$host_platform/bin/$binary_name" 2>/dev/null || true
+fi
 
 printf '==> npm install local platform package\n'
 tarball="$("$NPM" pack ./packages/landstrip-api --silent)"

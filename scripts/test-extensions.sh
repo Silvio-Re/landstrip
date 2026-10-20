@@ -79,6 +79,9 @@ if ((local_root)); then
   cargo build --locked --manifest-path packages/landstrip/Cargo.toml
   mkdir -p "$platform_package/bin"
   install -m 755 "packages/landstrip/target/debug/$binary" "$platform_package/bin/$binary"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    codesign -s - -f "$platform_package/bin/$binary" 2>/dev/null || true
+  fi
   trap cleanup_local_root EXIT
 
   if [[ "$platform_package" == npm/win32-* && "${CI:-}" == true ]]; then
