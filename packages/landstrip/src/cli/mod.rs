@@ -17,6 +17,7 @@ use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::error::Error as StdError;
 use std::io;
+use std::path::Path;
 use std::process;
 
 pub fn execute() {
@@ -82,11 +83,16 @@ fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
 }
 
 fn run(command: &RunCommand) -> Result<CommandOutcome> {
-    let policy = load_policy(&command.policy, Some(command.tool.as_os_str()))?;
+    let policy = load_policy(
+        &command.policy,
+        &command.cwd,
+        Some(command.tool.as_os_str()),
+    )?;
     platform::validate(&policy)?;
     #[cfg(unix)]
     let result = platform::execute(
         &policy,
+        &command.cwd,
         &command.tool,
         &command.tool_args,
         command.trap_fd.as_ref(),
@@ -97,19 +103,19 @@ fn run(command: &RunCommand) -> Result<CommandOutcome> {
             .collect::<Vec<_>>(),
     );
     #[cfg(not(unix))]
-    let result = platform::execute(&policy, &command.tool, &command.tool_args);
+    let result = platform::execute(&policy, &command.cwd, &command.tool, &command.tool_args);
 
     result.map(CommandOutcome::from)
 }
 
 fn check_policy(request: &PolicyRequest) -> Result<CommandOutcome> {
-    let result = load_policy(&request.policy, request.tool.as_deref())
+    let result = load_policy(&request.policy, &request.cwd, request.tool.as_deref())
         .and_then(|policy| platform::validate(&policy));
     policy_validation_report(result).map(CommandOutcome::from)
 }
 
 fn resolve_policy(request: &PolicyRequest) -> Result<CommandOutcome> {
-    let policy = load_policy(&request.policy, request.tool.as_deref())?;
+    let policy = load_policy(&request.policy, &request.cwd, request.tool.as_deref())?;
     Ok(CommandOutcome::from(policy))
 }
 
@@ -142,12 +148,15 @@ fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport
     }
 }
 
-fn load_policy(input: &PolicyInput, tool: Option<&std::ffi::OsStr>) -> Result<AccessPolicy> {
+fn load_policy(
+    input: &PolicyInput,
+    cwd: &Path,
+    tool: Option<&std::ffi::OsStr>,
+) -> Result<AccessPolicy> {
     let format = PolicyFormat::try_from(input)?;
-    let cwd = std::env::current_dir()?;
     log::debug!("cli: cwd: {}", cwd.display());
     let settings = load_settings(&input.paths, format, tool)?;
-    settings.resolve(&cwd)
+    settings.resolve(cwd)
 }
 
 fn exit_with_error(

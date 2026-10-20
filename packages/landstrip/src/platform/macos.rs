@@ -13,7 +13,7 @@ use std::fmt::{self, Write};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 
@@ -22,6 +22,7 @@ const SANDBOX_FILTER_NONE: libc::c_int = 0;
 
 pub(crate) fn execute(
     policy: &AccessPolicy,
+    cwd: &Path,
     tool: &OsStr,
     args: &[OsString],
     trap_fd: Option<&TrapFd>,
@@ -31,7 +32,9 @@ pub(crate) fn execute(
     apply_profile(&profile)?;
     close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd).as_slice(), inherited_fds)
         .map_err(Error::seatbelt)?;
-    let error = Command::new(tool).args(args).exec();
+    let mut command = Command::new(tool);
+    command.args(args).current_dir(cwd);
+    let error = command.exec();
     Err(Error::launch(tool, error).into())
 }
 

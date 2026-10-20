@@ -10,6 +10,7 @@
 .Cm run
 .Op Fl p Ar file
 .Op Fl -policy-format Ar format
+.Op Fl -cwd Ar dir
 .Op Fl -trap Ar FD
 .Op Fl -inherit Ar FD[,FD...]
 .Op Fl -
@@ -79,6 +80,8 @@ Select
 .Va json
 or
 .Va yaml .
+.It Fl -cwd Ar dir
+Set the working directory for policy resolution and execution (defaults to the current working directory).
 .It Fl -tool Ar program
 Include the resolved executable's policy when validating or resolving.
 .El

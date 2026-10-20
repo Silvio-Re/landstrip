@@ -24,6 +24,7 @@ use crate::policy::AccessPolicy;
 use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::path::Path;
 
 pub(super) use manage::active_implementation;
 pub(crate) use manage::{manage, status};
@@ -32,7 +33,12 @@ pub(crate) use worker::run as run_worker;
 pub(super) fn is_installed() -> Result<bool> {
     Ok(state::load_optional()?.is_some())
 }
-pub(super) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<i32> {
+pub(super) fn execute(
+    policy: &AccessPolicy,
+    cwd: &Path,
+    tool: &OsStr,
+    args: &[OsString],
+) -> Result<i32> {
     let installation =
         state::load().map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     if !installation.complete {
@@ -58,10 +64,8 @@ pub(super) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
         .context("restricted-user state path has no parent")?
         .join("runs")
         .join(format!("{request_id}.json"));
-    let cwd = std::env::current_dir()
-        .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     let grants = access::GrantPlan::new(policy, &request_path)?;
-    worker::write_request(&request_path, &lease.account().sid, tool, args, &cwd)
+    worker::write_request(&request_path, &lease.account().sid, tool, args, cwd)
         .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     if let Err(error) = lease.write_journal(&grants) {
         let _ = fs::remove_file(&request_path);

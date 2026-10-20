@@ -547,11 +547,16 @@ fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> Win32CallRe
     Ok(())
 }
 
-pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<i32> {
+pub(crate) fn execute(
+    policy: &AccessPolicy,
+    cwd: &Path,
+    tool: &OsStr,
+    args: &[OsString],
+) -> Result<i32> {
     if restricted_user::is_installed()? {
-        restricted_user::execute(policy, tool, args)
+        restricted_user::execute(policy, cwd, tool, args)
     } else {
-        appcontainer::execute(policy, tool, args)
+        appcontainer::execute(policy, cwd, tool, args)
     }
 }
 

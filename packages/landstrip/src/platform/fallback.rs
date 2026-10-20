@@ -12,10 +12,12 @@ use crate::policy::AccessPolicy;
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::ffi::{OsStr, OsString};
+use std::path::Path;
 
 #[cfg(unix)]
 pub(crate) fn execute(
     _policy: &AccessPolicy,
+    _cwd: &Path,
     _tool: &OsStr,
     _args: &[OsString],
     _trap_fd: Option<&TrapFd>,
@@ -25,6 +27,11 @@ pub(crate) fn execute(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn execute(_policy: &AccessPolicy, _tool: &OsStr, _args: &[OsString]) -> Result<i32> {
+pub(crate) fn execute(
+    _policy: &AccessPolicy,
+    _cwd: &Path,
+    _tool: &OsStr,
+    _args: &[OsString],
+) -> Result<i32> {
     Err(Error::PlatformUnsupported.into())
 }

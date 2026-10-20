@@ -97,7 +97,12 @@ fn hresult_cause(hr: i32) -> Cause {
     }
 }
 
-pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<i32> {
+pub(crate) fn execute(
+    policy: &AccessPolicy,
+    cwd: &Path,
+    tool: &OsStr,
+    args: &[OsString],
+) -> Result<i32> {
     let moniker = appcontainer_moniker(tool, policy, policy.allow_windows_loopback);
     let profile = AppContainerProfile::new(&moniker, !policy.allow_windows_loopback)?;
     let loopback = if policy.allow_windows_loopback {
@@ -116,6 +121,7 @@ pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
     }
     let exit_code = create_process_in_appcontainer(
         profile.sid(),
+        cwd,
         tool,
         args,
         grant_network,
@@ -904,6 +910,7 @@ fn is_io_file_type(file_type: u32) -> bool {
 
 fn create_process_in_appcontainer(
     sid: PSID,
+    cwd: &Path,
     tool: &OsStr,
     args: &[OsString],
     grant_network: bool,
@@ -988,6 +995,7 @@ fn create_process_in_appcontainer(
     startup_info.lpAttributeList = attribute_list.as_mut_ptr();
     let process_info = launch_process(
         &command_line,
+        cwd,
         tool,
         &mut startup_info,
         current_process_in_job()?,
@@ -1015,15 +1023,22 @@ fn current_process_in_job() -> Result<bool> {
 
 fn launch_process(
     command_line: &str,
+    cwd: &Path,
     tool: &OsStr,
     startup_info: &mut STARTUPINFOEXW,
     in_host_job: bool,
 ) -> Result<PROCESS_INFORMATION> {
-    match create_process(command_line, startup_info, EXTENDED_STARTUPINFO_PRESENT) {
+    match create_process(
+        command_line,
+        cwd,
+        startup_info,
+        EXTENDED_STARTUPINFO_PRESENT,
+    ) {
         Ok(process_info) => Ok(process_info),
         Err(source) if in_host_job && win32_status(&source) == Some(ERROR_ACCESS_DENIED) => {
             create_process(
                 command_line,
+                cwd,
                 startup_info,
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_BREAKAWAY_FROM_JOB,
             )
@@ -1044,10 +1059,12 @@ fn launch_process(
 
 fn create_process(
     command_line: &str,
+    cwd: &Path,
     startup_info: &mut STARTUPINFOEXW,
     creation_flags: u32,
 ) -> io::Result<PROCESS_INFORMATION> {
     let mut command_line = command_line.to_wide_nul();
+    let cwd = cwd.as_os_str().to_wide_nul();
     let mut process_info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
     let created = unsafe {
         CreateProcessW(
@@ -1058,7 +1075,7 @@ fn create_process(
             1,
             creation_flags,
             ptr::null(),
-            ptr::null(),
+            cwd.as_ptr(),
             (&raw mut *startup_info).cast(),
             &raw mut process_info,
         )

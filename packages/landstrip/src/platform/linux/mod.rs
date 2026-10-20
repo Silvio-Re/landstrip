@@ -13,6 +13,7 @@ use ::landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
 use anyhow::{Context, Result};
 use seccomp::ensure_notification_supported;
 use std::ffi::{OsStr, OsString};
+use std::path::Path;
 
 pub(crate) fn doctor() -> Result<()> {
     Ruleset::default()
@@ -27,6 +28,7 @@ pub(crate) fn doctor() -> Result<()> {
 }
 pub(crate) fn execute(
     policy: &AccessPolicy,
+    cwd: &Path,
     tool: &OsStr,
     args: &[OsString],
     trap_fd: Option<&TrapFd>,

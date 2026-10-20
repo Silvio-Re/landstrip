@@ -8,6 +8,7 @@ use crate::error::{Error, Mechanism};
 use crate::platform::WindowsCommand;
 #[cfg(unix)]
 use crate::trap_fd::TrapFd;
+use clap::builder::{PathBufValueParser, TypedValueParser};
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use std::env;
 use std::ffi::OsString;
@@ -53,6 +54,7 @@ pub(super) enum Command {
 #[derive(Debug)]
 pub(super) struct RunCommand {
     pub(super) policy: PolicyInput,
+    pub(super) cwd: PathBuf,
     #[cfg(unix)]
     pub(super) trap_fd: Option<TrapFd>,
     #[cfg(unix)]
@@ -64,6 +66,7 @@ pub(super) struct RunCommand {
 #[derive(Debug)]
 pub(super) struct PolicyRequest {
     pub(super) policy: PolicyInput,
+    pub(super) cwd: PathBuf,
     pub(super) tool: Option<OsString>,
 }
 
@@ -115,6 +118,15 @@ struct RunArgs {
     #[command(flatten)]
     policy: PolicyInput,
 
+    /// Working directory for execution and relative path resolution.
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = ".",
+        value_parser = PathBufValueParser::new().try_map(std::path::absolute)
+    )]
+    cwd: PathBuf,
+
     #[cfg(unix)]
     /// Write traps to an already-open file descriptor.
     #[arg(long = "trap", value_name = "FD", value_parser = parse_fd)]
@@ -139,6 +151,15 @@ struct RunArgs {
 struct PolicyRequestArgs {
     #[command(flatten)]
     policy: PolicyInput,
+
+    /// Working directory for execution and relative path resolution.
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = ".",
+        value_parser = PathBufValueParser::new().try_map(std::path::absolute)
+    )]
+    cwd: PathBuf,
 
     /// Include policy attached to this executable.
     #[arg(long, value_name = "PROGRAM")]
@@ -300,6 +321,7 @@ fn run_command(args: RunArgs) -> Result<RunCommand, Error> {
     };
     Ok(RunCommand {
         policy: args.policy,
+        cwd: args.cwd,
         #[cfg(unix)]
         trap_fd: args.trap_fd.map(|fd| {
             // SAFETY: parse_fd established that the inherited descriptor is open,
@@ -317,6 +339,7 @@ impl From<PolicyRequestArgs> for PolicyRequest {
     fn from(args: PolicyRequestArgs) -> Self {
         Self {
             policy: args.policy,
+            cwd: args.cwd,
             tool: args.tool,
         }
     }
