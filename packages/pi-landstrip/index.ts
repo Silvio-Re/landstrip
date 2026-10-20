@@ -1816,7 +1816,7 @@ function createLandstripIntegrationWithPrompts(
       if (disposed) throw new Error('Prepared process has been disposed');
       if (spawned) throw new Error('Prepared process can only be spawned once');
       spawned = true;
-      const landstripArgs = ['-p', workerPolicy.path, '--', options.command, ...options.args];
+      const landstripArgs = ['run', '-p', workerPolicy.path];
       const authPipe =
         Array.isArray(spawnOptions.stdio) && spawnOptions.stdio[WORKER_AUTH_FD] === 'pipe';
       if (authPipe && process.platform === 'win32') {
@@ -1826,9 +1826,10 @@ function createLandstripIntegrationWithPrompts(
       if (workerChildEnd || authPipe) stdio.push(workerChildEnd ?? 'ignore');
       if (authPipe) {
         stdio.push('pipe');
-        landstripArgs.unshift('--inherit', String(WORKER_AUTH_FD));
+        landstripArgs.push('--inherit', String(WORKER_AUTH_FD));
       }
-      if (workerChildEnd) landstripArgs.unshift('--trap', '3');
+      if (workerChildEnd) landstripArgs.push('--trap', '3');
+      landstripArgs.push('--', options.command, ...options.args);
       const child = spawn(binaryPath(), landstripArgs, {
         ...spawnOptions,
         cwd: options.cwd,
@@ -2054,8 +2055,9 @@ function createLandstripIntegrationWithPrompts(
             cwd,
           );
           policy = writePolicyFile(cwd, proxy?.port ?? null, 'shell', processAllowances);
-          landstripArgs = ['-p', policy.path, '--', invocation.executable, ...invocation.args];
-          if (process.platform !== 'win32') landstripArgs.unshift('--trap', '3');
+          landstripArgs = ['run', '-p', policy.path];
+          if (process.platform !== 'win32') landstripArgs.push('--trap', '3');
+          landstripArgs.push('--', invocation.executable, ...invocation.args);
         } catch (error) {
           await teardownResources();
           throw error;

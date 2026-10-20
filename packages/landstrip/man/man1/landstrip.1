@@ -7,6 +7,7 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl -debug
+.Cm run
 .Op Fl p Ar file
 .Op Fl -policy-format Ar format
 .Op Fl -trap Ar FD
@@ -59,7 +60,8 @@ Print the version.
 Print help.
 .El
 .Ss Policy input
-For program execution,
+For
+.Cm run ,
 .Cm check ,
 and
 .Cm resolve :
@@ -258,7 +260,7 @@ Other failures, including invalid policies and unhealthy reports, return 1;
 usage errors return 2.
 .Sh EXAMPLES
 .Bd -literal -offset indent
-landstrip -p policy.json -- cargo test
+landstrip run -p policy.json -- cargo test
 landstrip check -p - --policy-format yaml < policy.yaml
 .Ed
 .Sh SEE ALSO

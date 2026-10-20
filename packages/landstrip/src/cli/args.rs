@@ -82,9 +82,6 @@ pub(super) struct PolicyInput {
     name = PROGRAM_NAME,
     version,
     about = "OS-level sandbox runner",
-    args_conflicts_with_subcommands = true,
-    subcommand_negates_reqs = true,
-    override_usage = "landstrip [OPTIONS] [COMMAND]\n       landstrip [OPTIONS] [--] <PROGRAM> [ARGS...]"
 )]
 struct Cli {
     /// Enable debug logs.
@@ -92,16 +89,14 @@ struct Cli {
     debug: bool,
 
     #[command(subcommand)]
-    command: Option<CliCommand>,
-
-    #[command(flatten)]
-    run: RunArgs,
+    command: CliCommand,
 }
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    /// Run a command inside the sandbox.
+    Run(RunArgs),
     /// Check policy parsing, merging, resolution, and platform support.
-    #[command(alias = "validate")]
     Check(PolicyRequestArgs),
     /// Print the final normalized policy as JSON.
     Resolve(PolicyRequestArgs),
@@ -246,11 +241,12 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
     };
 
     let command = match cli.command {
-        Some(CliCommand::Check(args)) => Command::Check(args.into()),
-        Some(CliCommand::Resolve(args)) => Command::Resolve(args.into()),
-        Some(CliCommand::Doctor) => Command::Doctor,
+        CliCommand::Run(args) => Command::Run(run_command(args)?),
+        CliCommand::Check(args) => Command::Check(args.into()),
+        CliCommand::Resolve(args) => Command::Resolve(args.into()),
+        CliCommand::Doctor => Command::Doctor,
         #[cfg(target_os = "windows")]
-        Some(CliCommand::Windows(args)) => Command::Windows(match args.command {
+        CliCommand::Windows(args) => Command::Windows(match args.command {
             WindowsAction::Install(args) => WindowsCommand::Install {
                 restricted_accounts: args.restricted_accounts,
                 unrestricted_accounts: args.unrestricted_accounts,
@@ -261,7 +257,6 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
             WindowsAction::Status => WindowsCommand::Status,
             WindowsAction::Uninstall => WindowsCommand::Uninstall,
         }),
-        None => Command::Run(run_command(cli.run)?),
     };
 
     Ok(ParseOutcome::Invocation(Invocation {

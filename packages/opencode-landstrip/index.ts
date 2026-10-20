@@ -335,7 +335,7 @@ function buildWrappedCommand(
   trapPort: number | null,
   sessionID?: string,
 ): string {
-  const baseArgs = ['-p', policyPath, '--', ...shellArgs(shell, command)];
+  const baseArgs = ['run', '-p', policyPath, '--', ...shellArgs(shell, command)];
   const plain = [landstripBinaryPath(), ...baseArgs].map(shellQuote).join(' ');
   if (trapPort === null) return plain;
 
@@ -345,6 +345,7 @@ function buildWrappedCommand(
   // without invoking landstrip, while every started command runs exactly once.
   const trapped = [
     landstripBinaryPath(),
+    'run',
     '--trap',
     '3',
     '-p',
