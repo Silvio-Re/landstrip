@@ -26,7 +26,10 @@ pub fn dispatch(subcommand: &std::ffi::OsStr, mut args: std::env::ArgsOs) -> Opt
         "signal-outside" => Some(process::signal_outside_probe()),
         "signal-thread" => Some(process::signal_thread_probe()),
         "io-uring" => Some(process::io_uring_probe()),
-        "daemon" => Some(process::daemon_probe(args.next())),
+        "namespace-proc" => Some(process::namespace_proc_probe(args.next(), args.next())),
+        "namespace-network-denied" => Some(process::namespace_network_denied_probe()),
+        "namespace-lifetime" => Some(process::namespace_lifetime_probe(args.next(), args.next())),
+        "daemon" => Some(process::daemon_probe(args.next(), args.next())),
         _ => None,
     }
 }
