@@ -167,6 +167,7 @@ const AGENTS_HELP_ROWS = [
   ['Esc', 'Back one level, or close from a top-level tab'],
   ['Ctrl+C', 'Close'],
   ['Space', 'Toggle agent enabled or select task'],
+  ['C', 'Cancel running task or execution'],
   ['X', 'Delete selected agent or task sessions'],
   ['E', 'Edit project agent'],
   ['I', 'Inherit global agent state'],
@@ -317,6 +318,17 @@ interface TabFrame {
   listValue: (values: readonly string[]) => string;
 }
 
+const taskParameters = Type.Object({
+  description: Type.String({ description: 'Short task label (3-5 words)' }),
+  prompt: Type.String({ description: 'Full instructions for the subagent' }),
+  subagent_type: Type.String({ description: 'Subagent name' }),
+  task_id: Type.Optional(Type.String({ description: 'Task ID to resume' })),
+  command: Type.Optional(Type.String({ description: 'Originating command, if any' })),
+  background: Type.Optional(
+    Type.Boolean({ description: 'Return immediately and run in background' }),
+  ),
+});
+
 export const TasksToolSchema = Type.Object({
   action: Type.Union([Type.Literal('list'), Type.Literal('inspect'), Type.Literal('cancel')], {
     description:
@@ -332,17 +344,6 @@ export type TasksToolInput = {
   action: 'list' | 'inspect' | 'cancel';
   task_id?: string;
 };
-
-const taskParameters = Type.Object({
-  description: Type.String({ description: 'Short task label (3-5 words)' }),
-  prompt: Type.String({ description: 'Full instructions for the subagent' }),
-  subagent_type: Type.String({ description: 'Subagent name' }),
-  task_id: Type.Optional(Type.String({ description: 'Task ID to resume' })),
-  command: Type.Optional(Type.String({ description: 'Originating command, if any' })),
-  background: Type.Optional(
-    Type.Boolean({ description: 'Return immediately and run in background' }),
-  ),
-});
 
 interface TaskInput {
   description: string;
@@ -738,6 +739,7 @@ function taskTranscript(task: TaskRecord): string[] {
     const fallback = task.error ?? task.output ?? 'Command output is not available yet.';
     return fallback.split('\n');
   }
+
   if (!task.sessionFile || !existsSync(task.sessionFile)) {
     const fallback = task.error ?? task.output ?? 'Child session is not available yet.';
     return fallback.split('\n');
@@ -1494,7 +1496,12 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       description: 'Cycle to the next primary agent',
       handler: async (ctx) => this.cyclePrimaryAgent(ctx),
     });
+    this.pi.registerShortcut('ctrl+shift+t', {
+      description: 'Open Landstrip task sessions dashboard',
+      handler: async (ctx) => this.openLandstrip('tasks', ctx),
+    });
     this.pi.on('session_start', async (_event, ctx) => {
+      this.recentCompletions.clear();
       this.activeSessionId = undefined;
       await this.dispose();
       this.shuttingDown = false;
@@ -1507,6 +1514,10 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       const withoutTask = activeTools.filter((tool) => tool !== 'task');
       const nextTools = this.maxSubagents > 0 ? [...withoutTask, 'task'] : withoutTask;
       if (nextTools.join('\0') !== activeTools.join('\0')) this.pi.setActiveTools(nextTools);
+    });
+    this.pi.on('turn_start', async (_event, ctx) => {
+      this.recentCompletions.clear();
+      this.updateTaskWidget(ctx);
     });
     this.pi.on('session_before_switch', async (_event, ctx) => {
       this.activeSessionId = undefined;
@@ -1919,6 +1930,14 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
     return ctx.ui.custom<void>(
       (tui, theme, _keybindings, done) => {
+        const unsubscribe = this.onTaskUpdate(() => {
+          refreshTasks();
+          tui.requestRender();
+        });
+        const finish = (): void => {
+          unsubscribe();
+          done(undefined);
+        };
         const renderAgentsTab = (frame: TabFrame): string[] => {
           const { tabs, pane, contentWidth, pad } = frame;
           const listedAgents = agentsForTab();
@@ -2260,6 +2279,10 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                 'Runtime',
                 overview.running ? theme.fg('success', 'Running') : theme.fg('dim', 'Not running'),
               ),
+              item(
+                'Tasks',
+                `${tasks.filter((t) => t.state === 'running').length} running · ${tasks.length} total`,
+              ),
               '',
               theme.fg('accent', 'Protection'),
               item('Network', networkMode),
@@ -2376,8 +2399,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                 const cursor = index === selectedTask ? theme.fg('accent', '›') : ' ';
                 const selected = selectedTaskIds.has(task.id) ? theme.fg('accent', '✓') : ' ';
                 const indent = '  '.repeat(Math.max(0, task.depth - 1));
+                const tag = task.kind === 'command' ? '$ bash' : `@${task.agent}`;
                 listLines.push(
-                  `${cursor} ${selected} ${indent}${taskState(theme, task)} ${theme.fg('accent', `@${task.agent}`)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
+                  `${cursor} ${selected} ${indent}${taskState(theme, task)} ${theme.fg('accent', tag)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
                 );
               }
               if (status) listLines.push(theme.fg('dim', `  ${status}`));
@@ -2389,10 +2413,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             listLines.push('');
             if (pendingTaskAction) {
               const count = pendingTaskAction.taskIds.length;
+              const actionLabel = pendingTaskAction.type === 'cancel' ? 'Cancel' : 'Delete';
               const label =
                 count === 1
-                  ? `Delete ${pendingTaskAction.taskIds[0]?.slice(0, 8) ?? 'task'}?`
-                  : `Delete ${count} selected task sessions?`;
+                  ? `${actionLabel} ${pendingTaskAction.taskIds[0]?.slice(0, 8) ?? 'task'}?`
+                  : `${actionLabel} ${count} selected tasks?`;
               listLines.push(
                 `${theme.fg('warning', label)} ${dialogKeys(theme, [
                   ['Enter', 'confirm'],
@@ -2405,6 +2430,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                   ['↑ / ↓', 'move'],
                   ['Space', 'select'],
                   ['Enter', 'inspect'],
+                  ['C', 'cancel'],
                   ['X', 'delete'],
                   ['Esc', 'close'],
                 ]),
@@ -2431,10 +2457,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               duration,
             ].filter(Boolean);
             const usage = formatTaskUsage(task.usage);
+            const tag = task.kind === 'command' ? '$ bash' : `@${task.agent}`;
             const lines = [
               tabs,
               '',
-              `${theme.fg('accent', theme.bold(`@${task.agent}`))} ${theme.fg('text', task.description)}`,
+              `${theme.fg('accent', theme.bold(tag))} ${theme.fg('text', task.description)}`,
               `${taskState(theme, task)} ${theme.fg('dim', metrics.join(' · '))} ${theme.fg('dim', '·')} ${theme.fg(follow ? 'accent' : 'muted', `Follow: ${follow ? 'on' : 'off'}`)}`,
               ...(usage ? [theme.fg('dim', usage)] : []),
               '',
@@ -2451,13 +2478,10 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                 steering.render(Math.max(2, contentWidth - visibleWidth('Steer ')))[0] ?? '';
               lines.push(`${theme.fg('accent', 'Steer')} ${input.replace(/^>/, '›')}`);
             } else if (task.state === 'queued' || task.state === 'running') {
-              lines.push(
-                dialogKeys(theme, [
-                  ['Enter', 'steer'],
-                  ['F', 'follow'],
-                  ['Esc', 'tasks'],
-                ]),
-              );
+              const keys: Array<[string, string]> = [];
+              if (task.kind !== 'command') keys.push(['Enter', 'steer']);
+              keys.push(['C', 'cancel'], ['F', 'follow'], ['Esc', 'tasks']);
+              lines.push(dialogKeys(theme, keys));
             }
             return pane(lines.map((line) => truncateToWidth(line, contentWidth)));
           },
@@ -2494,7 +2518,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               if (!matchesKey(data, 'return')) return;
             }
             if (matchesKey(data, 'escape')) {
-              done(undefined);
+              finish();
               return;
             }
             if (!matchesKey(data, 'return')) return;
@@ -2551,10 +2575,23 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           tasks: (data) => {
             if (pendingTaskAction) {
               if (matchesKey(data, 'return')) {
-                const taskIds = pendingTaskAction.taskIds;
+                const action = pendingTaskAction;
                 pendingTaskAction = undefined;
-                const deleted = this.deleteTasks(taskIds, ctx);
-                for (const taskId of taskIds) selectedTaskIds.delete(taskId);
+                if (action.type === 'cancel') {
+                  void this.cancelTasks(action.taskIds, ctx).then((cancelled) => {
+                    if (cancelled > 0) {
+                      ctx.ui.notify(
+                        `Cancelled ${cancelled} task${cancelled === 1 ? '' : 's'}`,
+                        'info',
+                      );
+                    }
+                    refreshTasks();
+                    tui.requestRender();
+                  });
+                  return;
+                }
+                const deleted = this.deleteTasks(action.taskIds, ctx);
+                for (const taskId of action.taskIds) selectedTaskIds.delete(taskId);
                 refreshTasks();
                 if (deleted > 0) {
                   ctx.ui.notify(
@@ -2571,7 +2608,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               }
               return;
             }
-            if (matchesKey(data, 'escape')) done(undefined);
+            if (matchesKey(data, 'escape')) finish();
             else if (matchesKey(data, 'up')) selectedTask = Math.max(0, selectedTask - 1);
             else if (matchesKey(data, 'down') && tasks.length > 0) {
               selectedTask = Math.min(tasks.length - 1, selectedTask + 1);
@@ -2579,6 +2616,19 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               const task = tasks[selectedTask];
               if (!task) return;
               if (!selectedTaskIds.delete(task.id)) selectedTaskIds.add(task.id);
+            } else if (data.toLowerCase() === 'c') {
+              const targets = taskTargets();
+              const cancellable = targets.filter(
+                (t) => t.state === 'running' || t.state === 'queued',
+              );
+              if (cancellable.length === 0) {
+                ctx.ui.notify('No running or queued tasks selected to cancel', 'warning');
+                return;
+              }
+              pendingTaskAction = {
+                type: 'cancel',
+                taskIds: cancellable.map((task) => task.id),
+              };
             } else if (data.toLowerCase() === 'x') {
               const targets = taskTargets();
               if (targets.length === 0) return;
@@ -2597,13 +2647,25 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           log: (data) => {
             const task = tasks[selectedTask];
             if (!task) {
-              if (matchesKey(data, 'escape')) done(undefined);
+              if (matchesKey(data, 'escape')) finish();
               return;
             }
             if (matchesKey(data, 'escape')) {
               tab = 'tasks';
               follow = false;
               scroll = 0;
+            } else if (
+              data.toLowerCase() === 'c' &&
+              (task.state === 'running' || task.state === 'queued')
+            ) {
+              void this.cancelTasks([task.id], ctx).then((count) => {
+                if (count > 0) {
+                  ctx.ui.notify(`Cancelled task ${task.id.slice(0, 8)}`, 'info');
+                }
+                refreshTasks();
+                tui.requestRender();
+              });
+              return;
             } else if (
               matchesKey(data, 'return') &&
               (task.state === 'queued' || task.state === 'running')
@@ -2674,7 +2736,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             tui.requestRender();
           },
           help: (data) => {
-            if (matchesKey(data, 'escape')) done(undefined);
+            if (matchesKey(data, 'escape')) finish();
             return;
           },
         };
@@ -2783,7 +2845,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
             handleTabInput[tab](data);
           },
-          invalidate() {},
+          invalidate() {
+            unsubscribe();
+          },
         };
       },
       {
@@ -3030,15 +3094,10 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           finishedAt: Date.now(),
         });
 
-        const commandOutput = task.outputFile
-          ? (() => {
-              try {
-                return readFileSync(task.outputFile, 'utf8').trim();
-              } catch {
-                return '';
-              }
-            })()
-          : (task.output ?? '');
+        const commandOutput =
+          task.outputFile && existsSync(task.outputFile)
+            ? readFileSync(task.outputFile, 'utf8').trim()
+            : (task.output ?? '');
         const deliveryText = `Background command ${task.state === 'completed' ? 'completed' : 'failed'}: ${task.description}\n\n${renderTaskResult(task.id, task.state, commandOutput || (task.error ?? ''))}`;
         const delivered = await this.deliverBackground(task, deliveryText);
         if (delivered) {
@@ -3069,7 +3128,6 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       },
     };
   }
-
   private createTaskTool(
     parentTask?: TaskRecord,
     callerRules?: PermissionRules,
@@ -3941,6 +3999,13 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     try {
       const output = await run;
       if (this.shuttingDown || task.delivered || this.foregroundClaims.has(task.id)) return;
+      const durationSec = taskDuration(taskDetails(task)) ?? '';
+      this.recentCompletions.set(task.id, {
+        label: task.description,
+        status: 'completed',
+        text: `@${task.agent}: ${task.description} completed (${durationSec})`,
+        finishedAt: Date.now(),
+      });
       const delivered = await this.deliverBackground(
         task,
         `Background task completed: ${task.description}\n\n${renderTaskResult(task.id, 'completed', output)}`,
@@ -3948,9 +4013,17 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       if (!delivered) return;
       task.delivered = true;
       this.persist(task);
+      this.notifyTaskUpdate();
     } catch (error) {
       if (this.shuttingDown || task.delivered || this.foregroundClaims.has(task.id)) return;
       const message = formatError(error);
+      const durationSec = taskDuration(taskDetails(task)) ?? '';
+      this.recentCompletions.set(task.id, {
+        label: task.description,
+        status: task.state === 'cancelled' ? 'cancelled' : 'error',
+        text: `@${task.agent}: ${task.description} failed (${durationSec})`,
+        finishedAt: Date.now(),
+      });
       const delivered = await this.deliverBackground(
         task,
         `Background task failed: ${task.description}\n\n${renderTaskResult(task.id, 'error', message)}`,
@@ -3959,6 +4032,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       ctx.ui.notify(`Background task failed: ${task.description}`, 'error');
       task.delivered = true;
       this.persist(task);
+      this.notifyTaskUpdate();
     }
   }
 
@@ -4007,7 +4081,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
     const tasks = [...this.tasks.values()];
     const active = tasks.filter((task) => task.state === 'queued' || task.state === 'running');
-    if (active.length === 0) {
+    if (active.length === 0 && this.recentCompletions.size === 0) {
       ctx.ui.setWidget(TASK_WIDGET, undefined);
       return;
     }
@@ -4022,11 +4096,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
     ctx.ui.setWidget(TASK_WIDGET, (_tui, theme) => ({
       render: (width: number) => {
-        const header =
-          theme.fg('accent', theme.bold('Subagents')) + theme.fg('dim', `  ${summary}`);
+        const header = theme.fg('accent', theme.bold('Tasks')) + theme.fg('dim', `  ${summary}`);
         const tree = taskTreeLines(visible, (task) => {
           const state = taskState(theme, task);
-          const agent = theme.fg('accent', `@${task.agent}`);
+          const tag = task.kind === 'command' ? '$ bash' : `@${task.agent}`;
+          const agent = theme.fg('accent', tag);
           const record = byId.get(task.id)!;
           const progress = taskProgress(record);
           const suffix = progress.length > 0 ? theme.fg('dim', `  ·  ${progress.join(' · ')}`) : '';
@@ -4041,6 +4115,18 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         const shown = tree.slice(0, 8);
         if (tree.length > shown.length) {
           shown.push(theme.fg('dim', `   … ${tree.length - shown.length} more`));
+        }
+        if (this.recentCompletions.size > 0 && shown.length < 8) {
+          for (const comp of this.recentCompletions.values()) {
+            if (shown.length >= 8) break;
+            const icon =
+              comp.status === 'completed'
+                ? theme.fg('success', '✓')
+                : comp.status === 'cancelled'
+                  ? theme.fg('muted', '⊘')
+                  : theme.fg('error', '✗');
+            shown.push(`  ${icon} ${theme.fg('dim', comp.text)}`);
+          }
         }
         return [header, ...shown].map((line) => truncateToWidth(line, Math.max(1, width)));
       },

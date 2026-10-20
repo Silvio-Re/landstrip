@@ -29,6 +29,8 @@ export interface TaskCommandRecord {
   id: string;
   agent: string;
   state: string;
+  kind?: 'subagent' | 'command';
+  command?: string;
   description?: string;
 }
 
@@ -88,12 +90,15 @@ function parseArgv(args: string): Argv {
 type Completion = AutocompleteItem & { readonly search?: string };
 
 function taskItems(tasks: readonly TaskCommandRecord[], prefix: string): Completion[] {
-  return tasks.map((task) => ({
-    value: `${prefix}${task.id}`,
-    label: task.id.slice(0, 8),
-    description: `@${task.agent} [${task.state}]`,
-    search: task.id,
-  }));
+  return tasks.map((task) => {
+    const label = task.kind === 'command' || task.agent === 'bash' ? '$ bash' : `@${task.agent}`;
+    return {
+      value: `${prefix}${task.id}`,
+      label: task.id.slice(0, 8),
+      description: `${label} [${task.state}]`,
+      search: task.id,
+    };
+  });
 }
 
 export function matchingTasksById<T extends { id: string }>(
@@ -246,21 +251,58 @@ const SUBCOMMANDS: readonly Subcommand[] = [
   {
     name: 'tasks',
     summary: 'Inspect and manage running task sessions',
-    pane: (argv) => (argv.words[0] === 'kill' || argv.words[0] === 'list' ? undefined : 'tasks'),
+    pane: (argv) => {
+      const first = argv.words[0]?.toLowerCase() ?? '';
+      if (['cancel', 'delete', 'kill'].includes(first)) return undefined;
+      if (first === 'inspect' && argv.words[1]) return argv.words[1];
+      if (first && first !== 'list') return first;
+      return 'tasks';
+    },
     complete: (argv, { runtime }) => {
       const tasks = runtime?.getTasks() ?? [];
-      if (argv.words[0]?.toLowerCase() === 'kill') return taskItems(tasks, 'tasks kill ');
+      const action = argv.words[0]?.toLowerCase();
+      if (action === 'cancel' || action === 'kill') return taskItems(tasks, `tasks ${action} `);
+      if (action === 'delete') return taskItems(tasks, 'tasks delete ');
+      if (action === 'inspect') return taskItems(tasks, 'tasks inspect ');
       return [
-        { value: 'tasks list', label: 'list', description: 'List all task sessions' },
-        { value: 'tasks kill', label: 'kill', description: 'Kill a task session by ID' },
+        { value: 'tasks cancel', label: 'cancel', description: 'Cancel an active task session' },
+        { value: 'tasks delete', label: 'delete', description: 'Delete a task session by ID' },
+        { value: 'tasks inspect', label: 'inspect', description: 'Inspect a task session in TUI' },
         ...taskItems(tasks, 'tasks '),
       ];
     },
-    run: (argv, { ctx, runtime }) => {
-      const [action = '', taskId = ''] = argv.words;
-      if (action === 'kill') {
+    run: async (argv, { ctx, runtime }) => {
+      const [rawAction = '', rawTaskId = ''] = argv.words;
+      let action = rawAction.toLowerCase();
+      let taskId = rawTaskId;
+      if (!['cancel', 'delete', 'kill', 'inspect', 'list'].includes(action) && action) {
+        const matched = matchingTasksById(runtime.getTasks(), action);
+        if (matched.length > 0) {
+          action = 'inspect';
+          taskId = matched[0]!.id;
+        }
+      }
+      if (action === 'cancel' || action === 'kill') {
         if (!taskId) {
-          ctx.ui.notify('Task ID required to kill a task', 'error');
+          ctx.ui.notify('Task ID required to cancel a task', 'error');
+          return;
+        }
+        const matched = matchingTasksById(runtime.getTasks(), taskId);
+        if (matched.length === 0) {
+          ctx.ui.notify(`No task found matching ${taskId}`, 'error');
+          return;
+        }
+        if (matched.length > 1) {
+          ctx.ui.notify(`Task ID prefix ${taskId} matches ${matched.length} tasks`, 'error');
+          return;
+        }
+        const cancelled = await runtime.cancelTasks([matched[0]!.id], ctx);
+        ctx.ui.notify(`Cancelled ${cancelled} task${cancelled === 1 ? '' : 's'}`, 'info');
+        return;
+      }
+      if (action === 'delete') {
+        if (!taskId) {
+          ctx.ui.notify('Task ID required to delete a task', 'error');
           return;
         }
         const matched = matchingTasksById(runtime.getTasks(), taskId);
@@ -273,18 +315,17 @@ const SUBCOMMANDS: readonly Subcommand[] = [
           return;
         }
         const deleted = runtime.deleteTasks([matched[0]!.id], ctx);
-        ctx.ui.notify(`Killed ${deleted} task${deleted === 1 ? '' : 's'}`, 'info');
+        ctx.ui.notify(`Deleted ${deleted} task${deleted === 1 ? '' : 's'}`, 'info');
         return;
       }
-      const tasks = runtime.getTasks();
-      if (tasks.length === 0) {
-        ctx.ui.notify('No task sessions', 'info');
-        return;
+      if (action === 'inspect' && taskId) {
+        const matched = matchingTasksById(runtime.getTasks(), taskId);
+        if (matched.length === 1) {
+          await runtime.openLandstrip(matched[0]!.id, ctx);
+          return;
+        }
       }
-      ctx.ui.notify(
-        tasks.map((task) => `${task.id.slice(0, 8)}: @${task.agent} [${task.state}]`).join('\n'),
-        'info',
-      );
+      await runtime.openLandstrip('tasks', ctx);
     },
   },
   {
