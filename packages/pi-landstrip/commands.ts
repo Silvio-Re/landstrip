@@ -19,6 +19,7 @@ export interface CommandSubagentRuntime {
   getTasks(): TaskCommandRecord[];
   getAgentCatalog(ctx: ExtensionContext): AgentCatalog;
   selectPrimaryAgent(name: string, ctx: ExtensionContext): Promise<boolean>;
+  cancelTasks(taskIds: readonly string[], ctx: ExtensionContext): Promise<number>;
   deleteTasks(taskIds: readonly string[], ctx: ExtensionContext): number;
   openLandstrip(args: string, ctx: ExtensionContext): Promise<void>;
   primaryAgentName(): string | undefined;

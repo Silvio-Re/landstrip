@@ -8,8 +8,12 @@ import { join } from 'node:path';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
-import { createLandstripIntegration, type LandstripBashInput } from './index.ts';
-import { SubagentRuntime } from './subagents.ts';
+import {
+  createLandstripIntegration,
+  type LandstripBashInput,
+  type LandstripIntegration,
+} from './index.ts';
+import { SubagentRuntime, type SubagentTaskRecord } from './subagents.ts';
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -142,6 +146,120 @@ describe('Sandboxed Background Process Execution in Bash Tool', () => {
       const task = runtime.getTasks().find((t) => t.id === result.details.taskId);
       expect(task).toBeDefined();
       expect(task?.state).toBe('completed');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Task Cancellation vs Deletion Lifecycle', () => {
+  test('cancelTasks transitions active tasks to cancelled without deleting them', async () => {
+    const root = mkdtempSync(join(homedir(), '.pi-landstrip-test-'));
+    try {
+      vi.stubEnv('PI_CODING_AGENT_DIR', root);
+      const mockApi = createMockExtensionAPI();
+      let aborted = false;
+
+      const integration: LandstripIntegration = {
+        ...createLandstripIntegration({ registerBashTool: false, cwd: root }),
+        runSandboxedCommand: async (_cmd, _cwd, options) => {
+          options.signal?.addEventListener('abort', () => {
+            aborted = true;
+          });
+          return new Promise((resolve) => {
+            options.signal?.addEventListener('abort', () => {
+              resolve({ exitCode: null });
+            });
+          });
+        },
+      };
+
+      const runtime = new SubagentRuntime(mockApi.api, integration);
+      runtime.register();
+
+      const ctx = createMockExtensionContext(root);
+      // Initialize active session
+      for (const listener of mockApi.listeners.get('session_start') ?? []) {
+        await listener({}, ctx);
+      }
+
+      const launchResult = await runtime.runBackgroundShellTask(
+        { command: 'sleep 60', name: 'long-sleep' },
+        ctx,
+      );
+
+      const taskId = launchResult.details.taskId;
+      expect(taskId).toBeDefined();
+
+      const tasksBefore = runtime.getTasks();
+      const task = tasksBefore.find((t) => t.id === taskId);
+      expect(task).toBeDefined();
+      expect(task?.state).toBe('running');
+
+      const count = await runtime.cancelTasks([taskId], ctx);
+      expect(count).toBe(1);
+      expect(aborted).toBe(true);
+
+      const tasksAfter = runtime.getTasks();
+      const cancelledTask = tasksAfter.find((t) => t.id === taskId);
+      expect(cancelledTask).toBeDefined();
+      expect(cancelledTask?.state).toBe('cancelled');
+      expect(cancelledTask?.deleted).toBeUndefined();
+
+      // Deleting removes the task completely
+      const delCount = runtime.deleteTasks([taskId], ctx);
+      expect(delCount).toBe(1);
+      const tasksFinal = runtime.getTasks();
+      expect(tasksFinal.find((t) => t.id === taskId)).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('cancelTasks recursively cascades to child subagent tasks', async () => {
+    const root = mkdtempSync(join(homedir(), '.pi-landstrip-test-'));
+    try {
+      vi.stubEnv('PI_CODING_AGENT_DIR', root);
+      const mockApi = createMockExtensionAPI();
+      const integration = createLandstripIntegration({ registerBashTool: false, cwd: root });
+
+      const runtime = new SubagentRuntime(mockApi.api, integration);
+      runtime.register();
+      const ctx = createMockExtensionContext(root);
+      for (const listener of mockApi.listeners.get('session_start') ?? []) {
+        await listener({}, ctx);
+      }
+
+      // Populate mock parent and child tasks
+      const parentTask: SubagentTaskRecord = {
+        version: 1,
+        id: 'parent-task-1',
+        agent: 'architect',
+        description: 'parent task',
+        parentSessionId: 'test-session-123',
+        depth: 0,
+        state: 'running',
+        startedAt: Date.now(),
+      };
+      const childTask: SubagentTaskRecord = {
+        version: 1,
+        id: 'child-task-1',
+        parentTaskId: 'parent-task-1',
+        agent: 'developer',
+        description: 'child task',
+        parentSessionId: 'test-session-123',
+        depth: 1,
+        state: 'running',
+        startedAt: Date.now(),
+      };
+
+      (runtime as any).tasks.set(parentTask.id, parentTask);
+      (runtime as any).tasks.set(childTask.id, childTask);
+
+      const cancelledCount = await runtime.cancelTasks(['parent-task-1'], ctx);
+      expect(cancelledCount).toBe(2);
+      expect(parentTask.state).toBe('cancelled');
+      expect(childTask.state).toBe('cancelled');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

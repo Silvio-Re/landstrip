@@ -181,7 +181,7 @@ const AGENTS_HELP_ROWS = [
 const INHERIT = 'inherit';
 
 interface TaskListAction {
-  readonly type: 'delete';
+  readonly type: 'delete' | 'cancel';
   readonly taskIds: string[];
 }
 type PiThinkingLevel = Parameters<ExtensionAPI['setThinkingLevel']>[0];
@@ -3944,25 +3944,90 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     }));
   }
 
+  private abortTaskProcess(taskId: string): void {
+    const running = this.running.get(taskId);
+    if (running) {
+      try {
+        running.rpc.abort();
+      } catch {}
+    }
+    const controller = this.controllers.get(taskId);
+    if (controller) {
+      controller.abort();
+      this.controllers.delete(taskId);
+    }
+  }
+
+  async cancelTasks(taskIds: readonly string[], ctx: ExtensionContext): Promise<number> {
+    let cancelled = 0;
+    const toCancel = new Set<string>();
+
+    const collectRecursive = (id: string) => {
+      toCancel.add(id);
+      for (const t of this.tasks.values()) {
+        if (t.parentTaskId === id && !toCancel.has(t.id)) {
+          collectRecursive(t.id);
+        }
+      }
+    };
+
+    for (const id of taskIds) {
+      const task = this.tasks.get(id);
+      if (task) collectRecursive(task.id);
+    }
+
+    for (const taskId of toCancel) {
+      const task = this.tasks.get(taskId);
+      if (!task) continue;
+      if (task.state === 'completed' || task.state === 'error' || task.state === 'cancelled') {
+        continue;
+      }
+
+      task.state = 'cancelled';
+      task.finishedAt = Date.now();
+
+      this.abortTaskProcess(taskId);
+
+      this.persist(task);
+      cancelled += 1;
+    }
+
+    if (cancelled > 0) {
+      this.updateTaskWidget(ctx);
+      this.notifyTaskUpdate();
+    }
+    return cancelled;
+  }
+
   deleteTasks(taskIds: readonly string[], ctx: ExtensionContext): number {
     let deleted = 0;
     for (const taskId of taskIds) {
       const task = this.tasks.get(taskId);
       if (!task) continue;
+      if (task.state === 'running' || task.state === 'queued') {
+        task.state = 'cancelled';
+        task.finishedAt = Date.now();
+        this.abortTaskProcess(taskId);
+      }
       task.deleted = true;
       task.delivered = true;
-      this.controllers.get(taskId)?.abort();
       if (task.sessionDir && existsSync(task.sessionDir)) {
-        rmSync(task.sessionDir, { recursive: true, force: true });
+        try {
+          rmSync(task.sessionDir, { recursive: true, force: true });
+        } catch {}
       }
       this.tasks.delete(taskId);
       this.pendingPrompts.delete(taskId);
       this.pendingSteers.delete(taskId);
       this.foregroundClaims.delete(taskId);
+      this.recentCompletions.delete(taskId);
       this.persist(task);
       deleted += 1;
     }
-    if (deleted > 0) this.updateTaskWidget(ctx);
+    if (deleted > 0) {
+      this.updateTaskWidget(ctx);
+      this.notifyTaskUpdate();
+    }
     return deleted;
   }
 
