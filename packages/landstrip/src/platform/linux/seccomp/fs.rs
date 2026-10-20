@@ -3,22 +3,17 @@
 
 use super::error::{BrokerError, SysResult};
 use super::grant::{
-    Anchor, FdMutation, Grant, MutationGrant, MutationOp, OPEN_HOW_SIZE, OpenGrant, OpenHow,
-    OpenKind, open_fd_path, open_path,
+    FdMutation, Grant, MutationGrant, MutationTarget, OPEN_HOW_SIZE, OpenGrant, OpenHow,
+    PathMutation, open_path,
 };
 use super::notify::NotificationResult;
-use super::process::TargetProcess;
+use super::process::{ResolvedPath, TargetProcess};
 use super::supervise::{Denial, Denials};
-use crate::paths::{
-    PathCoverage, normalize_path, normalize_path_lexically, normalize_path_nofollow,
-};
-use crate::policy::{AccessPolicy, DenialReason, ReadAccess};
+use crate::paths::{PathCoverage, normalize_path_lexically};
+use crate::policy::{AccessPolicy, DenialReason};
 use crate::trap::{FilesystemDenial, Trap, TrapOperation};
-use std::fs;
 use std::io::IoSliceMut;
-use std::mem;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
 const SYS_FCHMODAT2: i64 = 452;
@@ -55,16 +50,27 @@ pub(super) mod legacy_syscall {
     pub const LCHOWN: Option<i64> = None;
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "syscall argument registers are zero- or sign-extended u64 in seccomp_notif"
-)]
-fn syscall_u32(value: u64) -> u32 {
-    value as u32
+trait SyscallArg {
+    fn to_u32(self) -> u32;
+    fn to_i32(self) -> i32;
 }
 
-fn syscall_i32(value: u64) -> i32 {
-    syscall_u32(value).cast_signed()
+impl SyscallArg for u64 {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "syscall argument registers are zero- or sign-extended u64 in seccomp_notif"
+    )]
+    fn to_u32(self) -> u32 {
+        self as u32
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "syscall argument registers are zero- or sign-extended u64 in seccomp_notif"
+    )]
+    fn to_i32(self) -> i32 {
+        (self as u32).cast_signed()
+    }
 }
 
 fn open_flag_names(flags: i32) -> Vec<&'static str> {
@@ -124,8 +130,8 @@ pub(super) enum MutationSyscall {
 
 impl MutationSyscall {
     pub(super) fn no_follow(self, args: &[u64; 6]) -> bool {
-        let flag = |index: usize| syscall_i32(args[index]) & libc::AT_SYMLINK_NOFOLLOW != 0;
-        let follow = |index: usize| syscall_i32(args[index]) & libc::AT_SYMLINK_FOLLOW != 0;
+        let flag = |index: usize| args[index].to_i32() & libc::AT_SYMLINK_NOFOLLOW != 0;
+        let follow = |index: usize| args[index].to_i32() & libc::AT_SYMLINK_FOLLOW != 0;
         match self {
             Self::Unlink
             | Self::Unlinkat
@@ -382,7 +388,7 @@ impl Open {
         let flags = i32::try_from(args[flags_arg]).map_err(|_| BrokerError::InvalidAddress)?;
         Ok(Self {
             flags,
-            mode: syscall_u32(args[mode_arg]),
+            mode: args[mode_arg].to_u32(),
             resolve: 0,
         })
     }
@@ -436,10 +442,12 @@ impl Open {
 }
 
 fn validate_open_how(how: &OpenHow) -> SysResult<()> {
-    match how.openat2(libc::AT_FDCWD, &c"".to_owned()) {
-        Err(libc::ENOENT) => Ok(()),
-        Err(errno) => Err(BrokerError::SystemCall { errno }),
-        Ok(_) => Err(BrokerError::SystemCall { errno: libc::EIO }),
+    match how.openat2(libc::AT_FDCWD, c"") {
+        Err(BrokerError::SystemCall {
+            errno: libc::ENOENT,
+        }) => Ok(()),
+        Err(err) => Err(err),
+        Ok(_) => Err(BrokerError::syscall(libc::EIO)),
     }
 }
 
@@ -449,7 +457,6 @@ struct OpenDenial {
     requested_path: PathBuf,
     syscall: &'static str,
     flags: i32,
-    mode: u32,
     grant: Option<OpenGrant>,
     reason: DenialReason,
     pid: u32,
@@ -472,7 +479,6 @@ fn deny_open(
         requested_path,
         syscall,
         flags,
-        mode,
         grant,
         reason,
         pid,
@@ -481,14 +487,11 @@ fn deny_open(
     if query_enabled {
         let query_id = *next_query_id;
         *next_query_id += 1;
+        // SECCOMP_IOCTL_NOTIF_ADDFD cannot inject O_PATH descriptors.
         let grant = if flags & libc::O_PATH != 0 {
             None
         } else {
-            Some(Grant::Open(match grant {
-                Some(grant) => grant,
-                None => OpenGrant::new(&path, flags, mode)
-                    .map_err(|errno| BrokerError::SystemCall { errno })?,
-            }))
+            grant.map(Grant::Open)
         };
         return Ok(NotificationResult::query(
             query_id,
@@ -537,7 +540,7 @@ fn read_open_request(request: &libc::seccomp_notif) -> SysResult<OpenRequest> {
     let dirfd = if legacy_open {
         libc::AT_FDCWD
     } else {
-        syscall_i32(request.data.args[0])
+        request.data.args[0].to_i32()
     };
     let path_arg = usize::from(!legacy_open);
     let path_ptr =
@@ -570,37 +573,22 @@ fn resolve_open_target(
     process: &TargetProcess,
     dirfd: i32,
     path: &Path,
-    flags: i32,
-    mode: u32,
-    resolve: u64,
-) -> SysResult<(PathBuf, PathBuf, Option<OpenGrant>)> {
-    if resolve != 0 {
-        let (raw, resolved, grant) =
-            OpenGrant::new_openat2(process, dirfd, path, flags, mode, resolve)
-                .map_err(|errno| BrokerError::SystemCall { errno })?;
-        Ok((raw, resolved, Some(grant)))
-    } else {
-        let raw = process.resolve_path(dirfd, path)?;
-        let trailing_slash = raw.as_os_str().as_bytes().ends_with(b"/");
-        if trailing_slash || flags & libc::O_NOFOLLOW != 0 {
-            let target = if trailing_slash {
-                raw.clone()
-            } else {
-                normalize_path_nofollow(&raw)
-            };
-            let grant = OpenGrant::new(&target, flags, mode)
-                .map_err(|errno| BrokerError::SystemCall { errno })?;
-            let resolved = match &grant.kind {
-                OpenKind::Reopen(handle) => open_fd_path(handle.as_fd())
-                    .map_err(|errno| BrokerError::SystemCall { errno })?,
-                OpenKind::Create { .. } => target,
-            };
-            Ok((raw, resolved, Some(grant)))
-        } else {
-            let resolved = normalize_path(&raw);
-            Ok((raw, resolved, None))
-        }
-    }
+    open: &Open,
+) -> SysResult<(PathBuf, PathBuf, SysResult<OpenGrant>)> {
+    let filesystem = process.filesystem()?;
+    let follow = open.flags & libc::O_NOFOLLOW == 0
+        && open.flags & (libc::O_CREAT | libc::O_EXCL) != (libc::O_CREAT | libc::O_EXCL);
+    let resolved = filesystem.resolve(
+        dirfd,
+        path,
+        follow,
+        open.flags & libc::O_CREAT != 0,
+        open.resolve,
+    )?;
+    let raw = resolved.raw.clone();
+    let label = resolved.label.clone();
+    let grant = OpenGrant::new(resolved, open.flags, open.mode, open.resolve);
+    Ok((raw, label, grant))
 }
 
 pub(super) fn handle_openat(
@@ -620,24 +608,35 @@ pub(super) fn handle_openat(
         syscall,
     } = read_open_request(request)?;
 
-    let (raw, resolved, open_grant) =
-        resolve_open_target(&process, dirfd, &path, flags, mode, resolve)?;
+    let (raw, resolved, open_grant) = resolve_open_target(
+        &process,
+        dirfd,
+        &path,
+        &Open {
+            flags,
+            mode,
+            resolve,
+        },
+    )?;
     let wants_write = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0;
     let reports_write = flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) != 0;
     let wants_read = flags & libc::O_WRONLY == 0;
     let hard_read_denied = wants_read && resolved.is_under_any(&policy.read_denied_always_roots);
     let hard_write_denied = wants_write && resolved.is_under_any(&policy.write_denied_always_roots);
     let query_enabled = query_enabled && !hard_read_denied && !hard_write_denied;
+    // Hard policy denials still apply to future descendants with missing parents.
+    if !hard_read_denied
+        && !hard_write_denied
+        && let Err(err) = &open_grant
+    {
+        return Err(*err);
+    }
+    let open_grant = open_grant.ok();
 
     if wants_write
         && !hard_read_denied
         && let Some(reason) = policy.write_reason(&resolved, &normalize_path_lexically(&raw), true)
     {
-        if flags & libc::O_CREAT == 0 && !resolved.try_exists()? {
-            return Err(BrokerError::SystemCall {
-                errno: libc::ENOENT,
-            });
-        }
         return deny_open(
             OpenDenial {
                 operation: TrapOperation::Write,
@@ -645,7 +644,6 @@ pub(super) fn handle_openat(
                 requested_path: path,
                 syscall,
                 flags,
-                mode,
                 grant: open_grant,
                 reason,
                 pid: request.pid,
@@ -657,11 +655,6 @@ pub(super) fn handle_openat(
         );
     }
     if wants_read && let Some(reason) = policy.read_reason(&resolved) {
-        if !resolved.try_exists()? {
-            return Err(BrokerError::SystemCall {
-                errno: libc::ENOENT,
-            });
-        }
         return deny_open(
             OpenDenial {
                 operation: TrapOperation::Read,
@@ -669,7 +662,6 @@ pub(super) fn handle_openat(
                 requested_path: path,
                 syscall,
                 flags,
-                mode,
                 grant: open_grant,
                 reason,
                 pid: request.pid,
@@ -684,34 +676,33 @@ pub(super) fn handle_openat(
     if flags & libc::O_PATH != 0 {
         return Ok(NotificationResult::Continue);
     }
-
-    let grant = open_grant
-        .map_or_else(|| OpenGrant::new(&resolved, flags, mode), Ok)
-        .map_err(|errno| BrokerError::SystemCall { errno })?;
-    Ok(NotificationResult::Open(grant))
+    Ok(NotificationResult::Open(open_grant.ok_or(
+        BrokerError::SystemCall {
+            errno: libc::ENOENT,
+        },
+    )?))
 }
 
 fn reparent_read_denial(
     policy: &AccessPolicy,
     spec: &Syscall,
-    slots: &[Option<(PathBuf, PathBuf)>],
+    paths: &[(ResolvedPath, PathBuf)],
 ) -> Option<(usize, DenialReason, TrapOperation)> {
     if !spec.kind.is_reparent() {
         return None;
     }
-    let (source, _) = slots.first().and_then(Option::as_ref)?;
-    let reason = policy.read_reason(source)?;
-    let dest_readable = slots
+    let (source, _) = paths.first()?;
+    let reason = policy.read_reason(&source.label)?;
+    let dest_readable = paths
         .get(1)
-        .and_then(Option::as_ref)
-        .is_none_or(|(dest, _)| policy.read_reason(dest).is_none());
+        .is_none_or(|(dest, _)| policy.read_reason(&dest.label).is_none());
     dest_readable.then_some((0, reason, TrapOperation::Read))
 }
 
 fn validate_mutation_flags(kind: MutationSyscall, args: &[u64; 6]) -> SysResult<()> {
     let flags = match kind {
-        MutationSyscall::Fchmodat2 | MutationSyscall::Utimensat => syscall_i32(args[3]),
-        MutationSyscall::Fchownat => syscall_i32(args[4]),
+        MutationSyscall::Fchmodat2 | MutationSyscall::Utimensat => args[3].to_i32(),
+        MutationSyscall::Fchownat => args[4].to_i32(),
         _ => return Ok(()),
     };
     if flags & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) != 0 {
@@ -745,12 +736,12 @@ pub(super) fn handle_mutation(
     }
 
     let process = TargetProcess::from_raw(request.pid);
-    let mut slots: Vec<Option<(PathBuf, PathBuf)>> = Vec::with_capacity(spec.paths.len());
-    let mut denial: Option<(usize, DenialReason, TrapOperation)> = None;
+    let filesystem = process.filesystem()?;
+    let mut paths = Vec::with_capacity(spec.paths.len());
     let no_follow = spec.kind.no_follow(&request.data.args);
     for (index, (dirfd_arg, path_arg)) in spec.paths.iter().enumerate() {
         let dirfd = match dirfd_arg {
-            Some(arg) => syscall_i32(request.data.args[*arg]),
+            Some(arg) => request.data.args[*arg].to_i32(),
             None => libc::AT_FDCWD,
         };
         let path_ptr =
@@ -766,51 +757,65 @@ pub(super) fn handle_mutation(
                 next_query_id,
             );
         }
-        let raw = process.resolve_path(dirfd, &path)?;
-        if spec.kind.is_mkdir() && mkdir_target_exists(&raw) {
+        let follow = !no_follow
+            && match spec.kind {
+                MutationSyscall::Rename
+                | MutationSyscall::Renameat
+                | MutationSyscall::Renameat2
+                | MutationSyscall::Symlink
+                | MutationSyscall::Symlinkat
+                | MutationSyscall::Mkdir
+                | MutationSyscall::Mkdirat
+                | MutationSyscall::Mknod
+                | MutationSyscall::Mknodat => false,
+                MutationSyscall::Link | MutationSyscall::Linkat => index == 0,
+                _ => true,
+            };
+        let target = filesystem.resolve(dirfd, &path, follow, true, 0)?;
+        if spec.kind.is_mkdir()
+            && target
+                .anchor
+                .as_ref()
+                .is_some_and(|anchor| anchor.target.is_some())
+        {
             return Err(BrokerError::SystemCall {
                 errno: libc::EEXIST,
             });
         }
-        let resolved = if no_follow {
-            normalize_path_nofollow(&raw)
-        } else {
-            normalize_path(&raw)
-        };
-        if denial.is_none() {
-            let lexical = normalize_path_lexically(&raw);
-            let surface_allow_miss = query_enabled || !spec.landlock_backed;
-            if let Some(reason) = policy.write_reason(&resolved, &lexical, surface_allow_miss) {
-                denial = Some((index, reason, TrapOperation::Write));
-            }
-        }
-        slots.push(Some((resolved, path)));
+        paths.push((target, path));
     }
 
+    let grant = spec.kind.grant(request, &process, &mut paths);
+    let mut denial = None;
+    for (index, (target, _)) in paths.iter().enumerate() {
+        // The broker executes every granted mutation outside Landlock, so
+        // allowWrite misses must be enforced here.
+        let lexical = normalize_path_lexically(&target.raw);
+        if let Some(reason) = policy.write_reason(&target.label, &lexical, true) {
+            denial = Some((index, reason, TrapOperation::Write));
+            break;
+        }
+    }
     let hard_read_denial = spec
         .kind
         .is_reparent()
         .then(|| {
-            slots.iter().position(|slot| {
-                slot.as_ref().is_some_and(|(path, _)| {
-                    path.is_under_any(&policy.read_denied_always_roots)
-                        || policy
-                            .read_denied_always_roots
-                            .iter()
-                            .any(|root| root.is_under(path))
-                })
+            paths.iter().position(|(target, _)| {
+                target.label.is_under_any(&policy.read_denied_always_roots)
+                    || policy
+                        .read_denied_always_roots
+                        .iter()
+                        .any(|root| root.is_under(&target.label))
             })
         })
         .flatten();
-    let hard_write_denial = slots.iter().position(|slot| {
-        slot.as_ref().is_some_and(|(path, _)| {
-            path.is_under_any(&policy.write_denied_always_roots)
-                || (spec.kind.is_reparent()
-                    && policy
-                        .write_denied_always_roots
-                        .iter()
-                        .any(|root| root.is_under(path)))
-        })
+    let hard_write_denial = paths.iter().position(|(target, _)| {
+        target.label.is_under_any(&policy.write_denied_always_roots)
+            || (spec.kind.is_reparent()
+                && policy
+                    .write_denied_always_roots
+                    .iter()
+                    .any(|root| root.is_under(&target.label)))
     });
     let query_enabled = query_enabled && hard_read_denial.is_none() && hard_write_denial.is_none();
     denial = hard_read_denial
@@ -819,30 +824,18 @@ pub(super) fn handle_mutation(
             hard_write_denial.map(|index| (index, DenialReason::DenyMatch, TrapOperation::Write))
         })
         .or(denial)
-        .or_else(|| reparent_read_denial(policy, spec, &slots));
+        .or_else(|| reparent_read_denial(policy, spec, &paths));
 
     let Some((index, reason, operation)) = denial else {
-        let must_pin = !policy.write_denied_roots.is_empty()
-            || !policy.write_denied_patterns.is_empty()
-            || !policy.write_denied_links.is_empty()
-            || !spec.landlock_backed
-            || (spec.kind.is_reparent() && !matches!(policy.read_access, ReadAccess::Unrestricted));
-        if must_pin {
-            match mutation_grant(spec, request, &process, &slots)? {
-                Some(Grant::Mutation(grant)) => {
-                    return Ok(NotificationResult::Mutation(grant));
-                }
-                Some(Grant::Open(grant)) => {
-                    return Ok(NotificationResult::Open(grant));
-                }
-                Some(Grant::Socket(_)) | None => {
-                    return Err(BrokerError::SystemCall { errno: libc::EIO });
-                }
-            }
-        }
-        return Ok(NotificationResult::Continue);
+        return match grant? {
+            Some(Grant::Mutation(grant)) => Ok(NotificationResult::Mutation(grant?)),
+            Some(Grant::Open(grant)) => Ok(NotificationResult::Open(grant)),
+            Some(Grant::Socket(_)) | None => Err(BrokerError::SystemCall { errno: libc::EIO }),
+        };
     };
-    let (resolved, path) = slots[index].clone().ok_or(BrokerError::InvalidAddress)?;
+    let (target, path) = &paths[index];
+    let resolved = target.label.clone();
+    let path = path.clone();
 
     if !query_enabled {
         denials.record(Denial::Filesystem(FilesystemDenial {
@@ -856,10 +849,10 @@ pub(super) fn handle_mutation(
         }));
         return Err(BrokerError::PolicyDenied);
     }
+    let grant = grant?;
 
     let qid = *next_query_id;
     *next_query_id += 1;
-    let grant = mutation_grant(spec, request, &process, &slots)?;
     Ok(NotificationResult::query(
         qid,
         Trap::filesystem(
@@ -896,7 +889,6 @@ fn mutation_target_fd(
         .join(process.pid.as_raw().to_string())
         .join("cwd");
     open_path(&cwd, libc::O_PATH | libc::O_CLOEXEC)
-        .map_err(|errno| BrokerError::SystemCall { errno })
 }
 
 fn handle_fd_mutation(
@@ -909,31 +901,31 @@ fn handle_fd_mutation(
 ) -> SysResult<NotificationResult> {
     let args = &request.data.args;
     let process = TargetProcess::from_raw(request.pid);
-    if spec.kind == MutationSyscall::Utimensat && syscall_i32(args[3]) != 0 {
+    if spec.kind == MutationSyscall::Utimensat && args[3].to_i32() != 0 {
         return Err(BrokerError::SystemCall {
             errno: libc::EINVAL,
         });
     }
 
-    let target = mutation_target_fd(&process, syscall_i32(args[0]), spec.kind)?;
-    let requested_path =
-        fs::read_link(Path::new("/proc/self/fd").join(target.as_raw_fd().to_string()))?;
+    let target = mutation_target_fd(&process, args[0].to_i32(), spec.kind)?;
+    let filesystem = process.filesystem()?;
+    let requested_path = filesystem.label(target.as_fd())?;
     let mutation = match spec.kind {
         MutationSyscall::Fchmod => FdMutation::Chmod {
-            mode: syscall_u32(args[1]),
+            mode: args[1].to_u32(),
         },
         MutationSyscall::Fchmodat2 => FdMutation::ChmodAt {
-            mode: syscall_u32(args[2]),
-            flags: syscall_i32(args[3]),
+            mode: args[2].to_u32(),
+            flags: args[3].to_i32(),
         },
         MutationSyscall::Fchown => FdMutation::Chown {
-            uid: syscall_u32(args[1]),
-            gid: syscall_u32(args[2]),
+            uid: args[1].to_u32(),
+            gid: args[2].to_u32(),
         },
         MutationSyscall::Fchownat => FdMutation::ChownAt {
-            uid: syscall_u32(args[2]),
-            gid: syscall_u32(args[3]),
-            flags: syscall_i32(args[4]),
+            uid: args[2].to_u32(),
+            gid: args[3].to_u32(),
+            flags: args[4].to_i32(),
         },
         MutationSyscall::Utimensat => FdMutation::Utimes {
             times: process.read_times(args[2])?,
@@ -941,7 +933,7 @@ fn handle_fd_mutation(
         MutationSyscall::Fsetxattr => FdMutation::SetXattr {
             name: process.read_xattr_name(args[1])?,
             value: process.read_bytes(args[2], args[3])?,
-            flags: syscall_i32(args[4]),
+            flags: args[4].to_i32(),
         },
         MutationSyscall::Fremovexattr => FdMutation::RemoveXattr {
             name: process.read_xattr_name(args[1])?,
@@ -952,25 +944,12 @@ fn handle_fd_mutation(
             });
         }
     };
-    let no_follow = match spec.kind {
-        MutationSyscall::Fchmodat2 => syscall_i32(args[3]) & libc::AT_SYMLINK_NOFOLLOW != 0,
-        MutationSyscall::Fchownat => syscall_i32(args[4]) & libc::AT_SYMLINK_NOFOLLOW != 0,
-        _ => false,
-    };
-    let resolved = if no_follow {
-        normalize_path_nofollow(&requested_path)
-    } else {
-        normalize_path(&requested_path)
-    };
+    let resolved = requested_path.clone();
     let lexical = normalize_path_lexically(&requested_path);
     let hard_write_denied = resolved.is_under_any(&policy.write_denied_always_roots);
     let query_enabled = query_enabled && !hard_write_denied;
     let reason = policy.write_reason(&resolved, &lexical, true);
-    let operation = MutationGrant {
-        op: MutationOp::Fd { target, mutation },
-        anchors: Vec::new(),
-        no_follow: false,
-    };
+    let operation = MutationGrant::Fd { target, mutation };
 
     let Some(reason) = reason else {
         return Ok(NotificationResult::Mutation(operation));
@@ -995,122 +974,146 @@ fn handle_fd_mutation(
     Ok(NotificationResult::query(
         qid,
         Trap::filesystem(denial, Some(qid)),
-        Some(Grant::Mutation(operation)),
+        Some(Grant::Mutation(Ok(operation))),
     ))
 }
 
-fn mutation_grant(
-    spec: &Syscall,
-    request: &libc::seccomp_notif,
-    process: &TargetProcess,
-    slots: &[Option<(PathBuf, PathBuf)>],
-) -> SysResult<Option<Grant>> {
-    let args = &request.data.args;
-    let op = match spec.kind {
-        MutationSyscall::Creat => {
-            return creat_grant(slots, syscall_u32(args[1]));
-        }
-        MutationSyscall::Fchmod
-        | MutationSyscall::Fchown
-        | MutationSyscall::Fsetxattr
-        | MutationSyscall::Fremovexattr => return Ok(None),
-        MutationSyscall::Mkdirat => MutationOp::Mkdir {
-            mode: syscall_u32(args[2]),
-        },
-        MutationSyscall::Mkdir => MutationOp::Mkdir {
-            mode: syscall_u32(args[1]),
-        },
-        MutationSyscall::Mknodat => MutationOp::Mknod {
-            mode: syscall_u32(args[2]),
-            dev: args[3],
-        },
-        MutationSyscall::Mknod => MutationOp::Mknod {
-            mode: syscall_u32(args[1]),
-            dev: args[2],
-        },
-        MutationSyscall::Unlinkat => MutationOp::Unlink {
-            flags: syscall_i32(args[2]),
-        },
-        MutationSyscall::Unlink => MutationOp::Unlink { flags: 0 },
-        MutationSyscall::Rmdir => MutationOp::Unlink {
-            flags: libc::AT_REMOVEDIR,
-        },
-        MutationSyscall::Renameat2 => MutationOp::Rename {
-            flags: syscall_u32(args[4]),
-        },
-        MutationSyscall::Renameat | MutationSyscall::Rename => MutationOp::Rename { flags: 0 },
-        MutationSyscall::Linkat => MutationOp::Link {
-            flags: syscall_i32(args[4]),
-        },
-        MutationSyscall::Link => MutationOp::Link { flags: 0 },
-        MutationSyscall::Symlinkat | MutationSyscall::Symlink => {
-            let Some(target) = process.read_target(args[0])? else {
-                return Ok(None);
-            };
-            MutationOp::Symlink { target }
-        }
-        MutationSyscall::Truncate => MutationOp::Truncate {
-            length: args[1].cast_signed(),
-        },
-        MutationSyscall::Fchmodat => MutationOp::Chmod {
-            mode: syscall_u32(args[2]),
-        },
-        MutationSyscall::Fchmodat2 => MutationOp::ChmodAt {
-            mode: syscall_u32(args[2]),
-            flags: syscall_i32(args[3]),
-        },
-        MutationSyscall::Chmod => MutationOp::Chmod {
-            mode: syscall_u32(args[1]),
-        },
-        MutationSyscall::Fchownat => MutationOp::ChownAt {
-            uid: syscall_u32(args[2]),
-            gid: syscall_u32(args[3]),
-            flags: syscall_i32(args[4]),
-        },
-        MutationSyscall::Chown | MutationSyscall::Lchown => MutationOp::Chown {
-            uid: syscall_u32(args[1]),
-            gid: syscall_u32(args[2]),
-        },
-        MutationSyscall::Utimensat => MutationOp::Utimes {
-            times: process.read_times(args[2])?,
-            flags: syscall_i32(args[3]),
-        },
-        MutationSyscall::Setxattr | MutationSyscall::Lsetxattr => MutationOp::SetXattr {
-            name: process.read_xattr_name(args[1])?,
-            value: process.read_bytes(args[2], args[3])?,
-            flags: syscall_i32(args[4]),
-        },
-        MutationSyscall::Removexattr | MutationSyscall::Lremovexattr => MutationOp::RemoveXattr {
-            name: process.read_xattr_name(args[1])?,
-        },
-    };
-
-    let mut anchors = Vec::with_capacity(slots.len());
-    for slot in slots {
-        let Some((resolved, _)) = slot else {
-            return Ok(None);
+impl MutationSyscall {
+    fn grant(
+        self,
+        request: &libc::seccomp_notif,
+        process: &TargetProcess,
+        paths: &mut [(ResolvedPath, PathBuf)],
+    ) -> SysResult<Option<Grant>> {
+        let mut paths = paths.iter_mut();
+        let (resolved, _) = paths.next().ok_or(BrokerError::InvalidAddress)?;
+        let at = resolved
+            .anchor
+            .take()
+            .ok_or_else(|| BrokerError::syscall(libc::ENOENT))?;
+        let to = paths.next().and_then(|(target, _)| target.anchor.take());
+        let args = &request.data.args;
+        let no_follow = self.no_follow(args);
+        let operation = match self {
+            MutationSyscall::Creat => {
+                return OpenGrant::new(
+                    ResolvedPath {
+                        raw: resolved.raw.clone(),
+                        label: resolved.label.clone(),
+                        anchor: Some(at),
+                        root: resolved.root.try_clone()?,
+                    },
+                    libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+                    args[1].to_u32(),
+                    0,
+                )
+                .map(|grant| Some(Grant::Open(grant)));
+            }
+            MutationSyscall::Mkdirat => Ok(MutationGrant::Mkdir {
+                at,
+                mode: args[2].to_u32(),
+            }),
+            MutationSyscall::Mkdir => Ok(MutationGrant::Mkdir {
+                at,
+                mode: args[1].to_u32(),
+            }),
+            MutationSyscall::Mknodat => Ok(MutationGrant::Mknod {
+                at,
+                mode: args[2].to_u32(),
+                dev: args[3],
+            }),
+            MutationSyscall::Mknod => Ok(MutationGrant::Mknod {
+                at,
+                mode: args[1].to_u32(),
+                dev: args[2],
+            }),
+            MutationSyscall::Unlinkat => Ok(MutationGrant::Unlink {
+                at,
+                flags: args[2].to_i32(),
+            }),
+            MutationSyscall::Unlink => Ok(MutationGrant::Unlink { at, flags: 0 }),
+            MutationSyscall::Rmdir => Ok(MutationGrant::Unlink {
+                at,
+                flags: libc::AT_REMOVEDIR,
+            }),
+            MutationSyscall::Renameat2 => Ok(MutationGrant::Rename {
+                from: at,
+                to: to.ok_or_else(|| BrokerError::syscall(libc::ENOENT))?,
+                flags: args[4].to_u32(),
+            }),
+            MutationSyscall::Renameat | MutationSyscall::Rename => Ok(MutationGrant::Rename {
+                from: at,
+                to: to.ok_or_else(|| BrokerError::syscall(libc::ENOENT))?,
+                flags: 0,
+            }),
+            MutationSyscall::Linkat | MutationSyscall::Link => {
+                let to = to.ok_or_else(|| BrokerError::syscall(libc::ENOENT))?;
+                let flags = if self == Self::Linkat {
+                    args[4].to_i32()
+                } else {
+                    0
+                };
+                MutationTarget::new(at, no_follow).map(|from| MutationGrant::Link {
+                    from,
+                    to,
+                    flags,
+                })
+            }
+            MutationSyscall::Symlinkat | MutationSyscall::Symlink => {
+                let Some(target) = process.read_target(args[0])? else {
+                    return Ok(None);
+                };
+                Ok(MutationGrant::Symlink { at, target })
+            }
+            MutationSyscall::Truncate => at.into_target().map(|target| MutationGrant::Truncate {
+                target,
+                length: args[1].cast_signed(),
+            }),
+            MutationSyscall::Fchmodat => at.into_target().map(|target| MutationGrant::Chmod {
+                target,
+                mode: args[2].to_u32(),
+            }),
+            MutationSyscall::Chmod => at.into_target().map(|target| MutationGrant::Chmod {
+                target,
+                mode: args[1].to_u32(),
+            }),
+            _ => {
+                let mutation = self.path_mutation(process, args)?;
+                MutationTarget::new(at, no_follow)
+                    .map(|target| MutationGrant::Metadata { target, mutation })
+            }
         };
-        anchors.push(Anchor::new(resolved).map_err(|errno| BrokerError::SystemCall { errno })?);
+
+        Ok(Some(Grant::Mutation(operation)))
     }
 
-    Ok(Some(Grant::Mutation(MutationGrant {
-        op,
-        anchors,
-        no_follow: spec.kind.no_follow(args),
-    })))
-}
-
-fn creat_grant(slots: &[Option<(PathBuf, PathBuf)>], mode: u32) -> SysResult<Option<Grant>> {
-    let Some((resolved, _)) = slots.first().and_then(Option::as_ref) else {
-        return Ok(None);
-    };
-    OpenGrant::new(
-        resolved,
-        libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
-        mode,
-    )
-    .map(|grant| Some(Grant::Open(grant)))
-    .map_err(|errno| BrokerError::SystemCall { errno })
+    fn path_mutation(self, process: &TargetProcess, args: &[u64; 6]) -> SysResult<PathMutation> {
+        Ok(match self {
+            Self::Fchmodat2 => PathMutation::ChmodAt {
+                mode: args[2].to_u32(),
+            },
+            Self::Fchownat => PathMutation::ChownAt {
+                uid: args[2].to_u32(),
+                gid: args[3].to_u32(),
+            },
+            Self::Chown | Self::Lchown => PathMutation::Chown {
+                uid: args[1].to_u32(),
+                gid: args[2].to_u32(),
+            },
+            Self::Utimensat => PathMutation::Utimes {
+                times: process.read_times(args[2])?,
+            },
+            Self::Setxattr | Self::Lsetxattr => PathMutation::SetXattr {
+                name: process.read_xattr_name(args[1])?,
+                value: process.read_bytes(args[2], args[3])?,
+                flags: args[4].to_i32(),
+            },
+            Self::Removexattr | Self::Lremovexattr => PathMutation::RemoveXattr {
+                name: process.read_xattr_name(args[1])?,
+            },
+            _ => return Err(BrokerError::syscall(libc::EINVAL)),
+        })
+    }
 }
 
 fn empty_path_uses_fd(kind: MutationSyscall, args: &[u64; 6], path: &Path) -> SysResult<bool> {
@@ -1118,8 +1121,8 @@ fn empty_path_uses_fd(kind: MutationSyscall, args: &[u64; 6], path: &Path) -> Sy
         return Ok(false);
     }
     let flags = match kind {
-        MutationSyscall::Fchmodat2 => syscall_i32(args[3]),
-        MutationSyscall::Fchownat => syscall_i32(args[4]),
+        MutationSyscall::Fchmodat2 => args[3].to_i32(),
+        MutationSyscall::Fchownat => args[4].to_i32(),
         _ => 0,
     };
     if flags & libc::AT_EMPTY_PATH != 0 {
@@ -1128,25 +1131,5 @@ fn empty_path_uses_fd(kind: MutationSyscall, args: &[u64; 6], path: &Path) -> Sy
         Err(BrokerError::SystemCall {
             errno: libc::ENOENT,
         })
-    }
-}
-
-fn mkdir_target_exists(path: &Path) -> bool {
-    let Ok(anchor) = Anchor::new(&normalize_path_nofollow(path)) else {
-        return false;
-    };
-    let flags = if path.as_os_str().as_bytes().ends_with(b"/") {
-        0
-    } else {
-        libc::AT_SYMLINK_NOFOLLOW
-    };
-    let mut stat = unsafe { mem::zeroed::<libc::stat>() };
-    unsafe {
-        libc::fstatat(
-            anchor.dir.as_raw_fd(),
-            anchor.name.as_ptr(),
-            std::ptr::addr_of_mut!(stat),
-            flags,
-        ) == 0
     }
 }

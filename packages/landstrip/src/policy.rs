@@ -289,7 +289,6 @@ impl Settings {
         let filesystem = &self.filesystem;
         let network = &self.network;
         let windows = &self.windows;
-
         #[cfg(target_os = "windows")]
         if !filesystem.deny_read_always.is_empty() {
             return Err(Error::PolicyDenyReadAlwaysUnsupported.into());

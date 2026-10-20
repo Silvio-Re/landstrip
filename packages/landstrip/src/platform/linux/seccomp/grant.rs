@@ -1,24 +1,23 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use super::error::BrokerError;
+use super::error::{BrokerError, SysResult};
 use super::network::{SocketAddrCall, TargetSocket};
 use super::notify::{NotificationChannel, NotificationResponse};
-use super::process::TargetProcess;
+use super::process::{ResolvedPath, label_under_root};
 use crate::error::Error as LandstripError;
 use crate::paths::PathCoverage;
 use crate::policy::AccessPolicy;
 use nix::errno::Errno;
-use std::ffi::{CString, OsStr};
+use nix::sys::stat::fstat;
+use std::ffi::{CStr, CString};
 use std::fs;
-use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
 pub(super) const OPEN_HOW_SIZE: usize = 24;
-pub(super) const RESOLVE_IN_ROOT: u64 = 0x10;
 const SYS_FCHMODAT2: i64 = 452;
 
 #[repr(C)]
@@ -30,11 +29,7 @@ pub(super) struct OpenHow {
 }
 
 impl OpenHow {
-    pub(super) fn openat2(
-        &self,
-        dirfd: RawFd,
-        path: &CString,
-    ) -> std::result::Result<OwnedFd, i32> {
+    pub(super) fn openat2(&self, dirfd: RawFd, path: &CStr) -> SysResult<OwnedFd> {
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_openat2,
@@ -44,18 +39,16 @@ impl OpenHow {
                 OPEN_HOW_SIZE,
             )
         };
-        if rc < 0 {
-            return Err(Errno::last() as i32);
-        }
-        RawFd::try_from(rc)
-            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-            .map_err(|_| libc::EMFILE)
+        let fd = Errno::result(rc)?;
+        let fd = RawFd::try_from(fd).map_err(|_| BrokerError::syscall(libc::EMFILE))?;
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }
 
 pub(super) enum Grant {
     Open(OpenGrant),
-    Mutation(MutationGrant),
+    // Preparation failures still await the policy decision before being returned.
+    Mutation(SysResult<MutationGrant>),
     Socket(SocketGrant),
 }
 
@@ -63,7 +56,10 @@ impl Grant {
     pub(super) fn apply(&self, policy: &AccessPolicy, notify: NotificationChannel<'_>, id: u64) {
         match self {
             Self::Open(grant) => grant.apply(policy, notify, id),
-            Self::Mutation(grant) => grant.apply(notify, id),
+            Self::Mutation(Ok(grant)) => grant.apply(notify, id),
+            Self::Mutation(Err(error)) => {
+                let _ = notify.respond(NotificationResponse::error(id, error.errno()));
+            }
             Self::Socket(grant) => grant.apply(notify, id),
         }
     }
@@ -73,6 +69,7 @@ pub(super) struct SocketGrant {
     pub(super) sock: OwnedFd,
     pub(super) addr: Vec<u8>,
     pub(super) call: SocketAddrCall,
+    pub(super) _path: Option<Anchor>,
 }
 
 impl SocketGrant {
@@ -81,6 +78,7 @@ impl SocketGrant {
             sock: socket.sock,
             addr: socket.addr,
             call,
+            _path: None,
         }
     }
 
@@ -105,183 +103,91 @@ fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> Result<i6
 pub(super) struct Anchor {
     pub(super) dir: OwnedFd,
     pub(super) name: CString,
+    pub(super) target: Option<OwnedFd>,
 }
 
 impl Anchor {
-    pub(super) fn new(resolved: &Path) -> std::result::Result<Self, i32> {
-        let parent = resolved.parent().ok_or(libc::EINVAL)?;
-        let name = CString::new(resolved.file_name().ok_or(libc::EINVAL)?.as_bytes())
-            .map_err(|_| libc::EINVAL)?;
-        Ok(Self {
-            dir: open_path(parent, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)?,
-            name,
-        })
+    pub(super) fn into_target(self) -> SysResult<OwnedFd> {
+        let fd = self
+            .target
+            .ok_or_else(|| BrokerError::syscall(libc::ENOENT))?;
+        validate_nofollow_target(fd.as_fd(), libc::O_NOFOLLOW)?;
+        Ok(fd)
     }
 
-    pub(super) fn pin(&self) -> std::result::Result<(OwnedFd, CString), i32> {
-        let fd = unsafe {
-            libc::openat(
-                self.dir.as_raw_fd(),
-                self.name.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(Errno::last() as i32);
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let path =
-            CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(|_| libc::EINVAL)?;
-        Ok((fd, path))
-    }
-
-    pub(super) fn path(&self) -> std::result::Result<CString, i32> {
+    pub(super) fn path(&self) -> SysResult<CString> {
         let mut path = format!("/proc/self/fd/{}/", self.dir.as_raw_fd()).into_bytes();
         path.extend_from_slice(self.name.as_bytes());
-        CString::new(path).map_err(|_| libc::EINVAL)
+        Ok(CString::new(path)?)
     }
 }
 
 pub(super) struct OpenGrant {
     pub(super) flags: i32,
     pub(super) kind: OpenKind,
+    label: PathBuf,
+    root: OwnedFd,
 }
 
 impl OpenGrant {
-    pub(super) fn new(resolved: &Path, flags: i32, mode: u32) -> std::result::Result<Self, i32> {
-        let kind = match open_path(resolved, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) {
-            Ok(handle) => {
-                if flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
-                    return Err(libc::EEXIST);
-                }
-                validate_nofollow_target(handle.as_fd(), flags)?;
-                OpenKind::Reopen(handle)
-            }
-            Err(libc::ENOENT) if resolved.as_os_str().as_bytes().ends_with(b"/") => {
-                return Err(if flags & libc::O_CREAT != 0 {
-                    libc::EISDIR
-                } else {
-                    libc::ENOENT
-                });
-            }
-            Err(libc::ENOENT) => OpenKind::Create {
-                anchor: Anchor::new(resolved)?,
-                mode,
-                resolve: 0,
-            },
-            Err(errno) => return Err(errno),
-        };
-        Ok(Self { flags, kind })
-    }
-
-    pub(super) fn new_openat2(
-        target: &TargetProcess,
-        dirfd: RawFd,
-        path: &Path,
+    pub(super) fn new(
+        mut resolved: ResolvedPath,
         flags: i32,
         mode: u32,
         resolve: u64,
-    ) -> std::result::Result<(PathBuf, PathBuf, Self), i32> {
-        let base = if path.is_absolute() && resolve & RESOLVE_IN_ROOT == 0 {
-            None
-        } else {
-            Some(target.open_dirfd(dirfd)?)
-        };
-        let base_fd = base.as_ref().map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
-        let raw = match &base {
-            Some(base) => {
-                let base = open_fd_path(base.as_fd())?;
-                if path.is_absolute() {
-                    base.join(path.strip_prefix("/").map_err(|_| libc::EINVAL)?)
-                } else {
-                    base.join(path)
-                }
+    ) -> SysResult<Self> {
+        if flags & libc::O_TMPFILE == libc::O_TMPFILE {
+            return Err(BrokerError::syscall(libc::EOPNOTSUPP));
+        }
+        let mut anchor = resolved.anchor.take().ok_or_else(|| {
+            if resolved.raw.as_os_str().as_bytes().ends_with(b"/") && flags & libc::O_CREAT != 0 {
+                BrokerError::syscall(libc::EISDIR)
+            } else {
+                BrokerError::syscall(libc::ENOENT)
             }
-            None => path.to_path_buf(),
-        };
-        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
-        let no_follow = flags & (libc::O_NOFOLLOW | libc::O_EXCL) != 0;
-        let pin_flags = libc::O_PATH
-            | libc::O_CLOEXEC
-            | (flags & libc::O_DIRECTORY)
-            | if no_follow { libc::O_NOFOLLOW } else { 0 };
-        let pin_how = OpenHow {
-            flags: u64::try_from(pin_flags).map_err(|_| libc::EINVAL)?,
-            mode: 0,
-            resolve,
-        };
-
-        match pin_how.openat2(base_fd, &c_path) {
-            Ok(handle) => {
+        })?;
+        let kind = match anchor.target.take() {
+            Some(handle) => {
                 if flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
-                    return Err(libc::EEXIST);
+                    return Err(BrokerError::syscall(libc::EEXIST));
                 }
                 validate_nofollow_target(handle.as_fd(), flags)?;
-                let resolved = open_fd_path(handle.as_fd())?;
-                Ok((
-                    raw,
-                    resolved,
-                    Self {
-                        flags,
-                        kind: OpenKind::Reopen(handle),
-                    },
-                ))
-            }
-            Err(libc::ENOENT) if flags & libc::O_CREAT != 0 => {
-                let source = Path::new(OsStr::from_bytes(c_path.to_bytes()));
-                if source.as_os_str().as_bytes().ends_with(b"/") {
-                    return Err(libc::ENOENT);
+                if flags & libc::O_DIRECTORY != 0 {
+                    let stat = fstat(&handle)?;
+                    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                        return Err(BrokerError::syscall(libc::ENOTDIR));
+                    }
                 }
-                let parent = source.parent().ok_or(libc::ENOENT)?;
-                let parent = if parent.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    parent
-                };
-                let name = CString::new(source.file_name().ok_or(libc::ENOENT)?.as_bytes())
-                    .map_err(|_| libc::EINVAL)?;
-                let parent =
-                    CString::new(parent.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
-                let parent_how = OpenHow {
-                    flags: u64::try_from(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
-                        .map_err(|_| libc::EINVAL)?,
-                    mode: 0,
-                    resolve,
-                };
-                let parent_handle = parent_how.openat2(base_fd, &parent)?;
-                let resolved =
-                    open_fd_path(parent_handle.as_fd())?.join(OsStr::from_bytes(name.to_bytes()));
-                Ok((
-                    raw,
-                    resolved,
-                    Self {
-                        flags,
-                        kind: OpenKind::Create {
-                            anchor: Anchor {
-                                dir: parent_handle,
-                                name,
-                            },
-                            mode,
-                            resolve,
-                        },
-                    },
-                ))
+                OpenKind::Reopen(handle)
             }
-            Err(errno) => Err(errno),
-        }
+            None if flags & libc::O_CREAT != 0 => OpenKind::Create {
+                anchor,
+                mode,
+                resolve,
+            },
+            None => return Err(BrokerError::syscall(libc::ENOENT)),
+        };
+        Ok(Self {
+            flags,
+            kind,
+            label: resolved.label,
+            root: resolved.root,
+        })
     }
 
-    pub(super) fn open(&self) -> std::result::Result<OwnedFd, i32> {
+    pub(super) fn open(&self) -> SysResult<OwnedFd> {
         match &self.kind {
             OpenKind::Reopen(handle) => {
-                let proc_path = CString::new(format!("/proc/self/fd/{}", handle.as_raw_fd()))
-                    .map_err(|_| libc::EINVAL)?;
-                let flags = (self.flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW))
+                if self.flags & libc::O_PATH != 0 {
+                    return handle.try_clone().map_err(BrokerError::from);
+                }
+                let proc_path = CString::new(format!("/proc/self/fd/{}", handle.as_raw_fd()))?;
+                let flags = (self.flags
+                    & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_TRUNC))
                     | libc::O_CLOEXEC;
                 let fd = unsafe { libc::open(proc_path.as_ptr(), flags) };
-                if fd < 0 {
-                    return Err(Errno::last() as i32);
-                }
+                let fd = Errno::result(fd)?;
+                let fd = RawFd::try_from(fd).map_err(|_| BrokerError::syscall(libc::EMFILE))?;
                 Ok(unsafe { OwnedFd::from_raw_fd(fd) })
             }
             OpenKind::Create {
@@ -289,10 +195,10 @@ impl OpenGrant {
                 mode,
                 resolve,
             } => {
-                let flags = self.flags | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+                let flags = (self.flags & !libc::O_TRUNC) | libc::O_NOFOLLOW | libc::O_CLOEXEC;
                 if *resolve != 0 {
                     let how = OpenHow {
-                        flags: u64::try_from(flags).map_err(|_| libc::EINVAL)?,
+                        flags: u64::try_from(flags)?,
                         mode: u64::from(*mode),
                         resolve: *resolve,
                     };
@@ -306,34 +212,73 @@ impl OpenGrant {
                         *mode as libc::c_uint,
                     )
                 };
-                if fd < 0 {
-                    return Err(Errno::last() as i32);
-                }
+                let fd = Errno::result(fd)?;
+                let fd = RawFd::try_from(fd).map_err(|_| BrokerError::syscall(libc::EMFILE))?;
                 Ok(unsafe { OwnedFd::from_raw_fd(fd) })
             }
         }
     }
 
+    fn check_policy(&self, policy: &AccessPolicy, fd: BorrowedFd<'_>) -> SysResult<()> {
+        let root = open_fd_path(self.root.as_fd())?;
+        self.check_label(policy, &label_under_root(&root, fd)?)
+    }
+
+    fn check_label(&self, policy: &AccessPolicy, label: &Path) -> SysResult<()> {
+        let moved = label != self.label;
+        if self.flags & libc::O_WRONLY == 0
+            && (label.is_under_any(&policy.read_denied_always_roots)
+                || (moved && policy.read_reason(label).is_some()))
+        {
+            return Err(BrokerError::syscall(libc::EACCES));
+        }
+        if self.flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0
+            && (label.is_under_any(&policy.write_denied_always_roots)
+                || (moved && policy.write_reason(label, label, true).is_some()))
+        {
+            return Err(BrokerError::syscall(libc::EACCES));
+        }
+        Ok(())
+    }
+
     pub(super) fn apply(&self, policy: &AccessPolicy, notify: NotificationChannel<'_>, id: u64) {
-        let opened = self.open().and_then(|fd| {
-            if self.flags & libc::O_WRONLY == 0
-                && !policy.read_denied_always_roots.is_empty()
-                && open_fd_path(fd.as_fd())?.is_under_any(&policy.read_denied_always_roots)
-            {
-                return Err(libc::EACCES);
+        let opened: SysResult<OwnedFd> = (|| {
+            // Approval does not authorize a later rename into a denied subtree.
+            // Recheck before opening and after opening, before any truncation.
+            match &self.kind {
+                OpenKind::Reopen(handle) => self.check_policy(policy, handle.as_fd())?,
+                OpenKind::Create { anchor, .. } => {
+                    let root = open_fd_path(self.root.as_fd())?;
+                    let label = label_under_root(&root, anchor.dir.as_fd())?
+                        .join(std::ffi::OsStr::from_bytes(anchor.name.as_bytes()));
+                    self.check_label(policy, &label)?;
+                }
             }
-            if self.flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0
-                && !policy.write_denied_always_roots.is_empty()
-                && open_fd_path(fd.as_fd())?.is_under_any(&policy.write_denied_always_roots)
-            {
-                return Err(libc::EACCES);
+            let fd = self.open()?;
+            self.check_policy(policy, fd.as_fd())?;
+            if self.flags & libc::O_TRUNC != 0 {
+                let stat = fstat(&fd)?;
+                if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+                    if self.flags & libc::O_ACCMODE == libc::O_RDONLY {
+                        // Linux also permits O_RDONLY|O_TRUNC; do not give the
+                        // target a writable descriptor just to truncate it.
+                        let path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+                        let writable = open_path(&path, libc::O_WRONLY | libc::O_CLOEXEC)?;
+                        self.check_policy(policy, writable.as_fd())?;
+                        let rc = unsafe { libc::ftruncate(writable.as_raw_fd(), 0) };
+                        Errno::result(rc)?;
+                    } else {
+                        let rc = unsafe { libc::ftruncate(fd.as_raw_fd(), 0) };
+                        Errno::result(rc)?;
+                    }
+                }
             }
             Ok(fd)
-        });
+        })();
         let opened = match opened {
             Ok(fd) => fd,
-            Err(errno) => {
-                let _ = notify.respond(NotificationResponse::error(id, -errno.abs()));
+            Err(err) => {
+                let _ = notify.respond(NotificationResponse::error(id, -err.errno().abs()));
                 return;
             }
         };
@@ -369,130 +314,169 @@ pub(super) enum OpenKind {
     },
 }
 
-pub(super) struct MutationGrant {
-    pub(super) op: MutationOp,
-    pub(super) anchors: Vec<Anchor>,
-    pub(super) no_follow: bool,
+pub(super) enum MutationGrant {
+    Mkdir {
+        at: Anchor,
+        mode: u32,
+    },
+    Mknod {
+        at: Anchor,
+        mode: u32,
+        dev: u64,
+    },
+    Unlink {
+        at: Anchor,
+        flags: i32,
+    },
+    Symlink {
+        at: Anchor,
+        target: CString,
+    },
+    Truncate {
+        target: OwnedFd,
+        length: i64,
+    },
+    Rename {
+        from: Anchor,
+        to: Anchor,
+        flags: u32,
+    },
+    Link {
+        from: MutationTarget,
+        to: Anchor,
+        flags: i32,
+    },
+    Chmod {
+        target: OwnedFd,
+        mode: u32,
+    },
+    Metadata {
+        target: MutationTarget,
+        mutation: PathMutation,
+    },
+    Fd {
+        target: OwnedFd,
+        mutation: FdMutation,
+    },
 }
 
 impl MutationGrant {
-    pub(super) fn run(&self) -> std::result::Result<(), i32> {
-        if let MutationOp::Fd { target, mutation } = &self.op {
-            return mutation.run(target.as_raw_fd());
-        }
-
-        let at = self.anchors.first().ok_or(libc::EINVAL)?;
-        let dir = at.dir.as_raw_fd();
-        let name = at.name.as_ptr();
-        let rc = match &self.op {
-            MutationOp::Mkdir { mode } => unsafe { libc::mkdirat(dir, name, *mode) },
-            MutationOp::Mknod { mode, dev } => unsafe { libc::mknodat(dir, name, *mode, *dev) },
-            MutationOp::Unlink { flags } => unsafe { libc::unlinkat(dir, name, *flags) },
-            MutationOp::Symlink { target } => unsafe {
-                libc::symlinkat(target.as_ptr(), dir, name)
-            },
-            MutationOp::Truncate { length } => {
-                let (_target, path) = at.pin()?;
-                let writable =
-                    unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-                if writable < 0 {
-                    return Err(Errno::last() as i32);
-                }
-                let writable = unsafe { OwnedFd::from_raw_fd(writable) };
-                return check(unsafe { libc::ftruncate(writable.as_raw_fd(), *length) });
+    pub(super) fn run(&self) -> SysResult<()> {
+        match self {
+            Self::Mkdir { at, mode } => {
+                Errno::result(unsafe {
+                    libc::mkdirat(at.dir.as_raw_fd(), at.name.as_ptr(), *mode)
+                })?;
             }
-            MutationOp::Rename { flags } => {
-                let to = self.anchors.get(1).ok_or(libc::EINVAL)?;
-                let rc = unsafe {
+            Self::Mknod { at, mode, dev } => {
+                Errno::result(unsafe {
+                    libc::mknodat(at.dir.as_raw_fd(), at.name.as_ptr(), *mode, *dev)
+                })?;
+            }
+            Self::Unlink { at, flags } => {
+                Errno::result(unsafe {
+                    libc::unlinkat(at.dir.as_raw_fd(), at.name.as_ptr(), *flags)
+                })?;
+            }
+            Self::Symlink { at, target } => {
+                Errno::result(unsafe {
+                    libc::symlinkat(target.as_ptr(), at.dir.as_raw_fd(), at.name.as_ptr())
+                })?;
+            }
+            Self::Truncate { target, length } => {
+                let path = PathBuf::from(format!("/proc/self/fd/{}", target.as_raw_fd()));
+                let writable = open_path(&path, libc::O_WRONLY | libc::O_CLOEXEC)?;
+                Errno::result(unsafe { libc::ftruncate(writable.as_raw_fd(), *length) })?;
+            }
+            Self::Rename { from, to, flags } => {
+                Errno::result(unsafe {
                     libc::syscall(
                         libc::SYS_renameat2,
-                        dir,
-                        name,
+                        from.dir.as_raw_fd(),
+                        from.name.as_ptr(),
                         to.dir.as_raw_fd(),
                         to.name.as_ptr(),
                         *flags,
                     )
+                })?;
+            }
+            Self::Link { from, to, flags } => {
+                let rc = match from {
+                    MutationTarget::Entry(at) => unsafe {
+                        libc::linkat(
+                            at.dir.as_raw_fd(),
+                            at.name.as_ptr(),
+                            to.dir.as_raw_fd(),
+                            to.name.as_ptr(),
+                            flags & !libc::AT_SYMLINK_FOLLOW,
+                        )
+                    },
+                    MutationTarget::Pinned(_) => {
+                        let path = from.path()?;
+                        unsafe {
+                            libc::linkat(
+                                libc::AT_FDCWD,
+                                path.as_ptr(),
+                                to.dir.as_raw_fd(),
+                                to.name.as_ptr(),
+                                libc::AT_SYMLINK_FOLLOW,
+                            )
+                        }
+                    }
                 };
-                return if rc < 0 {
-                    Err(Errno::last() as i32)
-                } else {
-                    Ok(())
-                };
+                Errno::result(rc)?;
             }
-            MutationOp::Link { flags } => {
-                let to = self.anchors.get(1).ok_or(libc::EINVAL)?;
-                unsafe { libc::linkat(dir, name, to.dir.as_raw_fd(), to.name.as_ptr(), *flags) }
+            Self::Chmod { target, mode } => {
+                let path = CString::new(format!("/proc/self/fd/{}", target.as_raw_fd()))?;
+                Errno::result(unsafe { libc::chmod(path.as_ptr(), *mode) })?;
             }
-            MutationOp::Chmod { mode } => {
-                let (_fd, path) = at.pin()?;
-                unsafe { libc::chmod(path.as_ptr(), *mode) }
-            }
-            MutationOp::ChmodAt { mode, flags } => run_fchmodat(self, at, *mode, *flags)?,
-            MutationOp::Chown { uid, gid } => {
-                if self.no_follow {
-                    unsafe { libc::fchownat(dir, name, *uid, *gid, libc::AT_SYMLINK_NOFOLLOW) }
-                } else {
-                    let (_fd, path) = at.pin()?;
-                    unsafe { libc::chown(path.as_ptr(), *uid, *gid) }
-                }
-            }
-            MutationOp::ChownAt { uid, gid, flags } => run_fchownat(self, at, *uid, *gid, *flags)?,
-            MutationOp::Utimes { times, flags } => {
-                let ptr = times.as_ref().map_or(ptr::null(), |t| t.as_ptr());
-                if self.no_follow {
-                    unsafe { libc::utimensat(dir, name, ptr, *flags) }
-                } else {
-                    let (_fd, path) = at.pin()?;
-                    unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), ptr, *flags) }
-                }
-            }
-            MutationOp::Fd { .. } => return Err(libc::EINVAL),
-            MutationOp::SetXattr { name, value, flags } => {
-                run_setxattr(self, at, name, value, *flags)?
-            }
-            MutationOp::RemoveXattr { name } => run_removexattr(self, at, name)?,
-        };
-        check(rc)
+            Self::Metadata { target, mutation } => mutation.run(target)?,
+            Self::Fd { target, mutation } => mutation.run(target.as_raw_fd())?,
+        }
+        Ok(())
     }
 
     pub(super) fn apply(&self, notify: NotificationChannel<'_>, id: u64) {
         let rc = match self.run() {
             Ok(()) => NotificationResponse::success(id, 0),
-            Err(errno) => NotificationResponse::error(id, -errno.abs()),
+            Err(err) => NotificationResponse::error(id, -err.errno().abs()),
         };
         let _ = notify.respond(rc);
     }
 }
 
-pub(super) enum MutationOp {
-    Mkdir {
-        mode: u32,
-    },
-    Mknod {
-        mode: u32,
-        dev: u64,
-    },
-    Unlink {
-        flags: i32,
-    },
-    Symlink {
-        target: CString,
-    },
-    Truncate {
-        length: i64,
-    },
-    Rename {
-        flags: u32,
-    },
-    Link {
-        flags: i32,
-    },
-    Chmod {
-        mode: u32,
-    },
+pub(super) enum MutationTarget {
+    Entry(Anchor),
+    Pinned(OwnedFd),
+}
+
+impl MutationTarget {
+    pub(super) fn new(anchor: Anchor, no_follow: bool) -> SysResult<Self> {
+        if no_follow {
+            Ok(Self::Entry(anchor))
+        } else {
+            anchor.into_target().map(Self::Pinned)
+        }
+    }
+
+    fn path(&self) -> SysResult<CString> {
+        match self {
+            Self::Entry(at) => at.path(),
+            Self::Pinned(fd) => Ok(CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))?),
+        }
+    }
+
+    fn at_path(&self) -> (BorrowedFd<'_>, &CStr, i32) {
+        match self {
+            Self::Entry(at) => (at.dir.as_fd(), &at.name, libc::AT_SYMLINK_NOFOLLOW),
+            Self::Pinned(fd) => (fd.as_fd(), c"", libc::AT_EMPTY_PATH),
+        }
+    }
+}
+
+pub(super) enum PathMutation {
     ChmodAt {
         mode: u32,
-        flags: i32,
     },
     Chown {
         uid: u32,
@@ -501,15 +485,9 @@ pub(super) enum MutationOp {
     ChownAt {
         uid: u32,
         gid: u32,
-        flags: i32,
     },
     Utimes {
         times: Option<[libc::timespec; 2]>,
-        flags: i32,
-    },
-    Fd {
-        target: OwnedFd,
-        mutation: FdMutation,
     },
     SetXattr {
         name: CString,
@@ -519,6 +497,92 @@ pub(super) enum MutationOp {
     RemoveXattr {
         name: CString,
     },
+}
+
+impl PathMutation {
+    fn run(&self, target: &MutationTarget) -> SysResult<()> {
+        match self {
+            Self::ChmodAt { mode } => {
+                let (dir, name, target_flags) = target.at_path();
+                Errno::result(unsafe {
+                    libc::syscall(
+                        SYS_FCHMODAT2,
+                        dir.as_raw_fd(),
+                        name.as_ptr(),
+                        *mode,
+                        target_flags,
+                    )
+                })?;
+            }
+            Self::Chown { uid, gid } => {
+                let rc = match target {
+                    MutationTarget::Entry(at) => unsafe {
+                        libc::fchownat(
+                            at.dir.as_raw_fd(),
+                            at.name.as_ptr(),
+                            *uid,
+                            *gid,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    },
+                    MutationTarget::Pinned(_) => {
+                        let path = target.path()?;
+                        unsafe { libc::chown(path.as_ptr(), *uid, *gid) }
+                    }
+                };
+                Errno::result(rc)?;
+            }
+            Self::ChownAt { uid, gid } => {
+                let (dir, name, target_flags) = target.at_path();
+                Errno::result(unsafe {
+                    libc::fchownat(dir.as_raw_fd(), name.as_ptr(), *uid, *gid, target_flags)
+                })?;
+            }
+            Self::Utimes { times } => {
+                let times = times.as_ref().map_or(ptr::null(), |t| t.as_ptr());
+                let rc = match target {
+                    MutationTarget::Entry(at) => unsafe {
+                        libc::utimensat(
+                            at.dir.as_raw_fd(),
+                            at.name.as_ptr(),
+                            times,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    },
+                    MutationTarget::Pinned(_) => {
+                        let path = target.path()?;
+                        unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times, 0) }
+                    }
+                };
+                Errno::result(rc)?;
+            }
+            Self::SetXattr { name, value, flags } => {
+                let path = target.path()?;
+                let call = match target {
+                    MutationTarget::Entry(_) => libc::lsetxattr,
+                    MutationTarget::Pinned(_) => libc::setxattr,
+                };
+                Errno::result(unsafe {
+                    call(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        *flags,
+                    )
+                })?;
+            }
+            Self::RemoveXattr { name } => {
+                let path = target.path()?;
+                let call = match target {
+                    MutationTarget::Entry(_) => libc::lremovexattr,
+                    MutationTarget::Pinned(_) => libc::removexattr,
+                };
+                Errno::result(unsafe { call(path.as_ptr(), name.as_ptr()) })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(super) enum FdMutation {
@@ -552,7 +616,7 @@ pub(super) enum FdMutation {
 }
 
 impl FdMutation {
-    pub(super) fn run(&self, target: RawFd) -> std::result::Result<(), i32> {
+    pub(super) fn run(&self, target: RawFd) -> SysResult<()> {
         let rc = match self {
             Self::Chmod { mode } => unsafe { libc::fchmod(target, *mode) },
             Self::Chown { uid, gid } => unsafe { libc::fchown(target, *uid, *gid) },
@@ -578,145 +642,31 @@ impl FdMutation {
             },
             Self::RemoveXattr { name } => unsafe { libc::fremovexattr(target, name.as_ptr()) },
         };
-        check(rc)
+        Errno::result(rc)?;
+        Ok(())
     }
 }
 
-pub(super) fn open_path(path: &Path, flags: i32) -> std::result::Result<OwnedFd, i32> {
-    let cpath = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+pub(super) fn open_path(path: &Path, flags: i32) -> SysResult<OwnedFd> {
+    let cpath = CString::new(path.as_os_str().as_bytes())?;
     let fd = unsafe { libc::open(cpath.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(Errno::last() as i32);
-    }
+    let fd = Errno::result(fd)?;
+    let fd = RawFd::try_from(fd).map_err(|_| BrokerError::syscall(libc::EMFILE))?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-pub(super) fn open_fd_path(fd: BorrowedFd<'_>) -> std::result::Result<PathBuf, i32> {
+pub(super) fn open_fd_path(fd: BorrowedFd<'_>) -> SysResult<PathBuf> {
     fs::read_link(Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string()))
-        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+        .map_err(BrokerError::from)
 }
 
-pub(super) fn validate_nofollow_target(
-    handle: BorrowedFd<'_>,
-    flags: i32,
-) -> std::result::Result<(), i32> {
+pub(super) fn validate_nofollow_target(handle: BorrowedFd<'_>, flags: i32) -> SysResult<()> {
     if flags & libc::O_NOFOLLOW == 0 || flags & libc::O_PATH != 0 {
         return Ok(());
     }
-    let mut stat = unsafe { mem::zeroed::<libc::stat>() };
-    let rc = unsafe { libc::fstat(handle.as_raw_fd(), ptr::addr_of_mut!(stat)) };
-    if rc < 0 {
-        return Err(Errno::last() as i32);
-    }
+    let stat = fstat(handle)?;
     if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
-        return Err(libc::ELOOP);
+        return Err(BrokerError::syscall(libc::ELOOP));
     }
     Ok(())
-}
-
-fn run_fchmodat(
-    grant: &MutationGrant,
-    at: &Anchor,
-    mode: u32,
-    flags: i32,
-) -> std::result::Result<i32, i32> {
-    let dir = at.dir.as_raw_fd();
-    let name = at.name.as_ptr();
-    let (target, target_name, target_flags) = if grant.no_follow {
-        (None, name, flags)
-    } else {
-        let (target, _) = at.pin()?;
-        (Some(target), c"".as_ptr(), flags | libc::AT_EMPTY_PATH)
-    };
-    let target_fd = target.as_ref().map_or(dir, AsRawFd::as_raw_fd);
-    let rc = unsafe { libc::syscall(SYS_FCHMODAT2, target_fd, target_name, mode, target_flags) };
-    Ok(if rc < 0 { -1 } else { 0 })
-}
-
-fn run_fchownat(
-    grant: &MutationGrant,
-    at: &Anchor,
-    uid: u32,
-    gid: u32,
-    flags: i32,
-) -> std::result::Result<i32, i32> {
-    if grant.no_follow {
-        return Ok(unsafe {
-            libc::fchownat(at.dir.as_raw_fd(), at.name.as_ptr(), uid, gid, flags)
-        });
-    }
-    let (target, _) = at.pin()?;
-    Ok(unsafe {
-        libc::fchownat(
-            target.as_raw_fd(),
-            c"".as_ptr(),
-            uid,
-            gid,
-            flags | libc::AT_EMPTY_PATH,
-        )
-    })
-}
-
-fn mutation_xattr_path(
-    grant: &MutationGrant,
-    at: &Anchor,
-) -> std::result::Result<(Option<OwnedFd>, CString), i32> {
-    if grant.no_follow {
-        Ok((None, at.path()?))
-    } else {
-        let (target, path) = at.pin()?;
-        Ok((Some(target), path))
-    }
-}
-
-fn run_setxattr(
-    grant: &MutationGrant,
-    at: &Anchor,
-    name: &CString,
-    value: &[u8],
-    flags: i32,
-) -> std::result::Result<i32, i32> {
-    let (_target, path) = mutation_xattr_path(grant, at)?;
-    Ok(unsafe {
-        if grant.no_follow {
-            libc::lsetxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                value.as_ptr().cast(),
-                value.len(),
-                flags,
-            )
-        } else {
-            libc::setxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                value.as_ptr().cast(),
-                value.len(),
-                flags,
-            )
-        }
-    })
-}
-
-fn run_removexattr(
-    grant: &MutationGrant,
-    at: &Anchor,
-    name: &CString,
-) -> std::result::Result<i32, i32> {
-    let (_target, path) = mutation_xattr_path(grant, at)?;
-    Ok(unsafe {
-        if grant.no_follow {
-            libc::lremovexattr(path.as_ptr(), name.as_ptr())
-        } else {
-            libc::removexattr(path.as_ptr(), name.as_ptr())
-        }
-    })
-}
-
-fn check(rc: libc::c_int) -> std::result::Result<(), i32> {
-    if rc < 0 {
-        Err(Errno::last() as i32)
-    } else {
-        Ok(())
-    }
 }

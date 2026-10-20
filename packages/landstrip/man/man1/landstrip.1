@@ -24,16 +24,16 @@
 .Nm
 sandboxes programs using JSON or YAML policies in a supported subset of the
 Anthropic Sandbox Runtime format.
-When no subcommand is given,
-.Nm
-runs
-.Ar program
-under the merged policy.
+Execute commands under the merged policy with the
+.Cm run
+subcommand.
 Use
 .Nm Ar command Fl -help
 for command help.
 .Sh COMMANDS
 .Bl -tag -width "windows prepare-appcontainer"
+.It Cm run
+Execute a sandboxed program under the merged policy.
 .It Cm check
 Check parsing, paths, executable policy, and platform support.
 .It Cm resolve
@@ -176,6 +176,22 @@ Windows supports neither local binding nor Unix socket policy.
 .Va allowNetwork
 permits general access, including remote UDP, without relaxing filesystem or
 escape-prevention rules.
+.Ss Linux process isolation
+Commands always run in new user, PID, and mount namespaces with a private
+procfs that hides host processes.
+Execution fails if namespaces or procfs mounting are unavailable; it never
+falls back to the host process table.
+.Pp
+The tool runs under a native PID-1 reaper that forwards termination signals
+and removes remaining descendants, including double-forked processes.
+Landlock and seccomp remain responsible for filesystem and network enforcement.
+No network namespace is created; existing proxy access is unchanged.
+Inherited descriptors remain explicit grants and can expose host resources.
+.Pp
+.Cm capabilities
+and
+.Cm doctor
+report namespace availability as part of sandbox health, with the failure reason.
 .Ss Windows
 Requires explicit read grants and rejects nonempty
 .Va denyReadAlways

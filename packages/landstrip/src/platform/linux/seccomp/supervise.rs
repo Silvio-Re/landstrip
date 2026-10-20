@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
+use super::super::signals::ForwardSignals;
 use super::error::{BrokerError, SysResult};
 use super::fs::{MUTATION_SYSCALLS, handle_mutation, handle_openat, legacy_syscall};
 use super::grant::{Grant, MutationGrant, OpenGrant, SocketGrant};
@@ -293,133 +294,146 @@ struct ControlResponse {
     action: ControlAction,
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "query delivery failure handling must update supervisor state atomically"
-)]
-pub(super) fn supervise_child(
-    policy: &AccessPolicy,
-    child: Pid,
-    notify_fd: BorrowedFd<'_>,
-    syscalls: &NotificationSyscalls,
-    notify_filesystem: bool,
-    trap_fd: Option<&TrapFd>,
-) -> Result<i32> {
-    let notify = NotificationChannel::new(notify_fd);
-    let mut denials = Denials::new(trap_fd);
-    let mut trap_fd = trap_fd
-        .filter(|trap_fd| trap_fd.is_stream_socket())
-        .map(AsFd::as_fd);
-    let query_enabled = trap_fd.is_some();
-    let mount_namespace =
-        NamespaceId::try_from(Path::new("/proc/self/ns/mnt")).map_err(LandstripError::supervise)?;
-    let mut ctx = NotificationContext {
-        policy,
-        syscalls,
-        notify_filesystem,
-        query_enabled,
-        mount_namespace,
-    };
-    let mut pending_queries: HashMap<u64, PendingQuery> = HashMap::new();
-    let mut control_buffer: Vec<u8> = Vec::new();
-    let mut next_query_id: u64 = 1;
+pub(super) struct Supervisor<'a> {
+    pub(super) policy: &'a AccessPolicy,
+    pub(super) child: Pid,
+    pub(super) notify_fd: BorrowedFd<'a>,
+    pub(super) syscalls: &'a NotificationSyscalls,
+    pub(super) notify_filesystem: bool,
+    pub(super) trap_fd: Option<&'a TrapFd>,
+    pub(super) mount_namespace: NamespaceId,
+    pub(super) signals: Option<&'a mut ForwardSignals>,
+}
 
-    loop {
+impl Supervisor<'_> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "query delivery failure handling must update supervisor state atomically"
+    )]
+    pub(super) fn run(mut self) -> Result<i32> {
+        let notify = NotificationChannel::new(self.notify_fd);
+        let mut denials = Denials::new(self.trap_fd);
+        let mut trap_fd = self
+            .trap_fd
+            .filter(|trap_fd| trap_fd.is_stream_socket())
+            .map(AsFd::as_fd);
+        let query_enabled = trap_fd.is_some();
+        let mut ctx = NotificationContext {
+            policy: self.policy,
+            syscalls: self.syscalls,
+            notify_filesystem: self.notify_filesystem,
+            query_enabled,
+            mount_namespace: self.mount_namespace,
+        };
+        let mut pending_queries: HashMap<u64, PendingQuery> = HashMap::new();
+        let mut control_buffer: Vec<u8> = Vec::new();
+        let mut next_query_id: u64 = 1;
+
         loop {
-            match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::StillAlive) => break,
-                Ok(status) => return Ok(denials.emit(status)),
-                Err(Errno::EINTR) => {}
-                Err(error) => return Err(LandstripError::from(error).into()),
-            }
-        }
-
-        let revents = poll_broker_fds(notify_fd, trap_fd)?;
-        if revents.iter().all(PollFlags::is_empty) {
-            continue;
-        }
-
-        if revents[0].intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
             loop {
-                match waitpid(child, None) {
+                match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive) => break,
                     Ok(status) => return Ok(denials.emit(status)),
                     Err(Errno::EINTR) => {}
                     Err(error) => return Err(LandstripError::from(error).into()),
                 }
             }
-        }
 
-        if let Some(cfd) = trap_fd {
-            let dead = revents[1]
-                .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
-                || (revents[1].intersects(PollFlags::POLLIN)
-                    && process_control_responses(
-                        policy,
-                        cfd,
-                        &mut control_buffer,
-                        &mut pending_queries,
-                        notify,
-                    ));
-            if dead {
-                deny_all_pending(&mut pending_queries, notify);
-                denials.trap_fd = None;
-                trap_fd = None;
-                ctx.query_enabled = false;
+            let signal_fd = self.signals.as_ref().map(|s| s.as_fd());
+            let revents = poll_broker_fds(self.notify_fd, trap_fd, signal_fd)?;
+            if revents.iter().all(PollFlags::is_empty) {
+                continue;
             }
-        }
 
-        if !revents[0].intersects(PollFlags::POLLIN) {
-            continue;
-        }
+            if let Some(ref mut signals) = self.signals
+                && revents[2].intersects(PollFlags::POLLIN)
+            {
+                signals.process_pending()?;
+            }
 
-        let Some((request, handle_result)) =
-            receive_handled_notification(notify, &ctx, &mut denials, &mut next_query_id)?
-        else {
-            continue;
-        };
-        match handle_result {
-            HandleResult::Respond(response) => {
-                if let Err(source) = notify.respond(response) {
-                    loop {
-                        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-                            Ok(WaitStatus::StillAlive) => break,
-                            Ok(status) => return Ok(denials.emit(status)),
-                            Err(Errno::EINTR) => {}
-                            Err(error) => return Err(LandstripError::from(error).into()),
-                        }
+            if revents[0].intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+            {
+                loop {
+                    match waitpid(self.child, None) {
+                        Ok(status) => return Ok(denials.emit(status)),
+                        Err(Errno::EINTR) => {}
+                        Err(error) => return Err(LandstripError::from(error).into()),
                     }
-                    return Err(source);
                 }
             }
-            HandleResult::Pending(decision) => {
-                if let Err(error) = denials.write(&decision.trap) {
-                    log::debug!("trap query write failed: {error}");
+
+            if let Some(cfd) = trap_fd {
+                let dead = revents[1]
+                    .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+                    || (revents[1].intersects(PollFlags::POLLIN)
+                        && process_control_responses(
+                            self.policy,
+                            cfd,
+                            &mut control_buffer,
+                            &mut pending_queries,
+                            notify,
+                        ));
+                if dead {
                     deny_all_pending(&mut pending_queries, notify);
                     denials.trap_fd = None;
                     trap_fd = None;
                     ctx.query_enabled = false;
-                    notify.respond(NotificationResponse::error(
-                        request.id,
-                        -LandstripError::DENIAL_ERRNO,
-                    ))?;
-                } else {
-                    pending_queries.insert(
-                        decision.query_id,
-                        PendingQuery {
-                            request,
-                            grant: decision.grant,
-                        },
-                    );
                 }
             }
-            HandleResult::AddFd(grant) => {
-                grant.apply(policy, notify, request.id);
+
+            if !revents[0].intersects(PollFlags::POLLIN) {
+                continue;
             }
-            HandleResult::RunMutation(grant) => {
-                grant.apply(notify, request.id);
-            }
-            HandleResult::RunSocket(grant) => {
-                grant.apply(notify, request.id);
+
+            let Some((request, handle_result)) =
+                receive_handled_notification(notify, &ctx, &mut denials, &mut next_query_id)?
+            else {
+                continue;
+            };
+            match handle_result {
+                HandleResult::Respond(response) => {
+                    if let Err(source) = notify.respond(response) {
+                        loop {
+                            match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
+                                Ok(WaitStatus::StillAlive) => break,
+                                Ok(status) => return Ok(denials.emit(status)),
+                                Err(Errno::EINTR) => {}
+                                Err(error) => return Err(LandstripError::from(error).into()),
+                            }
+                        }
+                        return Err(source);
+                    }
+                }
+                HandleResult::Pending(decision) => {
+                    if let Err(error) = denials.write(&decision.trap) {
+                        log::debug!("trap query write failed: {error}");
+                        deny_all_pending(&mut pending_queries, notify);
+                        denials.trap_fd = None;
+                        trap_fd = None;
+                        ctx.query_enabled = false;
+                        notify.respond(NotificationResponse::error(
+                            request.id,
+                            -LandstripError::DENIAL_ERRNO,
+                        ))?;
+                    } else {
+                        pending_queries.insert(
+                            decision.query_id,
+                            PendingQuery {
+                                request,
+                                grant: decision.grant,
+                            },
+                        );
+                    }
+                }
+                HandleResult::AddFd(grant) => {
+                    grant.apply(self.policy, notify, request.id);
+                }
+                HandleResult::RunMutation(grant) => {
+                    grant.apply(notify, request.id);
+                }
+                HandleResult::RunSocket(grant) => {
+                    grant.apply(notify, request.id);
+                }
             }
         }
     }
@@ -451,19 +465,28 @@ fn receive_handled_notification(
 fn poll_broker_fds(
     notify: BorrowedFd<'_>,
     control: Option<BorrowedFd<'_>>,
-) -> Result<[PollFlags; 2]> {
-    let len = if control.is_some() { 2 } else { 1 };
+    signals: Option<BorrowedFd<'_>>,
+) -> Result<[PollFlags; 3]> {
+    let mut len = 1;
     let mut poll_fds = [
         PollFd::new(notify, PollFlags::POLLIN),
         PollFd::new(control.unwrap_or(notify), PollFlags::POLLIN),
+        PollFd::new(signals.unwrap_or(notify), PollFlags::POLLIN),
     ];
+    if control.is_some() {
+        len = 2;
+    }
+    if signals.is_some() {
+        len = 3;
+    }
     loop {
         match poll(&mut poll_fds[..len], POLL_MS) {
-            Ok(0) => return Ok([PollFlags::empty(); 2]),
+            Ok(0) => return Ok([PollFlags::empty(); 3]),
             Ok(_) => {
                 return Ok([
                     poll_fds[0].revents().unwrap_or_else(PollFlags::empty),
                     poll_fds[1].revents().unwrap_or_else(PollFlags::empty),
+                    poll_fds[2].revents().unwrap_or_else(PollFlags::empty),
                 ]);
             }
             Err(Errno::EINTR) => {}

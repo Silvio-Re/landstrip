@@ -157,6 +157,43 @@ pub(super) fn build_io_uring_deny(syscalls: &NotificationSyscalls) -> Result<Bpf
     builder.add_unconditional(syscalls.io_uring_setup);
     builder.add_unconditional(syscalls.io_uring_enter);
     builder.add_unconditional(syscalls.io_uring_register);
+    for syscall in [
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_chroot,
+        libc::SYS_move_mount,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_fspick,
+        libc::SYS_open_tree,
+        libc::SYS_mount_setattr,
+    ] {
+        builder.add_unconditional(syscall);
+    }
+    for flag in [
+        libc::CLONE_NEWUSER,
+        libc::CLONE_NEWNS,
+        libc::CLONE_NEWPID,
+        libc::CLONE_NEWNET,
+        libc::CLONE_NEWCGROUP,
+        libc::CLONE_NEWIPC,
+        libc::CLONE_NEWUTS,
+    ] {
+        let flag = u64::try_from(flag).map_err(|_| LandstripError::IntegerTooLarge)?;
+        builder.add_conditional_rule(
+            libc::SYS_clone,
+            vec![seccomp_cond(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(flag),
+                flag,
+            )?],
+        )?;
+    }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         builder.add_unconditional(libc::SYS_utime);
@@ -178,6 +215,10 @@ pub(super) fn load_filters(
     if let Some(io_uring) = io_uring {
         load_program(io_uring, 0)?;
     }
+    let mut builder = FilterBuilder::new();
+    builder.add_unconditional(libc::SYS_clone3);
+    let enosys = u32::try_from(libc::ENOSYS).map_err(|_| LandstripError::IntegerTooLarge)?;
+    load_program(&builder.build(SeccompAction::Errno(enosys))?, 0)?;
     let notify = notify.ok_or_else(|| {
         LandstripError::sandbox_setup(Mechanism::Seccomp, "notify filter missing")
     })?;

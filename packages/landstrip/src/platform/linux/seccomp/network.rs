@@ -6,9 +6,10 @@ use super::grant::{Grant, SocketGrant};
 use super::notify::NotificationResult;
 use super::process::TargetProcess;
 use super::supervise::{Denial, Denials};
-use crate::paths::{PathCoverage, normalize_path_nofollow};
+use crate::paths::PathCoverage;
 use crate::policy::{AccessPolicy, UnixSocketAccess};
 use crate::trap::{NetworkOperation, Trap};
+use nix::sys::stat::fstat;
 use nix::sys::uio::{RemoteIoVec, process_vm_readv};
 use nix::unistd::Pid;
 use std::env;
@@ -17,7 +18,7 @@ use std::fs;
 use std::io::IoSliceMut;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -132,6 +133,7 @@ fn network_query(
         sock: socket.sock,
         addr: socket.addr,
         call,
+        _path: None,
     });
     NotificationResult::query(qid, trap, Some(grant))
 }
@@ -416,7 +418,7 @@ fn handle_unix_connect(
     pid: u32,
     socket: TargetSocket,
 ) -> SysResult<NotificationResult> {
-    let Some((target, relative)) = unix_path_target(pid, &socket.addr)? else {
+    let Some(path) = unix_path_target(&socket.addr) else {
         return if matches!(
             policy.network_access.unix_socket_access(),
             UnixSocketAccess::Unrestricted
@@ -426,17 +428,29 @@ fn handle_unix_connect(
             Err(BrokerError::PolicyDenied)
         };
     };
-    authorize_unix_path(policy, &target)?;
-
-    let mut addr = socket.addr.clone();
-    if relative {
-        rewrite_unix_path(&mut addr, &target)?;
-    }
+    let process = TargetProcess::from_raw(pid);
+    let filesystem = process.filesystem()?;
+    let target = filesystem.resolve(libc::AT_FDCWD, &path, true, false, 0)?;
+    let anchor = target.anchor.ok_or(BrokerError::SystemCall {
+        errno: libc::ENOENT,
+    })?;
+    authorize_unix_path(
+        policy,
+        &target.label,
+        anchor.target.as_ref().map(AsFd::as_fd),
+    )?;
+    let object = anchor.target.as_ref().ok_or(BrokerError::InvalidAddress)?;
+    let mut addr = socket.addr;
+    rewrite_unix_path(
+        &mut addr,
+        &PathBuf::from(format!("/proc/self/fd/{}", object.as_raw_fd())),
+    )?;
 
     Ok(NotificationResult::Socket(SocketGrant {
         sock: socket.sock,
         addr,
         call: libc::connect,
+        _path: Some(anchor),
     }))
 }
 
@@ -445,29 +459,44 @@ fn handle_unix_bind(
     pid: u32,
     mut socket: TargetSocket,
 ) -> SysResult<NotificationResult> {
-    let Some((target, relative)) = unix_path_target(pid, &socket.addr)? else {
+    let Some(path) = unix_path_target(&socket.addr) else {
         return Err(BrokerError::PolicyDenied);
     };
-    authorize_unix_path(policy, &target)?;
-
-    if !target.is_under_any(&policy.write_roots) {
+    let process = TargetProcess::from_raw(pid);
+    let filesystem = process.filesystem()?;
+    let target = filesystem.resolve(libc::AT_FDCWD, &path, false, true, 0)?;
+    let anchor = target.anchor.ok_or(BrokerError::SystemCall {
+        errno: libc::ENOENT,
+    })?;
+    authorize_unix_path(
+        policy,
+        &target.label,
+        anchor.target.as_ref().map(AsFd::as_fd),
+    )?;
+    if policy
+        .write_reason(&target.label, &target.raw, true)
+        .is_some()
+    {
         return Err(BrokerError::PolicyDenied);
     }
+    let broker_path = anchor.path()?;
+    rewrite_unix_path(
+        &mut socket.addr,
+        Path::new(OsStr::from_bytes(broker_path.as_bytes())),
+    )?;
 
-    if relative {
-        rewrite_unix_path(&mut socket.addr, &target)?;
-    }
-
-    Ok(NotificationResult::Socket(SocketGrant::new(
-        socket,
-        libc::bind,
-    )))
+    Ok(NotificationResult::Socket(SocketGrant {
+        sock: socket.sock,
+        addr: socket.addr,
+        call: libc::bind,
+        _path: Some(anchor),
+    }))
 }
 
-fn unix_path_target(pid: u32, addr: &[u8]) -> SysResult<Option<(PathBuf, bool)>> {
+fn unix_path_target(addr: &[u8]) -> Option<PathBuf> {
     let sun_path = mem::size_of::<libc::sa_family_t>();
     if addr.len() <= sun_path || addr[sun_path] == 0 {
-        return Ok(None);
+        return None;
     }
 
     let path = &addr[sun_path..];
@@ -476,21 +505,18 @@ fn unix_path_target(pid: u32, addr: &[u8]) -> SysResult<Option<(PathBuf, bool)>>
         .position(|byte| *byte == 0)
         .unwrap_or(path.len());
     if end == 0 {
-        return Ok(None);
+        return None;
     }
 
-    let path = Path::new(OsStr::from_bytes(&path[..end]));
-    if path.is_absolute() {
-        Ok(Some((normalize_path_nofollow(path), false)))
-    } else {
-        let pid = i32::try_from(pid).map_err(|_| BrokerError::InvalidAddress)?;
-        let cwd = fs::read_link(format!("/proc/{pid}/cwd"))?;
-        Ok(Some((normalize_path_nofollow(&cwd.join(path)), true)))
-    }
+    Some(PathBuf::from(OsStr::from_bytes(&path[..end])))
 }
 
-fn authorize_unix_path(policy: &AccessPolicy, target: &Path) -> SysResult<()> {
-    if is_supervisor_socket(target) {
+fn authorize_unix_path(
+    policy: &AccessPolicy,
+    target: &Path,
+    object: Option<BorrowedFd<'_>>,
+) -> SysResult<()> {
+    if is_supervisor_socket(target, object) {
         return Err(BrokerError::PolicyDenied);
     }
     match policy.network_access.unix_socket_access() {
@@ -503,8 +529,7 @@ fn authorize_unix_path(policy: &AccessPolicy, target: &Path) -> SysResult<()> {
     }
 }
 
-fn is_supervisor_socket(target: &Path) -> bool {
-    let target = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+fn is_supervisor_socket(target: &Path, object: Option<BorrowedFd<'_>>) -> bool {
     // SAFETY: getuid(2) is always defined and has no preconditions.
     let uid = unsafe { libc::getuid() };
     let uid_runtime = Path::new("/run/user").join(uid.to_string());
@@ -516,20 +541,20 @@ fn is_supervisor_socket(target: &Path) -> bool {
     ];
     candidates
         .iter()
-        .any(|socket| target == *socket || same_socket_inode(&target, socket))
+        .any(|socket| target == socket || object.is_some_and(|fd| same_socket_inode(fd, socket)))
         || target.is_under("/run/systemd")
         || target.is_under(runtime.join("systemd"))
         || target.is_under(uid_runtime.join("systemd"))
 }
 
-fn same_socket_inode(left: &Path, right: &Path) -> bool {
-    let Ok(left) = fs::metadata(left) else {
-        return false;
+fn same_socket_inode(left: BorrowedFd<'_>, right: &Path) -> bool {
+    let Ok(stat) = fstat(left) else {
+        return true;
     };
     let Ok(right) = fs::metadata(right) else {
         return false;
     };
-    left.dev() == right.dev() && left.ino() == right.ino()
+    stat.st_dev == right.dev() && stat.st_ino == right.ino()
 }
 
 fn rewrite_unix_path(addr: &mut Vec<u8>, target: &Path) -> SysResult<()> {

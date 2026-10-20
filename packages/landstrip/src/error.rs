@@ -24,6 +24,8 @@ pub(crate) enum Mechanism {
     Landlock,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Seccomp,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Namespace,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Seatbelt,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -201,6 +203,10 @@ impl Error {
                 Some("the home directory is unavailable for a tilde-prefixed policy path")
             }
             Self::PolicyTraversalDepth => Some("policy path traversal exceeded its maximum depth"),
+            Self::SandboxSetupFailed {
+                mechanism: Mechanism::Namespace,
+                ..
+            } => Some("requested namespace isolation is unavailable"),
             Self::PlatformUnsupported => Some("the current platform is unsupported"),
             _ => None,
         }

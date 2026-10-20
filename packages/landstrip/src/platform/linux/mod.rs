@@ -5,7 +5,9 @@
 
 mod filter;
 mod landlock;
+mod namespace;
 mod seccomp;
+mod signals;
 
 use crate::policy::{AccessPolicy, ReadAccess};
 use crate::trap_fd::TrapFd;
@@ -24,8 +26,19 @@ pub(crate) fn doctor() -> Result<()> {
         .context("create a Landlock ruleset")?;
 
     ensure_notification_supported()?;
+    namespace::probe()
+}
+
+pub(crate) fn validate() -> Result<()> {
+    namespace::probe().map_err(|error| {
+        crate::error::Error::sandbox_setup(
+            crate::error::Mechanism::Namespace,
+            error.into_boxed_dyn_error(),
+        )
+    })?;
     Ok(())
 }
+
 pub(crate) fn execute(
     policy: &AccessPolicy,
     cwd: &Path,
@@ -45,9 +58,9 @@ pub(crate) fn execute(
 
     seccomp::run_broker(
         policy,
+        cwd,
         tool,
         args,
-        network.needs_network_broker(),
         needs_fs_broker,
         trap_fd,
         inherited_fds,

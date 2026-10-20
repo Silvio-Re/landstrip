@@ -88,6 +88,31 @@ pub fn fd_metadata_probe(
     let value = b"value";
     let rc = match operation.to_str() {
         Some("fchmod") => unsafe { libc::fchmod(file.as_raw_fd(), 0o600) },
+        Some("path-metadata") => {
+            // Exercise the pinned O_PATH target, not the ordinary descriptor above.
+            let results = unsafe {
+                [
+                    libc::syscall(SYS_FCHMODAT2, libc::AT_FDCWD, path.as_ptr(), 0o600, 0) as i32,
+                    libc::fchownat(
+                        libc::AT_FDCWD,
+                        path.as_ptr(),
+                        libc::geteuid(),
+                        libc::getegid(),
+                        0,
+                    ),
+                    libc::utimensat(libc::AT_FDCWD, path.as_ptr(), std::ptr::null(), 0),
+                    libc::setxattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
+                    ),
+                    libc::removexattr(path.as_ptr(), name.as_ptr()),
+                ]
+            };
+            return i32::from(results.into_iter().any(|rc| rc != 0));
+        }
         Some("fchmodat2-empty") => unsafe {
             libc::syscall(
                 SYS_FCHMODAT2,

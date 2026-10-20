@@ -5,7 +5,7 @@ use crate::error::Error as LandstripError;
 use nix::errno::Errno;
 use std::io;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BrokerError {
     AddressFamilyNotSupported,
     BadAddress,
@@ -17,7 +17,11 @@ pub(crate) enum BrokerError {
 }
 
 impl BrokerError {
-    pub(crate) fn errno(&self) -> i32 {
+    pub(crate) const fn syscall(errno: i32) -> Self {
+        Self::SystemCall { errno }
+    }
+
+    pub(crate) fn errno(self) -> i32 {
         match self {
             Self::PolicyDenied => LandstripError::DENIAL_ERRNO,
             Self::AddressFamilyNotSupported => libc::EAFNOSUPPORT,
@@ -25,7 +29,7 @@ impl BrokerError {
             Self::BadFileDescriptor => libc::EBADF,
             Self::BadAddress => libc::EFAULT,
             Self::NameTooLong => libc::ENAMETOOLONG,
-            Self::SystemCall { errno } => *errno,
+            Self::SystemCall { errno } => errno,
         }
     }
 }
@@ -43,6 +47,24 @@ impl From<io::Error> for BrokerError {
         Self::SystemCall {
             errno: error.raw_os_error().unwrap_or(libc::EIO),
         }
+    }
+}
+
+impl From<std::ffi::NulError> for BrokerError {
+    fn from(_: std::ffi::NulError) -> Self {
+        Self::InvalidAddress
+    }
+}
+
+impl From<std::str::Utf8Error> for BrokerError {
+    fn from(_: std::str::Utf8Error) -> Self {
+        Self::InvalidAddress
+    }
+}
+
+impl From<std::num::TryFromIntError> for BrokerError {
+    fn from(_: std::num::TryFromIntError) -> Self {
+        Self::InvalidAddress
     }
 }
 

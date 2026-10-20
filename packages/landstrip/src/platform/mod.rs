@@ -45,9 +45,8 @@ pub(crate) use macos::execute;
 pub(crate) use windows::{execute, manage as manage_windows, run_worker};
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::unnecessary_wraps, reason = "uniform platform validation API")]
 pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
-    Ok(())
+    linux::validate()
 }
 
 #[cfg(target_os = "macos")]
