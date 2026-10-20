@@ -96,10 +96,10 @@ function taskItems(tasks: readonly TaskCommandRecord[], prefix: string): Complet
   }));
 }
 
-export function matchingTasksById(
-  tasks: readonly TaskCommandRecord[],
+export function matchingTasksById<T extends { id: string }>(
+  tasks: readonly T[],
   taskId: string,
-): TaskCommandRecord[] {
+): T[] {
   const exact = tasks.find((task) => task.id === taskId);
   return exact ? [exact] : tasks.filter((task) => task.id.startsWith(taskId));
 }

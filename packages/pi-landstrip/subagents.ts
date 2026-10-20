@@ -317,6 +317,22 @@ interface TabFrame {
   listValue: (values: readonly string[]) => string;
 }
 
+export const TasksToolSchema = Type.Object({
+  action: Type.Union([Type.Literal('list'), Type.Literal('inspect'), Type.Literal('cancel')], {
+    description:
+      'Task management action: "list" to view task sessions, "inspect" for status/output, or "cancel" to stop an active task',
+  }),
+  task_id: Type.Optional(
+    Type.String({
+      description: 'Task ID or unique prefix (required for "inspect" and "cancel")',
+    }),
+  ),
+});
+export type TasksToolInput = {
+  action: 'list' | 'inspect' | 'cancel';
+  task_id?: string;
+};
+
 const taskParameters = Type.Object({
   description: Type.String({ description: 'Short task label (3-5 words)' }),
   prompt: Type.String({ description: 'Full instructions for the subagent' }),
@@ -1472,6 +1488,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
   register(): void {
     this.pi.registerTool(this.createTaskTool());
+    this.pi.registerTool(this.createTasksTool());
     registerLandstripCommands(this.pi, this, this.integration);
     this.pi.registerShortcut('ctrl+shift+a', {
       description: 'Cycle to the next primary agent',
@@ -2822,6 +2839,93 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     } finally {
       this.primaryAgentSwitching = false;
     }
+  }
+
+  createTasksTool(
+    boundCtx?: ExtensionContext,
+  ): ToolDefinition<
+    typeof TasksToolSchema,
+    TaskDetails | { count?: number; taskId?: string; cancelled?: boolean }
+  > {
+    return {
+      name: 'tasks',
+      label: 'Tasks',
+      description: 'Inspect, list, and cancel background tasks and subagents managed by Landstrip.',
+      parameters: TasksToolSchema,
+      executionMode: 'parallel',
+      renderCall: (input, theme) => {
+        const action = input.action ?? 'list';
+        const target = input.task_id ? ` ${input.task_id.slice(0, 8)}` : '';
+        return new Text(
+          `${theme.fg('toolTitle', theme.bold('Tasks'))} ${theme.fg('accent', action)}${theme.fg('dim', target)}`,
+          0,
+          0,
+        );
+      },
+      execute: async (_toolCallId, input, _signal, _onUpdate, callCtx) => {
+        const ctx = boundCtx ?? callCtx;
+        if (!ctx) throw new Error('Task context is unavailable');
+        const action = input.action;
+        if (action === 'list') {
+          const list = [...this.tasks.values()].map((task) => {
+            const details = taskDetails(task);
+            return {
+              id: details.taskId,
+              kind: details.kind,
+              agent: details.agent,
+              state: details.state,
+              command: details.command,
+              description: details.description,
+              duration: taskDuration(details),
+              exitCode: details.exitCode,
+            };
+          });
+          return {
+            content: [{ type: 'text', text: JSON.stringify(list, null, 2) }],
+            details: { count: list.length },
+          };
+        }
+        if (action === 'inspect') {
+          if (!input.task_id) throw new Error('task_id is required for inspect action');
+          const matched = matchingTasksById([...this.tasks.values()], input.task_id);
+          if (matched.length === 0)
+            throw new Error(`No task found matching prefix "${input.task_id}"`);
+          if (matched.length > 1)
+            throw new Error(`Task ID prefix "${input.task_id}" matches ${matched.length} tasks`);
+          const task = matched[0]!;
+          const details = taskDetails(task);
+          const transcript = taskTranscript(task);
+          const tail = transcript.slice(-100).join('\n');
+          const header =
+            task.kind === 'command'
+              ? `$ bash ${task.command ?? task.description}\nCWD: ${task.cwd}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nExit code: ${details.exitCode ?? 'none'}`
+              : `@${task.agent}: ${task.description}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nTool calls: ${task.toolCalls ?? 0}`;
+          return {
+            content: [{ type: 'text', text: `${header}\n\nRecent Output:\n${tail}` }],
+            details,
+          };
+        }
+        if (action === 'cancel') {
+          if (!input.task_id) throw new Error('task_id is required for cancel action');
+          const matched = matchingTasksById([...this.tasks.values()], input.task_id);
+          if (matched.length === 0)
+            throw new Error(`No task found matching prefix "${input.task_id}"`);
+          if (matched.length > 1)
+            throw new Error(`Task ID prefix "${input.task_id}" matches ${matched.length} tasks`);
+          const count = await this.cancelTasks([matched[0]!.id], ctx);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Cancelled task ${matched[0]!.id.slice(0, 8)} (${count} task cancelled)`,
+              },
+            ],
+            details: { taskId: matched[0]!.id, cancelled: count > 0 },
+          };
+        }
+        throw new Error(`Unknown action: ${action}`);
+      },
+    };
   }
 
   async runBackgroundShellTask(

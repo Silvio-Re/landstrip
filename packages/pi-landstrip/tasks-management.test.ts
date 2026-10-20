@@ -8,12 +8,13 @@ import { join } from 'node:path';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
+import { matchingTasksById } from './commands.ts';
 import {
   createLandstripIntegration,
   type LandstripBashInput,
   type LandstripIntegration,
 } from './index.ts';
-import { SubagentRuntime, type SubagentTaskRecord } from './subagents.ts';
+import { SubagentRuntime, type SubagentTaskRecord, type TasksToolInput } from './subagents.ts';
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -263,5 +264,88 @@ describe('Task Cancellation vs Deletion Lifecycle', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Tasks Tool (list, inspect, cancel)', () => {
+  test('tasks tool executes list, inspect, and cancel operations', async () => {
+    const root = mkdtempSync(join(homedir(), '.pi-landstrip-test-'));
+    try {
+      vi.stubEnv('PI_CODING_AGENT_DIR', root);
+      const mockApi = createMockExtensionAPI();
+      const integration: LandstripIntegration = {
+        ...createLandstripIntegration({ registerBashTool: false, cwd: root }),
+        runSandboxedCommand: async (_cmd, _cwd, options) => {
+          options.onData?.(Buffer.from('hello from background command\n'));
+          return { exitCode: 0 };
+        },
+      };
+
+      const runtime = new SubagentRuntime(mockApi.api, integration);
+      runtime.register();
+      const ctx = createMockExtensionContext(root);
+      for (const listener of mockApi.listeners.get('session_start') ?? []) {
+        await listener({}, ctx);
+      }
+
+      const tasksTool = mockApi.tools.get('tasks');
+      expect(tasksTool).toBeDefined();
+
+      // Launch a background shell task
+      const launched = await runtime.runBackgroundShellTask(
+        { command: 'echo test', name: 'echo-test' },
+        ctx,
+      );
+      const taskId = launched.details.taskId;
+
+      // 1. List
+      const listResult = await tasksTool.execute(
+        'call-1',
+        { action: 'list' } as TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      expect(listResult.content[0].text).toContain(taskId);
+      expect(listResult.details.count).toBe(1);
+
+      // 2. Inspect with prefix
+      const inspectResult = await tasksTool.execute(
+        'call-2',
+        { action: 'inspect', task_id: taskId.slice(0, 8) } as TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      expect(inspectResult.content[0].text).toContain('echo test');
+
+      // 3. Cancel with prefix
+      const cancelResult = await tasksTool.execute(
+        'call-3',
+        { action: 'cancel', task_id: taskId.slice(0, 8) } as TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      expect(cancelResult.content[0].text).toContain('Cancelled task');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('matchingTasksById prefix matching helper', () => {
+  test('matches exact ID first and falls back to unambiguous prefix', () => {
+    const tasks = [
+      { id: 'abcdef123456', agent: 'bash', state: 'running' },
+      { id: 'abc999888777', agent: 'bash', state: 'running' },
+      { id: 'xyz123456789', agent: 'bash', state: 'running' },
+    ];
+
+    expect(matchingTasksById(tasks, 'abcdef123456')).toEqual([tasks[0]]);
+    expect(matchingTasksById(tasks, 'abcdef')).toEqual([tasks[0]]);
+    expect(matchingTasksById(tasks, 'abc')).toEqual([tasks[0], tasks[1]]);
+    expect(matchingTasksById(tasks, 'xyz')).toEqual([tasks[2]]);
+    expect(matchingTasksById(tasks, 'nonexistent')).toEqual([]);
   });
 });
