@@ -3,16 +3,19 @@
 
 import { randomUUID } from 'node:crypto';
 import {
+  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   readlinkSync,
   realpathSync,
   rmSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -353,32 +356,51 @@ interface TaskUsage {
   turns: number;
 }
 
-interface TaskRecord {
+export interface BaseTaskRecord {
   version?: 1;
   id: string;
   parentSessionId: string;
   parentTaskId?: string;
   parentSessionFile?: string;
-  sessionDir?: string;
-  sessionFile?: string;
-  agent: string;
-  description: string;
   depth: number;
   state: TaskState;
-  output?: string;
-  error?: string;
-  outputFile?: string;
-  errorFile?: string;
+  startedAt?: number;
+  finishedAt?: number;
   delivered?: boolean;
   deleted?: boolean;
   background?: boolean;
+  cwd?: string;
+  sessionDir?: string;
+  sessionFile?: string;
+  outputFile?: string;
+  errorFile?: string;
+  output?: string;
+  error?: string;
+  command?: string;
+  exitCode?: number | null;
   currentTool?: string;
   toolCalls?: number;
   retryAttempt?: number;
   usage?: TaskUsage;
-  startedAt?: number;
-  finishedAt?: number;
 }
+
+export interface SubagentTaskRecord extends BaseTaskRecord {
+  kind?: 'subagent';
+  agent: string;
+  description: string;
+}
+
+export interface CommandTaskRecord extends BaseTaskRecord {
+  kind: 'command';
+  agent: 'bash';
+  command: string;
+  description: string;
+  cwd: string;
+  outputFile: string;
+  sandboxPolicy?: string;
+}
+
+export type TaskRecord = SubagentTaskRecord | CommandTaskRecord;
 
 export interface SubagentTaskView {
   readonly id: string;
@@ -386,12 +408,17 @@ export interface SubagentTaskView {
   readonly agent: string;
   readonly description: string;
   readonly state: 'queued' | 'running' | 'completed' | 'error' | 'cancelled' | 'interrupted';
+  readonly kind?: 'subagent' | 'command';
+  readonly command?: string;
+  readonly exitCode?: number | null;
 }
 
-interface TaskDetails {
+export interface TaskDetails {
   taskId: string;
   state: TaskState;
   agent: string;
+  kind?: 'subagent' | 'command';
+  command?: string;
   description?: string;
   background?: boolean;
   currentTool?: string;
@@ -402,6 +429,11 @@ interface TaskDetails {
   finishedAt?: number;
   output?: string;
   error?: string;
+  outputFile?: string;
+  errorFile?: string;
+  exitCode?: number | null;
+  parentTaskId?: string;
+  depth?: number;
 }
 
 function taskDetails(task: TaskRecord, state: TaskState = task.state): TaskDetails {
@@ -409,6 +441,8 @@ function taskDetails(task: TaskRecord, state: TaskState = task.state): TaskDetai
     taskId: task.id,
     state,
     agent: task.agent,
+    kind: task.kind ?? 'subagent',
+    command: task.command,
     description: task.description,
     background: task.background,
     currentTool: task.currentTool,
@@ -419,6 +453,11 @@ function taskDetails(task: TaskRecord, state: TaskState = task.state): TaskDetai
     finishedAt: task.finishedAt,
     output: task.output,
     error: task.error,
+    outputFile: task.outputFile,
+    errorFile: task.errorFile,
+    exitCode: task.exitCode,
+    parentTaskId: task.parentTaskId,
+    depth: task.depth,
   };
 }
 
@@ -633,6 +672,11 @@ function taskProgress(task: TaskRecord): string[] {
   if (task.state !== 'running') return [];
 
   const progress: string[] = [];
+  if (task.kind === 'command') {
+    const duration = taskDuration(taskDetails(task));
+    if (duration) progress.push(duration);
+    return progress;
+  }
   if (task.currentTool) progress.push(`→ ${task.currentTool}`);
   if (task.toolCalls !== undefined) {
     progress.push(`${task.toolCalls} call${task.toolCalls === 1 ? '' : 's'}`);
@@ -667,6 +711,17 @@ function messageContentText(message: unknown): string {
 }
 
 function taskTranscript(task: TaskRecord): string[] {
+  if (task.kind === 'command') {
+    if (task.outputFile) {
+      try {
+        const content = readFileSync(task.outputFile, 'utf8');
+        const lines = content.split('\n');
+        return lines.length > 0 && lines[0] !== '' ? lines : ['Command running... (no output yet)'];
+      } catch {}
+    }
+    const fallback = task.error ?? task.output ?? 'Command output is not available yet.';
+    return fallback.split('\n');
+  }
   if (!task.sessionFile || !existsSync(task.sessionFile)) {
     const fallback = task.error ?? task.output ?? 'Child session is not available yet.';
     return fallback.split('\n');
@@ -1037,12 +1092,11 @@ class PermissionBroker {
   }
 }
 
-export function renderTaskResult(
-  id: string,
-  state: 'queued' | 'running' | 'completed' | 'error',
-  value: string,
-): string {
-  const tag = state === 'error' ? 'task_error' : 'task_result';
+export function renderTaskResult(id: string, state: TaskState, value: string): string {
+  const tag =
+    state === 'error' || state === 'cancelled' || state === 'interrupted'
+      ? 'task_error'
+      : 'task_result';
   return `<task id="${id}" state="${state}">\n<${tag}>\n${value}\n</${tag}>\n</task>`;
 }
 
@@ -1374,6 +1428,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
   private primaryAgentSwitching = false;
   private shuttingDown = false;
   private activeSessionId: string | undefined;
+  private readonly taskUpdateListeners = new Set<() => void>();
+  private readonly recentCompletions = new Map<
+    string,
+    { label: string; status: 'completed' | 'error' | 'cancelled'; text: string; finishedAt: number }
+  >();
 
   constructor(
     private readonly pi: ExtensionAPI,
@@ -1396,6 +1455,19 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
   primaryAgentName(): string | undefined {
     return this.primaryAgent?.name;
+  }
+
+  onTaskUpdate(listener: () => void): () => void {
+    this.taskUpdateListeners.add(listener);
+    return () => this.taskUpdateListeners.delete(listener);
+  }
+
+  notifyTaskUpdate(): void {
+    for (const listener of this.taskUpdateListeners) {
+      try {
+        listener();
+      } catch {}
+    }
   }
 
   register(): void {
@@ -2750,6 +2822,148 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     } finally {
       this.primaryAgentSwitching = false;
     }
+  }
+
+  async runBackgroundShellTask(
+    params: { command: string; timeout?: number; background?: boolean; name?: string },
+    ctx: ExtensionContext,
+  ): Promise<{
+    content: Array<{ type: 'text'; text: string }>;
+    details: { taskId: string; state: string; description: string; outputFile: string };
+  }> {
+    const taskId = randomUUID();
+    const sessionId = this.activeSessionId ?? ctx.sessionManager.getSessionId();
+    const sessionDir = join(getAgentDir(), 'sessions', 'pi-landstrip', sessionId, taskId);
+    mkdirSync(sessionDir, { recursive: true });
+    const outputFile = join(sessionDir, 'output.txt');
+    const outputFd = openSync(outputFile, 'w');
+
+    const label = params.name?.trim() || truncateToWidth(params.command.trim(), 60);
+
+    const task: CommandTaskRecord = {
+      version: 1,
+      id: taskId,
+      kind: 'command',
+      agent: 'bash',
+      command: params.command,
+      description: label,
+      cwd: ctx.cwd,
+      parentSessionId: sessionId,
+      parentSessionFile: ctx.sessionManager.getSessionFile(),
+      depth: 1,
+      state: 'running',
+      startedAt: Date.now(),
+      sessionDir,
+      outputFile,
+      background: true,
+    };
+
+    this.tasks.set(taskId, task);
+    this.persist(task);
+    this.notifyTaskUpdate();
+    this.updateTaskWidget(ctx);
+
+    const controller = new AbortController();
+    this.controllers.set(taskId, controller);
+
+    void (async () => {
+      try {
+        const result = await this.integration.runSandboxedCommand!(
+          params.command,
+          ctx.cwd,
+          {
+            timeout: params.timeout,
+            signal: controller.signal,
+            promptOnBlock: false,
+            onData: (chunk: Buffer) => {
+              try {
+                writeSync(outputFd, chunk);
+              } catch {}
+              this.notifyTaskUpdate();
+            },
+          },
+          ctx,
+        );
+
+        task.exitCode = result.exitCode;
+        if (task.state !== 'cancelled') {
+          task.state = result.exitCode === 0 ? 'completed' : 'error';
+          if (result.exitCode !== 0) {
+            task.error = `Process exited with code ${result.exitCode}`;
+          }
+        }
+      } catch (err: unknown) {
+        if (task.state !== 'cancelled') {
+          task.state = 'error';
+          task.error = formatError(err);
+        }
+      } finally {
+        try {
+          closeSync(outputFd);
+        } catch {}
+        task.finishedAt = Date.now();
+        this.controllers.delete(taskId);
+        this.persist(task);
+
+        const durationSec = taskDuration(taskDetails(task)) ?? '';
+        const exitMsg =
+          task.exitCode !== undefined && task.exitCode !== null
+            ? task.exitCode === 0
+              ? 'completed'
+              : `failed (exit ${task.exitCode})`
+            : task.state === 'cancelled'
+              ? 'cancelled'
+              : 'error';
+        this.recentCompletions.set(taskId, {
+          label: task.description,
+          status:
+            task.state === 'completed'
+              ? 'completed'
+              : task.state === 'cancelled'
+                ? 'cancelled'
+                : 'error',
+          text: `$ bash ${task.description} ${exitMsg} (${durationSec})`,
+          finishedAt: Date.now(),
+        });
+
+        const commandOutput = task.outputFile
+          ? (() => {
+              try {
+                return readFileSync(task.outputFile, 'utf8').trim();
+              } catch {
+                return '';
+              }
+            })()
+          : (task.output ?? '');
+        const deliveryText = `Background command ${task.state === 'completed' ? 'completed' : 'failed'}: ${task.description}\n\n${renderTaskResult(task.id, task.state, commandOutput || (task.error ?? ''))}`;
+        const delivered = await this.deliverBackground(task, deliveryText);
+        if (delivered) {
+          task.delivered = true;
+          this.persist(task);
+        }
+        if (task.state === 'error') {
+          ctx.ui.notify(`Background command failed: ${task.description}`, 'error');
+        }
+
+        this.notifyTaskUpdate();
+        this.updateTaskWidget(ctx);
+      }
+    })();
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Command launched in background.\nTask ID: ${taskId}\nOutput file: ${outputFile}\nUse /landstrip tasks to view live progress or cancel.`,
+        },
+      ],
+      details: {
+        taskId,
+        state: 'running',
+        description: label,
+        outputFile,
+      },
+    };
   }
 
   private createTaskTool(

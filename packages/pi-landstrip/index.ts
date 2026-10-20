@@ -31,9 +31,11 @@ import type {
 import {
   type BashOperations,
   createBashToolDefinition,
+  createLocalBashOperations,
   getAgentDir,
   getShellConfig,
   SettingsManager,
+  type ToolDefinition,
   withFileMutationQueue,
 } from '@earendil-works/pi-coding-agent';
 import {
@@ -128,12 +130,33 @@ import { WORKER_AUTH_FD } from './worker-auth-channel.ts';
 import {
   registerSubagents,
   registerSubagentWorker,
+  type SubagentRuntime,
   workerConfigFromEnvironment,
 } from './subagents.ts';
+import { Type, type Static } from 'typebox';
 import { getPiConfigPaths } from './config.ts';
 import { formatError, PermissionPromptCoordinator } from './util.ts';
+import { Text } from '@earendil-works/pi-tui';
 
-type LandstripBashTool = ReturnType<typeof createBashToolDefinition>;
+export const LandstripBashSchema = Type.Object({
+  command: Type.String({ description: 'Shell command to execute' }),
+  timeout: Type.Optional(
+    Type.Number({ description: 'Timeout in seconds (optional, no default timeout)' }),
+  ),
+  background: Type.Optional(
+    Type.Boolean({
+      description: 'Run command asynchronously in the background and return a task ID',
+    }),
+  ),
+  name: Type.Optional(
+    Type.String({
+      description: 'Concise label for the background command execution',
+    }),
+  ),
+});
+export type LandstripBashInput = Static<typeof LandstripBashSchema>;
+
+export type LandstripBashTool = ToolDefinition<typeof LandstripBashSchema, any, any>;
 
 export type SandboxConfigScope = 'global' | 'project';
 
@@ -718,6 +741,8 @@ export interface LandstripIntegrationOptions {
   readonly registerBashTool?: boolean;
   /** Working directory used when registering the default bash tool. */
   readonly cwd?: string;
+  /** Subagent and background task runtime. */
+  readonly subagentRuntime?: SubagentRuntime;
 }
 
 /** Filesystem access requested by a primary Pi file tool. */
@@ -760,6 +785,21 @@ export interface LandstripIntegration extends PiLandstripRuntimeV2 {
   emit(event: LandstripEvent): void;
   /** Callbacks for querying and toggling sandbox state. */
   readonly sandboxCallbacks?: SandboxCallbacks;
+  /** Run a command through the effective Landstrip shell environment and sandbox. */
+  runSandboxedCommand?(
+    command: string,
+    cwd: string,
+    options: {
+      timeout?: number;
+      signal?: AbortSignal;
+      onData?: (chunk: Buffer) => void;
+      env?: NodeJS.ProcessEnv;
+      promptOnBlock?: boolean;
+    },
+    ctx: ExtensionContext,
+  ): Promise<{ exitCode: number | null }>;
+  /** Connect the subagent and background task runtime. */
+  setSubagentRuntime?(runtime: SubagentRuntime): void;
 }
 
 /** Callbacks for editing sandbox state from the agents dashboard. */
@@ -827,7 +867,8 @@ export default function (pi: ExtensionAPI) {
   }
   const permissionPrompts = new PermissionPromptCoordinator();
   const integration = createLandstripIntegrationWithPrompts({}, permissionPrompts);
-  registerSubagents(pi, integration, permissionPrompts);
+  const subagentRuntime = registerSubagents(pi, integration, permissionPrompts);
+  integration.setSubagentRuntime?.(subagentRuntime);
   integration.register(pi);
 }
 
@@ -844,6 +885,7 @@ function createLandstripIntegrationWithPrompts(
 ): LandstripIntegration {
   const shouldRegisterBashTool = options.registerBashTool ?? true;
   const localCwd = options.cwd ?? process.cwd();
+  let subagentRuntime: SubagentRuntime | undefined = options.subagentRuntime;
   let projectConfigTrusted = false;
 
   function loadConfig(cwd: string): ReturnType<typeof loadSandboxConfig> {
@@ -2603,13 +2645,59 @@ function createLandstripIntegrationWithPrompts(
     const localBash = createBashToolDefinition(cwd, {
       shellPath: SettingsManager.create(cwd).getShellPath(),
     });
+    const baseRenderCall = localBash.renderCall;
+    const baseRenderResult = localBash.renderResult;
 
     return {
       ...localBash,
       label: 'bash (landstrip)',
       description: 'Execute commands with the active Landstrip shell provider.',
-      async execute(id, params, signal, onUpdate, ctx) {
+      parameters: LandstripBashSchema,
+      renderCall(args, theme, context) {
+        const bashArgs = args as LandstripBashInput;
+        if (bashArgs.background) {
+          const nameSuffix = bashArgs.name ? theme.fg('dim', ` (${bashArgs.name})`) : '';
+          return new Text(
+            theme.fg('accent', '$ ' + bashArgs.command) + theme.fg('muted', ' [bg]') + nameSuffix,
+            0,
+            0,
+          );
+        }
+        return baseRenderCall
+          ? baseRenderCall(args as any, theme, context as any)
+          : new Text(args.command, 0, 0);
+      },
+      renderResult(result, options, theme, context) {
+        const details = result.details as { taskId?: string; description?: string } | undefined;
+        if (details?.taskId) {
+          const text = result.content[0]?.type === 'text' ? result.content[0].text : '';
+          return new Text(
+            theme.fg('success', `✓ Task ${details.taskId.slice(0, 8)} started`) +
+              '\n' +
+              theme.fg('dim', text),
+            0,
+            0,
+          );
+        }
+        return baseRenderResult
+          ? baseRenderResult(result as any, options, theme, context as any)
+          : new Text('', 0, 0);
+      },
+      async execute(id, rawParams, signal, onUpdate, ctx) {
         if (!ctx) throw new Error('Sandbox context is unavailable');
+        const params = rawParams as LandstripBashInput;
+        if (params.background) {
+          if (!ensureSandboxState(ctx)) {
+            if (sandboxState === 'unavailable') {
+              throw new Error('Sandbox is unavailable; refusing command');
+            }
+          }
+          if (!subagentRuntime) {
+            throw new Error('Background task runtime is unavailable');
+          }
+          return subagentRuntime.runBackgroundShellTask(params, ctx);
+        }
+
         if (!ensureSandboxState(ctx)) {
           if (sandboxState === 'unavailable') {
             throw new Error('Sandbox is unavailable; refusing command');
@@ -2619,12 +2707,12 @@ function createLandstripIntegrationWithPrompts(
               operations: createProviderBashOps(),
               shellPath: SettingsManager.create(ctx.cwd).getShellPath(),
             });
-            return providerBash.execute(id, params, signal, onUpdate, ctx);
+            return providerBash.execute(id, params as any, signal, onUpdate, ctx);
           }
-          return localBash.execute(id, params, signal, onUpdate, ctx);
+          return localBash.execute(id, params as any, signal, onUpdate, ctx);
         }
 
-        return runBashWithOptionalRetry(id, params, signal, onUpdate, ctx);
+        return runBashWithOptionalRetry(id, params as any, signal, onUpdate, ctx);
       },
     };
   }
@@ -2766,6 +2854,33 @@ function createLandstripIntegrationWithPrompts(
     on,
     register,
     emit: emitEvent,
+    runSandboxedCommand(
+      command: string,
+      cwd: string,
+      execOptions: {
+        timeout?: number;
+        signal?: AbortSignal;
+        onData?: (chunk: Buffer) => void;
+        env?: NodeJS.ProcessEnv;
+        promptOnBlock?: boolean;
+      },
+      ctx: ExtensionContext,
+    ): Promise<{ exitCode: number | null }> {
+      const ops = ensureSandboxState(ctx)
+        ? createLandstripBashOps(ctx, { promptOnBlock: execOptions.promptOnBlock ?? false })
+        : externalShellProvider !== undefined
+          ? createProviderBashOps()
+          : createLocalBashOperations();
+      return ops.exec(command, cwd, {
+        onData: execOptions.onData ?? (() => {}),
+        signal: execOptions.signal,
+        timeout: execOptions.timeout,
+        env: execOptions.env,
+      });
+    },
+    setSubagentRuntime(runtime: SubagentRuntime) {
+      subagentRuntime = runtime;
+    },
     sandboxCallbacks,
   };
   return integration;
