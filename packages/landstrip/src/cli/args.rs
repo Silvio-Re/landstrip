@@ -40,6 +40,7 @@ pub(super) enum Command {
     Run(RunCommand),
     Check(PolicyRequest),
     Resolve(PolicyRequest),
+    Capabilities,
     Doctor,
     #[cfg(target_os = "windows")]
     Windows(WindowsCommand),
@@ -100,6 +101,8 @@ enum CliCommand {
     Check(PolicyRequestArgs),
     /// Print the final normalized policy as JSON.
     Resolve(PolicyRequestArgs),
+    /// Inspect supported and available sandbox capabilities.
+    Capabilities,
     /// Verify that the current OS sandbox is operational.
     Doctor,
     #[cfg(target_os = "windows")]
@@ -244,6 +247,7 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
         CliCommand::Run(args) => Command::Run(run_command(args)?),
         CliCommand::Check(args) => Command::Check(args.into()),
         CliCommand::Resolve(args) => Command::Resolve(args.into()),
+        CliCommand::Capabilities => Command::Capabilities,
         CliCommand::Doctor => Command::Doctor,
         #[cfg(target_os = "windows")]
         CliCommand::Windows(args) => Command::Windows(match args.command {

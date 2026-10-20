@@ -17,9 +17,9 @@ mod unix;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use crate::outcome::DoctorReport;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::outcome::SandboxImplementation;
+use crate::outcome::{CapabilitiesReport, DoctorReport};
 
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
@@ -102,6 +102,10 @@ pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
     Err(crate::error::Error::PlatformUnsupported.into())
+}
+
+pub(crate) fn capabilities() -> anyhow::Result<CapabilitiesReport> {
+    doctor().map(CapabilitiesReport::from)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

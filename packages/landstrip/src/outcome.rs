@@ -23,6 +23,32 @@ pub(crate) enum SandboxImplementation {
     RestrictedUser,
 }
 
+impl SandboxImplementation {
+    fn capabilities(self) -> FeatureCapabilities {
+        let (unix_socket_filtering, process_isolation) = match self {
+            #[cfg(target_os = "linux")]
+            Self::LandlockSeccomp => (true, true),
+            #[cfg(target_os = "macos")]
+            Self::Seatbelt => (true, false),
+            #[cfg(target_os = "windows")]
+            Self::AppContainer | Self::RestrictedUser => (false, false),
+        };
+        FeatureCapabilities {
+            filesystem_tiers: &[
+                "allowWrite",
+                "denyWrite",
+                "allowRead",
+                "denyRead",
+                "denyReadAlways",
+                "denyWriteAlways",
+            ],
+            network_mediation: true,
+            unix_socket_filtering,
+            process_isolation,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct PolicyValidationError {
     pub(crate) code: &'static str,
@@ -43,6 +69,41 @@ pub(crate) struct DoctorReport {
     pub(crate) implementation: SandboxImplementation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CapabilitiesReport {
+    pub(crate) platform: &'static str,
+    pub(crate) implementation: SandboxImplementation,
+    pub(crate) supported: FeatureCapabilities,
+    pub(crate) available: FeatureCapabilities,
+}
+
+impl From<DoctorReport> for CapabilitiesReport {
+    fn from(report: DoctorReport) -> Self {
+        let supported = report.implementation.capabilities();
+        Self {
+            platform: report.platform,
+            implementation: report.implementation,
+            supported,
+            available: if report.ok {
+                supported
+            } else {
+                FeatureCapabilities::default()
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct FeatureCapabilities {
+    pub(crate) filesystem_tiers: &'static [&'static str],
+    pub(crate) network_mediation: bool,
+    pub(crate) unix_socket_filtering: bool,
+    pub(crate) process_isolation: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -101,6 +162,7 @@ pub(crate) enum CommandOutcome {
     PolicyValidated(PolicyValidationReport),
     PolicyResolved(Box<AccessPolicy>),
     Doctor(DoctorReport),
+    Capabilities(CapabilitiesReport),
     #[cfg(target_os = "windows")]
     Windows(WindowsStatusReport),
 }
@@ -114,6 +176,7 @@ impl CommandOutcome {
             #[cfg(target_os = "windows")]
             Self::Windows(report) => i32::from(!report.healthy),
             Self::PolicyResolved(_) => 0,
+            Self::Capabilities(_) => 0,
         }
     }
 
@@ -123,6 +186,7 @@ impl CommandOutcome {
             Self::PolicyValidated(report) => serde_json::to_writer(&mut output, report)?,
             Self::PolicyResolved(policy) => serde_json::to_writer(&mut output, policy)?,
             Self::Doctor(report) => serde_json::to_writer(&mut output, report)?,
+            Self::Capabilities(report) => serde_json::to_writer(&mut output, report)?,
             #[cfg(target_os = "windows")]
             Self::Windows(report) => serde_json::to_writer(&mut output, report)?,
         }
@@ -151,6 +215,12 @@ impl From<AccessPolicy> for CommandOutcome {
 impl From<DoctorReport> for CommandOutcome {
     fn from(report: DoctorReport) -> Self {
         Self::Doctor(report)
+    }
+}
+
+impl From<CapabilitiesReport> for CommandOutcome {
+    fn from(report: CapabilitiesReport) -> Self {
+        Self::Capabilities(report)
     }
 }
 

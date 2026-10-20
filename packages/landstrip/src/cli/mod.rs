@@ -72,6 +72,7 @@ fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
         Command::Run(command) => run(command),
         Command::Check(request) => check_policy(request),
         Command::Resolve(request) => resolve_policy(request),
+        Command::Capabilities => platform::capabilities().map(CommandOutcome::from),
         Command::Doctor => platform::doctor().map(CommandOutcome::from),
         #[cfg(target_os = "windows")]
         Command::Windows(command) => platform::manage_windows(command).map(CommandOutcome::from),
