@@ -215,6 +215,7 @@ function writePolicyFile(
       network: config.network,
       filesystem: config.filesystem,
       macos: config.macos,
+      windows: config.windows,
       baseDirectory,
       httpProxyPort: proxyPort,
     }),
