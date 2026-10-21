@@ -4,6 +4,7 @@
 //! macOS Seatbelt (SBPL) sandbox platform.
 
 use super::unix::close_inherited_fds;
+use crate::config::SandboxMacos;
 use crate::error::Error;
 use crate::paths::PathCoverage;
 use crate::policy::{AccessPolicy, GlobPattern, NetworkAccess, ReadAccess, UnixSocketAccess};
@@ -74,11 +75,10 @@ fn render_profile(policy: &AccessPolicy) -> std::result::Result<String, fmt::Err
     writeln!(sb, "(deny default)")?;
 
     render_process_rules(&mut sb)?;
-    render_mach_rules(&mut sb)?;
+    render_mach_rules(&mut sb, &policy.macos)?;
     render_write_rules(&mut sb, policy)?;
     render_read_rules(&mut sb, policy)?;
     render_network_rules(&mut sb, &policy.network_access)?;
-
     Ok(sb)
 }
 
@@ -96,11 +96,33 @@ fn render_process_rules(sb: &mut String) -> fmt::Result {
 }
 
 /// Default Mach services, matching the Anthropic sandbox-runtime (srt) base
-/// profile plus `SecurityServer` and trustd for Keychain / TLS trust.
-fn render_mach_rules(sb: &mut String) -> fmt::Result {
+/// profile plus `SecurityServer` for Keychain access.
+fn render_mach_rules(sb: &mut String, macos: &SandboxMacos) -> fmt::Result {
     writeln!(sb, "(allow mach-lookup")?;
     writeln!(sb, "  (global-name \"com.apple.SecurityServer\")")?;
-    writeln!(sb, "  (global-name \"com.apple.trustd.agent\")")?;
+    if macos.allow_trustd {
+        writeln!(sb, "  (global-name \"com.apple.trustd.agent\")")?;
+    }
+    if macos.allow_apple_events {
+        writeln!(sb, "  (global-name \"com.apple.coreservices.appleevents\")")?;
+        writeln!(
+            sb,
+            "  (global-name \"com.apple.CoreServices.coreservicesd\")"
+        )?;
+        writeln!(
+            sb,
+            "  (global-name \"com.apple.coreservices.quarantine-resolver\")"
+        )?;
+    }
+    for service in &macos.allow_mach_lookup {
+        if let Some(prefix) = service.strip_suffix('*') {
+            let escaped = escape_sbpl_literal(prefix);
+            writeln!(sb, "  (global-name-prefix \"{escaped}\")")?;
+        } else {
+            let escaped = escape_sbpl_literal(service);
+            writeln!(sb, "  (global-name \"{escaped}\")")?;
+        }
+    }
     writeln!(sb, "  (global-name \"com.apple.audio.systemsoundserver\")")?;
     writeln!(sb, "  (global-name \"com.apple.bsd.dirhelper\")")?;
     writeln!(
@@ -133,6 +155,10 @@ fn render_mach_rules(sb: &mut String) -> fmt::Result {
         "  (global-name \"com.apple.system.opendirectoryd.membership\")"
     )?;
     writeln!(sb, ")")?;
+    if macos.allow_apple_events {
+        writeln!(sb, "(allow appleevent-send)")?;
+        writeln!(sb, "(allow lsopen)")?;
+    }
     writeln!(
         sb,
         "(allow system-socket (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))"
@@ -221,7 +247,13 @@ fn render_write_rules(sb: &mut String, policy: &AccessPolicy) -> fmt::Result {
         let escaped = escape_sbpl_literal(&root.to_string_lossy());
         writeln!(sb, "(allow file-write* (subpath \"{escaped}\"))")?;
     }
-
+    if policy.macos.allow_pty {
+        writeln!(sb, "(allow pseudo-tty)")?;
+        writeln!(
+            sb,
+            "(allow file-ioctl file-write* (literal \"/dev/ptmx\") (regex #\"^/dev/ttys\"))"
+        )?;
+    }
     // Deny rules follow the allow rules so SBPL's last-match-wins precedence
     // subtracts the denied subtrees from the granted write roots.
     for root in &policy.write_denied_roots {
@@ -292,12 +324,17 @@ fn render_read_rules(sb: &mut String, policy: &AccessPolicy) -> fmt::Result {
                 let escaped = escape_sbpl_literal(&root.to_string_lossy());
                 writeln!(sb, "(allow file-read* (subpath \"{escaped}\"))")?;
             }
+            if policy.macos.allow_pty {
+                writeln!(
+                    sb,
+                    "(allow file-read* (literal \"/dev/ptmx\") (regex #\"^/dev/ttys\"))"
+                )?;
+            }
             render_parent_dir_rules(sb, roots)?;
 
             render_symlink_metadata_rules(sb, &policy.read_symlinks)?;
         }
     }
-
     // Deny rules follow the allow rules so SBPL's last-match-wins
     // precedence subtracts the denied subtrees from the read grants.
     for root in &policy.read_denied_roots {

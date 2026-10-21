@@ -197,6 +197,8 @@ name=httpProxyPort zero is rejected | os=linux,macos | policy={"network":{"httpP
 name=socksProxyPort zero is rejected | os=linux,macos | policy={"network":{"socksProxyPort":0},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'printf ok' | status=!0
 name=malformed JSON policy is rejected | os=linux,macos | policy={bad | cmd=%SHELL% -c 'printf ok' | status=!0
 name=removed windows.backend reports migration | os=linux,macos | policy={"windows":{"backend":"appContainer"}} | cmd=%SHELL% -c 'printf ok' | status=!0 | out=windows.backend was removed
+name=empty allowMachLookup entry is rejected | os=linux,macos | policy={"macos":{"allowMachLookup":[""]}} | cmd=%SHELL% -c 'printf ok' | status=!0 | out=POLICY_INVALID_MACH_LOOKUP
+name=bare wildcard allowMachLookup entry is rejected | os=linux,macos | policy={"macos":{"allowMachLookup":["*"]}} | cmd=%SHELL% -c 'printf ok' | status=!0 | out=POLICY_INVALID_MACH_LOOKUP
 
 # --- denyWrite subtrees ---
 
@@ -315,6 +317,10 @@ name=allowRead preserves proc self for brokered reads | os=linux | policy={"netw
 name=allowRead preserves proc self exe and dev fd for brokered reads | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/proc","/dev","/usr","/lib","/lib64","/bin","/sbin","/etc"]}} | cmd=%SHELL% -c 'test -e /proc/self/exe && test -r /proc/self/fd/0 && (test ! -e /dev/fd || test -r /dev/fd/0)' | status=0
 name=restricted read resolves symlinked tmpdir | os=macos | setup=mkdir:sym-read;write:sym-read/hello.txt:hello-symlink\n | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/Users","/home"],"allowWrite":["/dev/null"]}} | cmd=%SHELL% -c 'cat "$1/hello.txt"' _ %TMP%/sym-read | status=0 | out=hello-symlink
 name=restricted read resolves symlinked etc | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/Users","/home"],"allowWrite":["/dev/null"]}} | cmd=/bin/cat /etc/hosts | status=0
+name=default macos policy denies pseudo-tty allocation | os=macos | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"],"allowWrite":["/dev/null"]}} | cmd=/usr/bin/script -q /dev/null /usr/bin/true | status=!0
+name=allowPty permits pseudo-tty allocation | os=macos | policy={"macos":{"allowPty":true},"filesystem":{"denyRead":["/"],"allowRead":["/"],"allowWrite":["/dev/null"]}} | cmd=/usr/bin/script -q /dev/null /usr/bin/true | status=0
+name=allowPty does not override explicit denyReadAlways on ptmx | os=macos | policy={"macos":{"allowPty":true},"filesystem":{"denyReadAlways":["/dev/ptmx"],"allowRead":["/"],"allowWrite":["/dev/null"]}} | cmd=/usr/bin/script -q /dev/null /usr/bin/true | status=!0
+name=macos allowTrustd allowAppleEvents and allowMachLookup run under Seatbelt | os=macos | policy={"macos":{"allowTrustd":true,"allowAppleEvents":true,"allowMachLookup":["com.example.helper","com.example.service.*"]},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'printf ok' | status=0 | out=ok
 
 # --- nonfatal denials stay hidden on success ---
 

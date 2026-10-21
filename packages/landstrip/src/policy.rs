@@ -15,7 +15,7 @@
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
 //! while lowering the policy.
 
-use crate::config::{AppContainerMode, PathSelector, SandboxNetwork, Settings};
+use crate::config::{AppContainerMode, PathSelector, SandboxMacos, SandboxNetwork, Settings};
 use crate::error::{Error, PathIo};
 use crate::paths::{
     NormalizeRoots, PathCoverage, canonicalize_existing_prefix, normalize_path,
@@ -48,6 +48,8 @@ pub(crate) struct AccessPolicy {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) read_symlinks: Vec<PathBuf>,
     pub(crate) network_access: NetworkAccess,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) macos: SandboxMacos,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) app_container_mode: AppContainerMode,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -459,6 +461,7 @@ impl Settings {
             read_denied_always_patterns: read_denied_always_patterns.into_boxed_slice(),
             read_symlinks,
             network_access: lower_network_policy(network, &policy_base, home)?,
+            macos: lower_macos_policy(&self.macos)?,
             app_container_mode: windows.app_container_mode,
             allow_windows_loopback: windows.allow_loopback,
         };
@@ -685,6 +688,25 @@ fn lower_network_policy(
         connect_tcp_ports,
         bind,
         unix_socket_access,
+    })
+}
+
+fn lower_macos_policy(macos: &SandboxMacos) -> Result<SandboxMacos> {
+    let mut allow_mach_lookup = Vec::with_capacity(macos.allow_mach_lookup.len());
+    for service in &macos.allow_mach_lookup {
+        if service.strip_suffix('*').unwrap_or(service).is_empty() {
+            return Err(Error::PolicyInvalidMachLookup.into());
+        }
+        allow_mach_lookup.push(service.clone());
+    }
+    allow_mach_lookup.sort_unstable();
+    allow_mach_lookup.dedup();
+
+    Ok(SandboxMacos {
+        allow_trustd: macos.allow_trustd,
+        allow_mach_lookup,
+        allow_apple_events: macos.allow_apple_events,
+        allow_pty: macos.allow_pty,
     })
 }
 

@@ -84,6 +84,7 @@ pub(crate) enum Error {
     PolicyDenyWriteSymlinkAncestor,
     PolicyInvalidPort,
     PolicyEmptyPath,
+    PolicyInvalidMachLookup,
     PolicyHomeUnavailable,
     PolicyTraversalDepth,
     /// The sandbox could not be installed on the process.
@@ -199,6 +200,9 @@ impl Error {
             }
             Self::PolicyInvalidPort => Some("proxy ports must be between 1 and 65535"),
             Self::PolicyEmptyPath => Some("policy paths must not be empty"),
+            Self::PolicyInvalidMachLookup => {
+                Some("Mach service lookup names must not be empty or bare wildcards")
+            }
             Self::PolicyHomeUnavailable => {
                 Some("the home directory is unavailable for a tilde-prefixed policy path")
             }

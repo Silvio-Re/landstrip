@@ -50,6 +50,7 @@ impl PolicyFormat {
 pub(crate) struct Settings {
     pub(crate) filesystem: SandboxFilesystem,
     pub(crate) network: SandboxNetwork,
+    pub(crate) macos: SandboxMacos,
     pub(crate) windows: SandboxWindows,
 }
 
@@ -108,6 +109,20 @@ pub(crate) struct SandboxNetwork {
     pub(crate) allow_unix_sockets: Vec<PathSelector>,
     pub(crate) http_proxy_port: Option<u16>,
     pub(crate) socks_proxy_port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names match the JSON policy schema"
+)]
+pub(crate) struct SandboxMacos {
+    pub(crate) allow_trustd: bool,
+    #[serde(deserialize_with = "deserialize_strings")]
+    pub(crate) allow_mach_lookup: Vec<String>,
+    pub(crate) allow_apple_events: bool,
+    pub(crate) allow_pty: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -378,6 +393,13 @@ where
 {
     let input = Option::<PathInput>::deserialize(deserializer)?;
     Ok(input.map_or_else(Vec::new, Vec::from))
+}
+
+fn deserialize_strings<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
