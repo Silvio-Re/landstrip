@@ -72,17 +72,27 @@ impl AccessPolicy {
     /// patterns in `write_denied_patterns` are evaluated dynamically against the
     /// lexical path so files created after sandbox startup are also blocked.
     pub(crate) fn is_write_denied(&self, canonical: &Path, lexical: &Path) -> bool {
-        canonical.is_under_any(&self.write_denied_roots)
-            || lexical.is_under_any(&self.write_denied_links)
-            || matches_any_pattern(canonical, &self.write_denied_patterns)
-            || matches_any_pattern(lexical, &self.write_denied_patterns)
+        matches_denied(
+            &self.write_denied_roots,
+            &self.write_denied_patterns,
+            canonical,
+        ) || matches_denied(
+            &self.write_denied_links,
+            &self.write_denied_patterns,
+            lexical,
+        )
     }
 
     pub(crate) fn is_write_denied_always(&self, canonical: &Path, lexical: &Path) -> bool {
-        canonical.is_under_any(&self.write_denied_always_roots)
-            || lexical.is_under_any(&self.write_denied_always_roots)
-            || matches_any_pattern(canonical, &self.write_denied_always_patterns)
-            || matches_any_pattern(lexical, &self.write_denied_always_patterns)
+        matches_denied(
+            &self.write_denied_always_roots,
+            &self.write_denied_always_patterns,
+            canonical,
+        ) || matches_denied(
+            &self.write_denied_always_roots,
+            &self.write_denied_always_patterns,
+            lexical,
+        )
     }
 
     pub(crate) fn is_read_denied(&self, path: &Path) -> bool {
@@ -101,46 +111,35 @@ impl AccessPolicy {
     }
 
     pub(crate) fn is_read_denied_always(&self, path: &Path) -> bool {
-        path.is_under_any(&self.read_denied_always_roots)
-            || matches_any_pattern(path, &self.read_denied_always_patterns)
+        matches_denied(
+            &self.read_denied_always_roots,
+            &self.read_denied_always_patterns,
+            path,
+        )
     }
 
     pub(crate) fn has_read_denied_under(&self, dir: &Path) -> bool {
-        self.read_denied_roots.iter().any(|root| root.is_under(dir))
-            || self
-                .read_denied_patterns
-                .iter()
-                .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
+        has_denied_under(&self.read_denied_roots, &self.read_denied_patterns, dir)
     }
 
     pub(crate) fn has_write_denied_under(&self, dir: &Path) -> bool {
-        self.write_denied_roots
-            .iter()
-            .any(|root| root.is_under(dir))
-            || self
-                .write_denied_patterns
-                .iter()
-                .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
+        has_denied_under(&self.write_denied_roots, &self.write_denied_patterns, dir)
     }
 
     pub(crate) fn has_read_denied_always_under(&self, dir: &Path) -> bool {
-        self.read_denied_always_roots
-            .iter()
-            .any(|root| root.is_under(dir))
-            || self
-                .read_denied_always_patterns
-                .iter()
-                .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
+        has_denied_under(
+            &self.read_denied_always_roots,
+            &self.read_denied_always_patterns,
+            dir,
+        )
     }
 
     pub(crate) fn has_write_denied_always_under(&self, dir: &Path) -> bool {
-        self.write_denied_always_roots
-            .iter()
-            .any(|root| root.is_under(dir))
-            || self
-                .write_denied_always_patterns
-                .iter()
-                .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
+        has_denied_under(
+            &self.write_denied_always_roots,
+            &self.write_denied_always_patterns,
+            dir,
+        )
     }
 
     /// Why a write to `canonical` is mediated, or `None` when the policy permits
@@ -384,7 +383,7 @@ impl Settings {
         // Missing Windows allow roots cannot receive ACL entries. Dropping them is
         // fail-closed because sandbox SIDs receive no access to those paths.
         #[cfg(target_os = "windows")]
-        write_allow.retain(|path| path.try_exists().unwrap_or(false));
+        retain_windows_allow_roots(&mut write_allow);
         let mut resolved_write_deny =
             resolve_deny_paths(&filesystem.deny_write, &policy_base, home)?;
         let mut write_denied_links =
@@ -406,8 +405,7 @@ impl Settings {
 
         let mut read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
         #[cfg(target_os = "windows")]
-        read_allow.retain(|path| path.try_exists().unwrap_or(false));
-
+        retain_windows_allow_roots(&mut read_allow);
         let mut resolved_read_deny = resolve_deny_paths(&filesystem.deny_read, &policy_base, home)?;
         let mut read_denied_roots =
             effective_denied_roots(&resolved_read_deny.concrete, &read_allow);
@@ -421,8 +419,7 @@ impl Settings {
         let read_denied_always_patterns = resolved_read_always.patterns;
         // Windows cannot attach deny entries to missing paths or volume roots.
         #[cfg(target_os = "windows")]
-        read_denied_roots
-            .retain(|path| path.parent().is_some() && path.try_exists().unwrap_or(true));
+        retain_windows_deny_roots(&mut read_denied_roots);
 
         #[cfg(target_os = "windows")]
         let (write_allow, write_deny) = {
@@ -476,21 +473,20 @@ struct ResolvedDenyPaths {
 }
 
 impl ResolvedDenyPaths {
+    fn matches(&self, path: &Path) -> bool {
+        matches_denied(&self.concrete, &self.patterns, path)
+    }
+
     fn carveouts(&self, always: &Self, allow: &[PathBuf]) -> Vec<PathBuf> {
         allow
             .iter()
-            .filter(|path| {
-                !path.is_under_any(&always.concrete)
-                    && !matches_any_pattern(path, &always.patterns)
-                    && matches_any_pattern(path, &self.patterns)
-            })
+            .filter(|path| !always.matches(path) && matches_any_pattern(path, &self.patterns))
             .cloned()
             .collect()
     }
+
     fn merge_always(&mut self, always: &Self, allow: &mut Vec<PathBuf>) {
-        allow.retain(|path| {
-            !path.is_under_any(&always.concrete) && !matches_any_pattern(path, &always.patterns)
-        });
+        allow.retain(|path| !always.matches(path));
         self.concrete.extend(always.concrete.iter().cloned());
         self.concrete.normalize_roots();
         self.patterns.extend(always.patterns.iter().cloned());
@@ -506,19 +502,26 @@ struct WindowsWriteRoots {
 }
 
 #[cfg(target_os = "windows")]
+fn retain_windows_allow_roots(paths: &mut Vec<PathBuf>) {
+    paths.retain(|path| path.try_exists().unwrap_or(false));
+}
+
+#[cfg(target_os = "windows")]
+fn retain_windows_deny_roots(paths: &mut Vec<PathBuf>) {
+    paths.retain(|path| path.parent().is_some() && path.try_exists().unwrap_or(true));
+}
+
+#[cfg(target_os = "windows")]
 fn lower_windows_write_access(
     write_allow: &[PathBuf],
-    write_deny: Vec<PathBuf>,
+    mut write_deny: Vec<PathBuf>,
     read_denied_roots: &[PathBuf],
 ) -> WindowsWriteRoots {
     // Windows ACLs cannot attach deny entries to paths that do not exist or to
     // volume roots. Nested denials under `allowWrite` are enforced by explicit
     // DENY ACEs applied after the write grants so parent directories keep their
     // write permission for sibling creation.
-    let write_deny: Vec<PathBuf> = write_deny
-        .into_iter()
-        .filter(|path| path.parent().is_some() && path.try_exists().unwrap_or(true))
-        .collect();
+    retain_windows_deny_roots(&mut write_deny);
 
     let mut carved_writes: Vec<PathBuf> = write_allow
         .iter()
@@ -771,6 +774,18 @@ fn resolve_deny_paths(
     patterns.dedup();
 
     Ok(ResolvedDenyPaths { concrete, patterns })
+}
+
+fn matches_denied(roots: &[PathBuf], patterns: &[String], path: &Path) -> bool {
+    path.is_under_any(roots) || matches_any_pattern(path, patterns)
+}
+
+#[cfg(target_os = "linux")]
+fn has_denied_under(roots: &[PathBuf], patterns: &[String], dir: &Path) -> bool {
+    roots.iter().any(|root| root.is_under(dir))
+        || patterns
+            .iter()
+            .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
 }
 
 fn matches_any_pattern(path: &Path, patterns: &[String]) -> bool {
