@@ -145,20 +145,25 @@ export interface LandstripControlResponse {
   action: 'allow' | 'deny';
 }
 
+export type LandstripPathSelector =
+  | string
+  | { literal: string }
+  | { glob: string };
+
 export interface LandstripFilesystemPolicy {
-  denyRead?: string[];
-  denyReadAlways?: string[];
-  allowRead?: string[];
-  allowWrite?: string[];
-  denyWrite?: string[];
-  denyWriteAlways?: string[];
+  denyRead?: LandstripPathSelector[];
+  denyReadAlways?: LandstripPathSelector[];
+  allowRead?: LandstripPathSelector[];
+  allowWrite?: LandstripPathSelector[];
+  denyWrite?: LandstripPathSelector[];
+  denyWriteAlways?: LandstripPathSelector[];
 }
 
 export interface LandstripNetworkPolicy {
   allowNetwork?: boolean;
   allowLocalBinding?: boolean;
   allowAllUnixSockets?: boolean;
-  allowUnixSockets?: string[];
+  allowUnixSockets?: LandstripPathSelector[];
   httpProxyPort?: number;
   socksProxyPort?: number;
 }
@@ -227,7 +232,6 @@ export interface SandboxConfigFile {
 }
 
 export type SandboxConfigOverrides = SandboxConfigFile;
-
 
 export type PathAccessDecision = 'allow' | 'ask' | 'deny' | 'denyAlways';
 

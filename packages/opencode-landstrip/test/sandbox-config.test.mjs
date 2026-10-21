@@ -14,6 +14,10 @@ test('mergeArray returns base when override is undefined or empty', () => {
 test('mergeArray merges and deduplicates string arrays', () => {
   assert.deepEqual(mergeArray(['a', 'b'], ['b', 'c', 'd']), ['a', 'b', 'c', 'd']);
   assert.deepEqual(mergeArray([], ['x', 'y']), ['x', 'y']);
+  assert.deepEqual(mergeArray([{ literal: '/a' }], [{ literal: '/a' }, { glob: '/b/*' }]), [
+    { literal: '/a' },
+    { glob: '/b/*' },
+  ]);
 });
 
 test('parseSandboxConfig parses valid config and partial config', () => {

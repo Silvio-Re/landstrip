@@ -418,14 +418,27 @@ function controlResponseLine(queryId, action) {
   return JSON.stringify({ query_id: queryId, action }) + '\n';
 }
 
+function resolvePathSelector(entry, baseDirectory) {
+  if (typeof entry === 'string') {
+    return /[*?[\]]/.test(entry)
+      ? canonicalizeGlobPattern(entry, baseDirectory)
+      : canonicalizePath(entry, baseDirectory);
+  }
+  if (isRecord(entry)) {
+    if (typeof entry.literal === 'string') {
+      return { literal: canonicalizePath(entry.literal, baseDirectory) };
+    }
+    if (typeof entry.glob === 'string') {
+      return { glob: canonicalizeGlobPattern(entry.glob, baseDirectory) };
+    }
+  }
+  return entry;
+}
+
 function resolveFilesystemPatterns(patterns, baseDirectory) {
   if (!patterns || !Array.isArray(patterns)) return [];
   if (!baseDirectory) return [...patterns];
-  return patterns.map((pattern) =>
-    /[*?[\]]/.test(pattern)
-      ? canonicalizeGlobPattern(pattern, baseDirectory)
-      : canonicalizePath(pattern, baseDirectory),
-  );
+  return patterns.map((pattern) => resolvePathSelector(pattern, baseDirectory));
 }
 
 function resolveFilesystemPolicy(filesystem, baseDirectory) {
@@ -552,7 +565,16 @@ function validateStringArrayFields(value, fields, prefix = '') {
 
 function mergeArray(base, override) {
   if (!override) return base;
-  return [...new Set([...(base ?? []), ...override])];
+  const result = [];
+  const seen = new Set();
+  for (const item of [...(base ?? []), ...override]) {
+    const key = typeof item === 'string' ? `s:${item}` : `o:${JSON.stringify(item)}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(item);
+    }
+  }
+  return result;
 }
 
 function parseSandboxConfig(value) {
@@ -729,14 +751,43 @@ function normalizePathForComparison(filePath) {
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
+function resolveSelectorForMatch(pattern, baseDirectory) {
+  if (isRecord(pattern)) {
+    if (typeof pattern.literal === 'string') {
+      return {
+        canonical: canonicalizePath(pattern.literal, baseDirectory),
+        isGlob: false,
+      };
+    }
+    if (typeof pattern.glob === 'string') {
+      const isGlob = /[*?[\]]/.test(pattern.glob);
+      return {
+        canonical: isGlob
+          ? canonicalizeGlobPattern(pattern.glob, baseDirectory)
+          : canonicalizePath(pattern.glob, baseDirectory),
+        isGlob,
+      };
+    }
+  }
+  const raw = String(pattern);
+  const isGlob = /[*?[\]]/.test(raw);
+  return {
+    canonical: isGlob
+      ? canonicalizeGlobPattern(raw, baseDirectory)
+      : canonicalizePath(raw, baseDirectory),
+    isGlob,
+  };
+}
+
 function matchesPathPattern(filePath, patterns, baseDirectory = process.cwd()) {
   if (!Array.isArray(patterns) || patterns.length === 0) return false;
   const abs = normalizePathForComparison(canonicalizePath(filePath, baseDirectory));
 
   return patterns.some((pattern) => {
-    const absPattern = normalizePathForComparison(canonicalizeGlobPattern(pattern, baseDirectory));
+    const { canonical, isGlob } = resolveSelectorForMatch(pattern, baseDirectory);
+    const absPattern = normalizePathForComparison(canonical);
 
-    if (/[*?[\]]/.test(pattern)) {
+    if (isGlob) {
       const matcher = globToRegExp(absPattern);
       for (let candidate = abs; ;) {
         if (matcher.test(candidate)) return true;
@@ -757,7 +808,7 @@ function matchPathSpecificity(filePath, patterns, baseDirectory = process.cwd())
   let best = -1;
   for (const pattern of patterns) {
     if (!matchesPathPattern(filePath, [pattern], baseDirectory)) continue;
-    const canonical = canonicalizeGlobPattern(pattern, baseDirectory);
+    const { canonical } = resolveSelectorForMatch(pattern, baseDirectory);
     if (canonical.length > best) {
       best = canonical.length;
     }

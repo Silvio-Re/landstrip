@@ -40,6 +40,18 @@ test('matchesPathPattern checks path patterns with and without globs', () => {
     matchesPathPattern('/workspace/project/other/test.txt', ['/workspace/project/sub'], cwd),
     false,
   );
+  assert.equal(
+    matchesPathPattern('/workspace/project/[bracket]/file.txt', [{ literal: '[bracket]' }], cwd),
+    true,
+  );
+  assert.equal(
+    matchesPathPattern('/workspace/project/b/file.txt', [{ literal: '[bracket]' }], cwd),
+    false,
+  );
+  assert.equal(
+    matchesPathPattern('/workspace/project/src/index.ts', [{ glob: 'src/*.ts' }], cwd),
+    true,
+  );
 });
 
 test('evaluateReadAccess handles allow, deny, denyAlways, and specificity overrides', () => {

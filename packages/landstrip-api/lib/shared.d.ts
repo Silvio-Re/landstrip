@@ -6,6 +6,7 @@ import type {
   LandstripFilesystemTrap,
   LandstripNetworkPolicy,
   LandstripNetworkTrap,
+  LandstripPathSelector,
   LandstripPolicy,
   LandstripTrap,
   LandstripWindowsPolicy,
@@ -27,6 +28,7 @@ export type LandstripDenialTrap = LandstripFilesystemTrap | LandstripNetworkTrap
 export type LandstripQueryTrap = LandstripDenialTrap & { state: 'query' };
 
 export type {
+  LandstripPathSelector,
   SandboxConfig,
   SandboxConfigFile,
   SandboxConfigOverrides,
@@ -101,10 +103,9 @@ export interface BuildLandstripPolicyOptions {
 }
 
 export function resolveFilesystemPatterns(
-  patterns: string[] | undefined,
+  patterns: LandstripPathSelector[] | undefined,
   baseDirectory?: string,
-): string[];
-
+): LandstripPathSelector[];
 export function resolveFilesystemPolicy(
   filesystem?: LandstripFilesystemPolicy,
   baseDirectory?: string,
@@ -122,8 +123,7 @@ export function writeLandstripPolicyFile(
 ): { dir: string; path: string };
 
 
-export function mergeArray(base: string[], override?: string[]): string[];
-
+export function mergeArray<T = string>(base: T[], override?: T[]): T[];
 export function parseSandboxConfig(value: unknown): SandboxConfigFile;
 
 export function deepMergeSandboxConfig<T extends SandboxConfig = SandboxConfig>(
@@ -153,36 +153,35 @@ export interface EvaluateDomainOptions {
 
 export function matchesPathPattern(
   filePath: string,
-  patterns: string[],
+  patterns: LandstripPathSelector[],
   baseDirectory?: string,
 ): boolean;
 
 export function matchPathSpecificity(
   filePath: string,
-  patterns: string[],
+  patterns: LandstripPathSelector[],
   baseDirectory?: string,
 ): number;
 
 export function isPathReadAllowed(
   filePath: string,
-  allowRead: string[],
-  denyRead: string[],
+  allowRead: LandstripPathSelector[],
+  denyRead: LandstripPathSelector[],
   baseDirectory?: string,
   options?: { requireAllowMatch?: boolean },
 ): boolean;
 
 export function isPathWriteAllowed(
   filePath: string,
-  allowWrite: string[],
+  allowWrite: LandstripPathSelector[],
   baseDirectory?: string,
 ): boolean;
 
 export function shouldPromptForWrite(
   filePath: string,
-  allowWrite: string[],
+  allowWrite: LandstripPathSelector[],
   baseDirectory?: string,
 ): boolean;
-
 export function evaluateReadAccess(
   filePath: string,
   filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile | SandboxConfig | SandboxConfigFile,

@@ -15,6 +15,7 @@ export type {
   LandstripControlResponse,
   LandstripFilesystemPolicy,
   LandstripNetworkPolicy,
+  LandstripPathSelector,
   LandstripPolicy,
   LandstripTrap,
 } from '@landstrip/landstrip-api';

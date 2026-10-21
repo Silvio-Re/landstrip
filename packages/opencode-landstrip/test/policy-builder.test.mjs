@@ -9,12 +9,21 @@ import {
 
 test('resolveFilesystemPatterns canonicalizes paths and glob patterns', () => {
   const baseDir = '/test/base';
-  const patterns = ['relative/file.txt', 'glob/*.js', '/absolute/path'];
+  const patterns = [
+    'relative/file.txt',
+    'glob/*.js',
+    '/absolute/path',
+    { literal: 'dir/[bracket]/file.txt' },
+    { glob: 'nested/**/*.ts' },
+  ];
   const resolved = resolveFilesystemPatterns(patterns, baseDir);
-  assert.equal(resolved.length, 3);
-  assert.equal(resolved[0], '/test/base/relative/file.txt');
-  assert.equal(resolved[1], '/test/base/glob/*.js');
-  assert.equal(resolved[2], '/absolute/path');
+  assert.deepEqual(resolved, [
+    '/test/base/relative/file.txt',
+    '/test/base/glob/*.js',
+    '/absolute/path',
+    { literal: '/test/base/dir/[bracket]/file.txt' },
+    { glob: '/test/base/nested/**/*.ts' },
+  ]);
 });
 
 test('resolveFilesystemPatterns handles undefined or empty inputs', () => {
