@@ -17,9 +17,9 @@ mod unix;
 #[cfg(target_os = "windows")]
 mod windows;
 
+use crate::outcome::DoctorReport;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::outcome::SandboxImplementation;
-use crate::outcome::{CapabilitiesReport, DoctorReport};
 
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
@@ -86,16 +86,7 @@ pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
 #[cfg(target_os = "windows")]
 pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
     let status = windows::status()?;
-    let platform = std::env::consts::OS;
-    let implementation = status.active;
-    let ok = status.healthy;
-    let error = status.error;
-    Ok(DoctorReport {
-        ok,
-        platform,
-        implementation,
-        error,
-    })
+    Ok(DoctorReport::new(status.active, status.error))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -103,24 +94,13 @@ pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
     Err(crate::error::Error::PlatformUnsupported.into())
 }
 
-pub(crate) fn capabilities() -> anyhow::Result<CapabilitiesReport> {
-    doctor().map(CapabilitiesReport::from)
-}
-
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn doctor_report(
     implementation: SandboxImplementation,
     result: anyhow::Result<()>,
 ) -> DoctorReport {
-    let platform = std::env::consts::OS;
-    let (ok, error) = match result {
-        Ok(()) => (true, None),
-        Err(error) => (false, Some(format!("{error:#}"))),
-    };
-    DoctorReport {
-        ok,
-        platform,
+    DoctorReport::new(
         implementation,
-        error,
-    }
+        result.err().map(|error| format!("{error:#}")),
+    )
 }

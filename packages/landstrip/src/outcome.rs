@@ -67,31 +67,28 @@ pub(crate) struct DoctorReport {
     pub(crate) ok: bool,
     pub(crate) platform: &'static str,
     pub(crate) implementation: SandboxImplementation,
+    pub(crate) supported: FeatureCapabilities,
+    pub(crate) available: FeatureCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CapabilitiesReport {
-    pub(crate) platform: &'static str,
-    pub(crate) implementation: SandboxImplementation,
-    pub(crate) supported: FeatureCapabilities,
-    pub(crate) available: FeatureCapabilities,
-}
-
-impl From<DoctorReport> for CapabilitiesReport {
-    fn from(report: DoctorReport) -> Self {
-        let supported = report.implementation.capabilities();
+impl DoctorReport {
+    pub(crate) fn new(implementation: SandboxImplementation, error: Option<String>) -> Self {
+        let ok = error.is_none();
+        let supported = implementation.capabilities();
+        let available = if ok {
+            supported
+        } else {
+            FeatureCapabilities::default()
+        };
         Self {
-            platform: report.platform,
-            implementation: report.implementation,
+            ok,
+            platform: std::env::consts::OS,
+            implementation,
             supported,
-            available: if report.ok {
-                supported
-            } else {
-                FeatureCapabilities::default()
-            },
+            available,
+            error,
         }
     }
 }
@@ -162,7 +159,6 @@ pub(crate) enum CommandOutcome {
     PolicyValidated(PolicyValidationReport),
     PolicyResolved(Box<AccessPolicy>),
     Doctor(DoctorReport),
-    Capabilities(CapabilitiesReport),
     #[cfg(target_os = "windows")]
     Windows(WindowsStatusReport),
 }
@@ -176,7 +172,6 @@ impl CommandOutcome {
             #[cfg(target_os = "windows")]
             Self::Windows(report) => i32::from(!report.healthy),
             Self::PolicyResolved(_) => 0,
-            Self::Capabilities(_) => 0,
         }
     }
 
@@ -186,7 +181,6 @@ impl CommandOutcome {
             Self::PolicyValidated(report) => serde_json::to_writer(&mut output, report)?,
             Self::PolicyResolved(policy) => serde_json::to_writer(&mut output, policy)?,
             Self::Doctor(report) => serde_json::to_writer(&mut output, report)?,
-            Self::Capabilities(report) => serde_json::to_writer(&mut output, report)?,
             #[cfg(target_os = "windows")]
             Self::Windows(report) => serde_json::to_writer(&mut output, report)?,
         }
@@ -215,12 +209,6 @@ impl From<AccessPolicy> for CommandOutcome {
 impl From<DoctorReport> for CommandOutcome {
     fn from(report: DoctorReport) -> Self {
         Self::Doctor(report)
-    }
-}
-
-impl From<CapabilitiesReport> for CommandOutcome {
-    fn from(report: CapabilitiesReport) -> Self {
-        Self::Capabilities(report)
     }
 }
 
