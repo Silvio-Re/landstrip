@@ -33,13 +33,11 @@ impl PolicyFormat {
                 "policy root and filesystem must be objects",
             )));
         }
-        if let Some(paths) = value.pointer_mut("/filesystem/denyReadAlways") {
-            let resolved = deserialize_paths(paths.take()).map_err(Error::parse_failed)?;
-            *paths = serde_json::to_value(resolved).map_err(Error::parse_failed)?;
-        }
-        if let Some(paths) = value.pointer_mut("/filesystem/denyWriteAlways") {
-            let resolved = deserialize_paths(paths.take()).map_err(Error::parse_failed)?;
-            *paths = serde_json::to_value(resolved).map_err(Error::parse_failed)?;
+        for pointer in ["/filesystem/denyReadAlways", "/filesystem/denyWriteAlways"] {
+            if let Some(paths) = value.pointer_mut(pointer) {
+                let resolved = deserialize_paths(paths.take()).map_err(Error::parse_failed)?;
+                *paths = serde_json::to_value(resolved).map_err(Error::parse_failed)?;
+            }
         }
         Ok(value)
     }
@@ -138,12 +136,6 @@ pub(crate) enum AppContainerMode {
 pub(crate) struct SandboxWindows {
     pub(crate) app_container_mode: AppContainerMode,
     pub(crate) allow_loopback: bool,
-    #[serde(
-        rename = "backend",
-        deserialize_with = "reject_windows_backend",
-        skip_serializing
-    )]
-    _removed_backend: (),
 }
 
 pub(crate) fn load_settings(
@@ -195,19 +187,16 @@ fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<V
     let Some(exe) = resolve_executable(tool) else {
         return Ok(None);
     };
+    let context = format!("executable policy {}", exe.display());
 
-    let Some(bytes) =
-        read_policy_bytes(&exe).with_context(|| format!("executable policy {}", exe.display()))?
-    else {
+    let Some(bytes) = read_policy_bytes(&exe).with_context(|| context.clone())? else {
         return Ok(None);
     };
 
     let document = String::from_utf8(bytes)
         .map_err(Error::parse_failed)
-        .with_context(|| format!("executable policy {}", exe.display()))?;
-    let value = format
-        .parse_document(&document)
-        .with_context(|| format!("executable policy {}", exe.display()))?;
+        .with_context(|| context.clone())?;
+    let value = format.parse_document(&document).with_context(|| context)?;
     Ok(Some(value))
 }
 
@@ -373,18 +362,6 @@ unsafe fn platform_getxattr(
     size: libc::size_t,
 ) -> libc::ssize_t {
     unsafe { libc::getxattr(path, name, value, size, 0, 0) }
-}
-
-fn reject_windows_backend<'de, D>(deserializer: D) -> std::result::Result<(), D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
-
-    Err(serde::de::Error::custom(
-        "windows.backend was removed; use `landstrip windows install` or \
-         `landstrip windows uninstall` to select the Windows implementation",
-    ))
 }
 
 fn deserialize_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<PathSelector>, D::Error>
