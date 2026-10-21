@@ -17,7 +17,10 @@
 
 use crate::config::{AppContainerMode, PathSelector, SandboxNetwork, Settings};
 use crate::error::{Error, PathIo};
-use crate::paths::{NormalizeRoots, PathCoverage, normalize_path, normalize_path_lexically};
+use crate::paths::{
+    NormalizeRoots, PathCoverage, canonicalize_existing_prefix, normalize_path,
+    normalize_path_lexically,
+};
 use anyhow::Result;
 use serde::Serialize;
 use std::env;
@@ -38,6 +41,8 @@ pub(crate) struct AccessPolicy {
     pub(crate) write_denied_links: Vec<PathBuf>,
     pub(crate) read_access: ReadAccess,
     pub(crate) read_denied_roots: Vec<PathBuf>,
+    pub(crate) read_denied_patterns: Vec<String>,
+    pub(crate) read_carveouts: Vec<PathBuf>,
     pub(crate) read_denied_always_roots: Box<[PathBuf]>,
     pub(crate) read_denied_always_patterns: Box<[String]>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -78,9 +83,42 @@ impl AccessPolicy {
             || matches_any_pattern(lexical, &self.write_denied_always_patterns)
     }
 
+    pub(crate) fn is_read_denied(&self, path: &Path) -> bool {
+        path.is_under_any(&self.read_denied_roots)
+            || self.is_read_denied_always(path)
+            || self.read_denied_patterns.iter().any(|pattern| {
+                let glob = GlobPattern::new(pattern);
+                path.ancestors().any(|ancestor| glob.matches_path(ancestor))
+                    && !self.read_carveouts.iter().any(|carveout| {
+                        path.is_under(carveout)
+                            && carveout
+                                .ancestors()
+                                .any(|ancestor| glob.matches_path(ancestor))
+                    })
+            })
+    }
+
     pub(crate) fn is_read_denied_always(&self, path: &Path) -> bool {
         path.is_under_any(&self.read_denied_always_roots)
             || matches_any_pattern(path, &self.read_denied_always_patterns)
+    }
+
+    pub(crate) fn has_read_denied_under(&self, dir: &Path) -> bool {
+        self.read_denied_roots.iter().any(|root| root.is_under(dir))
+            || self
+                .read_denied_patterns
+                .iter()
+                .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
+    }
+
+    pub(crate) fn has_write_denied_under(&self, dir: &Path) -> bool {
+        self.write_denied_roots
+            .iter()
+            .any(|root| root.is_under(dir))
+            || self
+                .write_denied_patterns
+                .iter()
+                .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
     }
 
     pub(crate) fn has_read_denied_always_under(&self, dir: &Path) -> bool {
@@ -127,7 +165,7 @@ impl AccessPolicy {
         match &self.read_access {
             ReadAccess::Unrestricted => None,
             ReadAccess::AllowRoots(roots) => {
-                if path.is_under_any(&self.read_denied_roots) || self.is_read_denied_always(path) {
+                if self.is_read_denied(path) {
                     Some(DenialReason::DenyMatch)
                 } else if path.is_under_any(roots) {
                     None
@@ -345,24 +383,17 @@ impl Settings {
         // fail-closed because sandbox SIDs receive no access to those paths.
         #[cfg(target_os = "windows")]
         write_allow.retain(|path| path.try_exists().unwrap_or(false));
-        let resolved_deny = resolve_deny_paths(&filesystem.deny_write, &policy_base, home, false)?;
-        let mut write_deny = resolved_deny.concrete;
-        let mut write_denied_patterns = resolved_deny.patterns;
+        let mut resolved_write_deny =
+            resolve_deny_paths(&filesystem.deny_write, &policy_base, home)?;
         let mut write_denied_links =
             collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
         let resolved_write_always =
-            resolve_deny_paths(&filesystem.deny_write_always, &policy_base, home, true)?;
+            resolve_deny_paths(&filesystem.deny_write_always, &policy_base, home)?;
+        resolved_write_deny.merge_always(&resolved_write_always, &mut write_allow);
+        let write_deny = resolved_write_deny.concrete;
+        let write_denied_patterns = resolved_write_deny.patterns;
         let write_denied_always_roots = resolved_write_always.concrete;
         let write_denied_always_patterns = resolved_write_always.patterns;
-        write_allow.retain(|path| {
-            !path.is_under_any(&write_denied_always_roots)
-                && !matches_any_pattern(path, &write_denied_always_patterns)
-        });
-        write_deny.extend(write_denied_always_roots.iter().cloned());
-        write_deny.normalize_roots();
-        write_denied_patterns.extend(write_denied_always_patterns.iter().cloned());
-        write_denied_patterns.sort_unstable();
-        write_denied_patterns.dedup();
         write_denied_links.extend(collect_symlink_ancestors(
             &filesystem.deny_write_always,
             &policy_base,
@@ -375,18 +406,25 @@ impl Settings {
         #[cfg(target_os = "windows")]
         read_allow.retain(|path| path.try_exists().unwrap_or(false));
 
-        let mut read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
-        let mut read_denied_roots = effective_denied_roots(&read_deny, &read_allow);
+        let mut resolved_read_deny = resolve_deny_paths(&filesystem.deny_read, &policy_base, home)?;
+        let mut read_denied_roots =
+            effective_denied_roots(&resolved_read_deny.concrete, &read_allow);
         let resolved_read_always =
-            resolve_deny_paths(&filesystem.deny_read_always, &policy_base, home, true)?;
+            resolve_deny_paths(&filesystem.deny_read_always, &policy_base, home)?;
+        let read_carveouts: Vec<PathBuf> = read_allow
+            .iter()
+            .filter(|allow| {
+                !allow.is_under_any(&resolved_read_always.concrete)
+                    && !matches_any_pattern(allow, &resolved_read_always.patterns)
+                    && matches_any_pattern(allow, &resolved_read_deny.patterns)
+            })
+            .cloned()
+            .collect();
+        resolved_read_deny.merge_always(&resolved_read_always, &mut read_allow);
+        let read_deny = resolved_read_deny.concrete;
+        let read_denied_patterns = resolved_read_deny.patterns;
         let read_denied_always_roots = resolved_read_always.concrete;
         let read_denied_always_patterns = resolved_read_always.patterns;
-        read_allow.retain(|path| {
-            !path.is_under_any(&read_denied_always_roots)
-                && !matches_any_pattern(path, &read_denied_always_patterns)
-        });
-        read_deny.extend(read_denied_always_roots.iter().cloned());
-        read_deny.normalize_roots();
         // Windows cannot attach deny entries to missing paths.
         #[cfg(target_os = "windows")]
         read_denied_roots.retain(|path| path.try_exists().unwrap_or(true));
@@ -400,7 +438,7 @@ impl Settings {
         let lowered_read = lower_read_access(
             &read_allow,
             &read_deny,
-            &read_denied_always_patterns,
+            &read_denied_patterns,
             &mut read_denied_roots,
         )?;
         let (read_access, read_symlinks) = (lowered_read.access, lowered_read.symlinks);
@@ -415,6 +453,8 @@ impl Settings {
             write_denied_links,
             read_access,
             read_denied_roots,
+            read_denied_patterns,
+            read_carveouts,
             read_denied_always_roots: read_denied_always_roots.into_boxed_slice(),
             read_denied_always_patterns: read_denied_always_patterns.into_boxed_slice(),
             read_symlinks,
@@ -436,6 +476,19 @@ struct LoweredReadAccess {
 struct ResolvedDenyPaths {
     concrete: Vec<PathBuf>,
     patterns: Vec<String>,
+}
+
+impl ResolvedDenyPaths {
+    fn merge_always(&mut self, always: &Self, allow: &mut Vec<PathBuf>) {
+        allow.retain(|path| {
+            !path.is_under_any(&always.concrete) && !matches_any_pattern(path, &always.patterns)
+        });
+        self.concrete.extend(always.concrete.iter().cloned());
+        self.concrete.normalize_roots();
+        self.patterns.extend(always.patterns.iter().cloned());
+        self.patterns.sort_unstable();
+        self.patterns.dedup();
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -501,7 +554,7 @@ fn lower_windows_write_access(
 fn lower_read_access(
     read_allow: &[PathBuf],
     read_deny: &[PathBuf],
-    read_denied_always_patterns: &[String],
+    read_denied_patterns: &[String],
     read_denied_roots: &mut Vec<PathBuf>,
 ) -> Result<LoweredReadAccess> {
     let fs_root = normalize_path(Path::new("/"));
@@ -512,12 +565,13 @@ fn lower_read_access(
         return Err(Error::PolicyUnrestrictedRead.into());
     }
 
-    if read_deny.is_empty() && read_denied_always_patterns.is_empty() {
+    let has_dynamic_patterns = cfg!(not(target_os = "windows")) && !read_denied_patterns.is_empty();
+    if read_deny.is_empty() && !has_dynamic_patterns {
         Ok(LoweredReadAccess {
             access: ReadAccess::Unrestricted,
             symlinks: Vec::new(),
         })
-    } else if read_deny.is_empty()
+    } else if (has_dynamic_patterns && read_deny.is_empty())
         || (read_allow.contains(&fs_root)
             && !read_deny
                 .iter()
@@ -669,7 +723,6 @@ fn resolve_deny_paths(
     paths: &[PathSelector],
     policy_base: &Path,
     home: Option<&Path>,
-    expand_existing: bool,
 ) -> Result<ResolvedDenyPaths> {
     let mut concrete: Vec<PathBuf> = Vec::new();
     let mut patterns: Vec<String> = Vec::new();
@@ -678,23 +731,20 @@ fn resolve_deny_paths(
         let resolved = resolve_sandbox_path(selector.as_str(), policy_base, home)?;
         let resolved_str = resolved.to_string_lossy();
         if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
-            if expand_existing {
-                for candidate in GlobPattern::new(&resolved_str).expand()? {
-                    push_path_variants(&mut concrete, &candidate);
-                }
+            for candidate in GlobPattern::new(&resolved_str).expand()? {
+                push_path_variants(&mut concrete, &candidate);
             }
             patterns.push(resolved_str.clone().into_owned());
             let base = GlobPattern::new(&resolved_str).base();
-            if let Ok(canonical) = fs::canonicalize(&base) {
-                let base_str = base.to_string_lossy();
-                let canonical_str = canonical.to_string_lossy();
-                if canonical_str != base_str
-                    && let Some(suffix) = resolved_str.strip_prefix(base_str.as_ref())
-                {
-                    let mut canonical_pattern = canonical_str.into_owned();
-                    canonical_pattern.push_str(suffix);
-                    patterns.push(canonical_pattern);
-                }
+            let canonical = normalize_path_lexically(&canonicalize_existing_prefix(&base));
+            let base_str = base.to_string_lossy();
+            let canonical_str = canonical.to_string_lossy();
+            if canonical_str != base_str
+                && let Some(suffix) = resolved_str.strip_prefix(base_str.as_ref())
+            {
+                let mut canonical_pattern = canonical_str.into_owned();
+                canonical_pattern.push_str(suffix);
+                patterns.push(canonical_pattern);
             }
         } else {
             push_path_variants(&mut concrete, &resolved);
@@ -846,9 +896,9 @@ fn collect_symlink_ancestors(
 #[cfg(target_os = "macos")]
 fn push_path_variants(paths: &mut Vec<PathBuf>, path: &Path) {
     paths.push(normalize_path_lexically(path));
-    if let Ok(canonical) = fs::canonicalize(path) {
-        paths.push(normalize_path_lexically(&canonical));
-    }
+    paths.push(normalize_path_lexically(&canonicalize_existing_prefix(
+        path,
+    )));
 }
 
 #[cfg(not(target_os = "macos"))]

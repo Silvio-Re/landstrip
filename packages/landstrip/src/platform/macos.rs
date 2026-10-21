@@ -5,7 +5,8 @@
 
 use super::unix::close_inherited_fds;
 use crate::error::Error;
-use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
+use crate::paths::PathCoverage;
+use crate::policy::{AccessPolicy, GlobPattern, NetworkAccess, ReadAccess, UnixSocketAccess};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -74,19 +75,8 @@ fn render_profile(policy: &AccessPolicy) -> std::result::Result<String, fmt::Err
 
     render_process_rules(&mut sb)?;
     render_mach_rules(&mut sb)?;
-    render_write_rules(
-        &mut sb,
-        &policy.write_roots,
-        &policy.write_denied_roots,
-        &policy.write_denied_patterns,
-    )?;
-    render_read_rules(
-        &mut sb,
-        &policy.read_access,
-        &policy.read_denied_roots,
-        &policy.read_denied_always_patterns,
-        &policy.read_symlinks,
-    )?;
+    render_write_rules(&mut sb, policy)?;
+    render_read_rules(&mut sb, policy)?;
     render_network_rules(&mut sb, &policy.network_access)?;
 
     Ok(sb)
@@ -199,43 +189,101 @@ fn glob_to_sbpl_regex(pattern: &str) -> String {
     regex
 }
 
-fn render_write_rules(
-    sb: &mut String,
-    write_roots: &[PathBuf],
-    write_denied_roots: &[PathBuf],
-    write_denied_patterns: &[String],
-) -> fmt::Result {
-    for root in write_roots {
+fn render_pattern_filter(pattern: &str, carveouts: &[PathBuf]) -> String {
+    let regex = glob_to_sbpl_regex(pattern);
+    let escaped = escape_sbpl_regex_literal(&regex);
+    let glob = GlobPattern::new(pattern);
+    let filter = format!("(regex #\"{escaped}\")");
+    let matching_carveouts: Vec<&Path> = carveouts
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|carveout| {
+            carveout
+                .ancestors()
+                .any(|ancestor| glob.matches_path(ancestor))
+        })
+        .collect();
+    if matching_carveouts.is_empty() {
+        return filter;
+    }
+
+    let mut wrapped = format!("(require-all {filter}");
+    for carveout in matching_carveouts {
+        let escaped_carveout = escape_sbpl_literal(&carveout.to_string_lossy());
+        let _ = write!(wrapped, " (require-not (subpath \"{escaped_carveout}\"))");
+    }
+    wrapped.push(')');
+    wrapped
+}
+
+fn render_write_rules(sb: &mut String, policy: &AccessPolicy) -> fmt::Result {
+    for root in &policy.write_roots {
         let escaped = escape_sbpl_literal(&root.to_string_lossy());
         writeln!(sb, "(allow file-write* (subpath \"{escaped}\"))")?;
     }
 
     // Deny rules follow the allow rules so SBPL's last-match-wins precedence
     // subtracts the denied subtrees from the granted write roots.
-    for root in write_denied_roots {
+    for root in &policy.write_denied_roots {
         let escaped = escape_sbpl_literal(&root.to_string_lossy());
         writeln!(sb, "(deny file-write* (subpath \"{escaped}\"))")?;
     }
 
     // Regex rules are evaluated at syscall time, so unlike expand_glob_path
     // they also cover paths created after sandbox_init.
-    for pattern in write_denied_patterns {
+    for pattern in &policy.write_denied_patterns {
         let regex = glob_to_sbpl_regex(pattern);
         let escaped = escape_sbpl_regex_literal(&regex);
         writeln!(sb, "(deny file-write* (regex #\"{escaped}\"))")?;
     }
 
+    if !policy.write_roots.is_empty() {
+        for root in &policy.read_denied_roots {
+            let escaped = escape_sbpl_literal(&root.to_string_lossy());
+            writeln!(sb, "(deny file-write-unlink (subpath \"{escaped}\"))")?;
+        }
+        for pattern in &policy.read_denied_patterns {
+            let filter = render_pattern_filter(pattern, &policy.read_carveouts);
+            writeln!(sb, "(deny file-write-unlink {filter})")?;
+        }
+
+        let mut ancestors: Vec<PathBuf> = Vec::new();
+        for root in policy
+            .write_denied_roots
+            .iter()
+            .chain(policy.read_denied_roots.iter())
+        {
+            for ancestor in root.ancestors().skip(1) {
+                if ancestor != Path::new("/") && ancestor.is_under_any(&policy.write_roots) {
+                    ancestors.push(ancestor.to_path_buf());
+                }
+            }
+        }
+        for pattern in policy
+            .write_denied_patterns
+            .iter()
+            .chain(policy.read_denied_patterns.iter())
+        {
+            let base = GlobPattern::new(pattern).base();
+            for ancestor in base.ancestors() {
+                if ancestor != Path::new("/") && ancestor.is_under_any(&policy.write_roots) {
+                    ancestors.push(ancestor.to_path_buf());
+                }
+            }
+        }
+        ancestors.sort_unstable();
+        ancestors.dedup();
+        for ancestor in &ancestors {
+            let escaped = escape_sbpl_literal(&ancestor.to_string_lossy());
+            writeln!(sb, "(deny file-write-unlink (literal \"{escaped}\"))")?;
+        }
+    }
+
     Ok(())
 }
 
-fn render_read_rules(
-    sb: &mut String,
-    read_access: &ReadAccess,
-    read_denied_roots: &[PathBuf],
-    read_denied_patterns: &[String],
-    read_symlinks: &[PathBuf],
-) -> fmt::Result {
-    match read_access {
+fn render_read_rules(sb: &mut String, policy: &AccessPolicy) -> fmt::Result {
+    match &policy.read_access {
         ReadAccess::Unrestricted => sb.push_str("(allow file-read*)\n"),
         ReadAccess::AllowRoots(roots) => {
             writeln!(sb, "(deny file-read*)")?;
@@ -246,20 +294,19 @@ fn render_read_rules(
             }
             render_parent_dir_rules(sb, roots)?;
 
-            render_symlink_metadata_rules(sb, read_symlinks)?;
-
-            // Deny rules follow the allow rules so SBPL's last-match-wins
-            // precedence subtracts the denied subtrees from the read roots.
-            for root in read_denied_roots {
-                let escaped = escape_sbpl_literal(&root.to_string_lossy());
-                writeln!(sb, "(deny file-read* (subpath \"{escaped}\"))")?;
-            }
-            for pattern in read_denied_patterns {
-                let regex = glob_to_sbpl_regex(pattern);
-                let escaped = escape_sbpl_regex_literal(&regex);
-                writeln!(sb, "(deny file-read* (regex #\"{escaped}\"))")?;
-            }
+            render_symlink_metadata_rules(sb, &policy.read_symlinks)?;
         }
+    }
+
+    // Deny rules follow the allow rules so SBPL's last-match-wins
+    // precedence subtracts the denied subtrees from the read grants.
+    for root in &policy.read_denied_roots {
+        let escaped = escape_sbpl_literal(&root.to_string_lossy());
+        writeln!(sb, "(deny file-read* (subpath \"{escaped}\"))")?;
+    }
+    for pattern in &policy.read_denied_patterns {
+        let filter = render_pattern_filter(pattern, &policy.read_carveouts);
+        writeln!(sb, "(deny file-read* {filter})")?;
     }
 
     Ok(())

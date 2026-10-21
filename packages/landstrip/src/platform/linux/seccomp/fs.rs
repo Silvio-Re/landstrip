@@ -659,6 +659,11 @@ pub(super) fn handle_openat(
     if wants_read
         && let Some(reason) = policy
             .read_reason(&resolved)
+            .or_else(|| {
+                policy
+                    .is_read_denied(&lexical)
+                    .then_some(DenialReason::DenyMatch)
+            })
             .or_else(|| hard_read_denied.then_some(DenialReason::DenyMatch))
     {
         return deny_open(
@@ -697,12 +702,29 @@ fn reparent_read_denial(
     if !spec.kind.is_reparent() {
         return None;
     }
+    let read_denial = |target: &ResolvedPath| {
+        policy.read_reason(&target.label).or_else(|| {
+            policy
+                .has_read_denied_under(&target.label)
+                .then_some(DenialReason::DenyMatch)
+        })
+    };
     let (source, _) = paths.first()?;
-    let reason = policy.read_reason(&source.label)?;
-    let dest_readable = paths
-        .get(1)
-        .is_none_or(|(dest, _)| policy.read_reason(&dest.label).is_none());
-    dest_readable.then_some((0, reason, TrapOperation::Read))
+    if let Some(reason) = read_denial(source) {
+        let dest_readable = paths
+            .get(1)
+            .is_none_or(|(dest, _)| policy.read_reason(&dest.label).is_none());
+        if dest_readable {
+            return Some((0, reason, TrapOperation::Read));
+        }
+    }
+    if let Some((dest, _)) = paths.get(1)
+        && let Some(reason) = read_denial(dest)
+        && policy.read_reason(&source.label).is_none()
+    {
+        return Some((1, reason, TrapOperation::Read));
+    }
+    None
 }
 
 fn validate_mutation_flags(kind: MutationSyscall, args: &[u64; 6]) -> SysResult<()> {
@@ -799,6 +821,10 @@ pub(super) fn handle_mutation(
         let lexical = normalize_path_lexically(&target.raw);
         if let Some(reason) = policy.write_reason(&target.label, &lexical, true) {
             denial = Some((index, reason, TrapOperation::Write));
+            break;
+        }
+        if spec.kind.is_reparent() && policy.has_write_denied_under(&target.label) {
+            denial = Some((index, DenialReason::DenyMatch, TrapOperation::Write));
             break;
         }
     }
