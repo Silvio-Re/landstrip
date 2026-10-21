@@ -9,7 +9,7 @@ use super::grant::{
 use super::notify::NotificationResult;
 use super::process::{ResolvedPath, TargetProcess};
 use super::supervise::{Denial, Denials};
-use crate::paths::{PathCoverage, normalize_path_lexically};
+use crate::paths::normalize_path_lexically;
 use crate::policy::{AccessPolicy, DenialReason};
 use crate::trap::{FilesystemDenial, Trap, TrapOperation};
 use std::io::IoSliceMut;
@@ -621,8 +621,10 @@ pub(super) fn handle_openat(
     let wants_write = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0;
     let reports_write = flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) != 0;
     let wants_read = flags & libc::O_WRONLY == 0;
-    let hard_read_denied = wants_read && resolved.is_under_any(&policy.read_denied_always_roots);
-    let hard_write_denied = wants_write && resolved.is_under_any(&policy.write_denied_always_roots);
+    let lexical = normalize_path_lexically(&raw);
+    let hard_read_denied = wants_read
+        && (policy.is_read_denied_always(&resolved) || policy.is_read_denied_always(&lexical));
+    let hard_write_denied = wants_write && policy.is_write_denied_always(&resolved, &lexical);
     let query_enabled = query_enabled && !hard_read_denied && !hard_write_denied;
     // Hard policy denials still apply to future descendants with missing parents.
     if !hard_read_denied
@@ -635,7 +637,7 @@ pub(super) fn handle_openat(
 
     if wants_write
         && !hard_read_denied
-        && let Some(reason) = policy.write_reason(&resolved, &normalize_path_lexically(&raw), true)
+        && let Some(reason) = policy.write_reason(&resolved, &lexical, true)
     {
         return deny_open(
             OpenDenial {
@@ -654,7 +656,11 @@ pub(super) fn handle_openat(
             next_query_id,
         );
     }
-    if wants_read && let Some(reason) = policy.read_reason(&resolved) {
+    if wants_read
+        && let Some(reason) = policy
+            .read_reason(&resolved)
+            .or_else(|| hard_read_denied.then_some(DenialReason::DenyMatch))
+    {
         return deny_open(
             OpenDenial {
                 operation: TrapOperation::Read,
@@ -801,21 +807,17 @@ pub(super) fn handle_mutation(
         .is_reparent()
         .then(|| {
             paths.iter().position(|(target, _)| {
-                target.label.is_under_any(&policy.read_denied_always_roots)
-                    || policy
-                        .read_denied_always_roots
-                        .iter()
-                        .any(|root| root.is_under(&target.label))
+                let lexical = normalize_path_lexically(&target.raw);
+                policy.is_read_denied_always(&target.label)
+                    || policy.is_read_denied_always(&lexical)
+                    || policy.has_read_denied_always_under(&target.label)
             })
         })
         .flatten();
     let hard_write_denial = paths.iter().position(|(target, _)| {
-        target.label.is_under_any(&policy.write_denied_always_roots)
-            || (spec.kind.is_reparent()
-                && policy
-                    .write_denied_always_roots
-                    .iter()
-                    .any(|root| root.is_under(&target.label)))
+        let lexical = normalize_path_lexically(&target.raw);
+        policy.is_write_denied_always(&target.label, &lexical)
+            || (spec.kind.is_reparent() && policy.has_write_denied_always_under(&target.label))
     });
     let query_enabled = query_enabled && hard_read_denial.is_none() && hard_write_denial.is_none();
     denial = hard_read_denial
@@ -946,7 +948,7 @@ fn handle_fd_mutation(
     };
     let resolved = requested_path.clone();
     let lexical = normalize_path_lexically(&requested_path);
-    let hard_write_denied = resolved.is_under_any(&policy.write_denied_always_roots);
+    let hard_write_denied = policy.is_write_denied_always(&resolved, &lexical);
     let query_enabled = query_enabled && !hard_write_denied;
     let reason = policy.write_reason(&resolved, &lexical, true);
     let operation = MutationGrant::Fd { target, mutation };

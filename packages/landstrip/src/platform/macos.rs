@@ -84,6 +84,7 @@ fn render_profile(policy: &AccessPolicy) -> std::result::Result<String, fmt::Err
         &mut sb,
         &policy.read_access,
         &policy.read_denied_roots,
+        &policy.read_denied_always_patterns,
         &policy.read_symlinks,
     )?;
     render_network_rules(&mut sb, &policy.network_access)?;
@@ -191,6 +192,9 @@ fn glob_to_sbpl_regex(pattern: &str) -> String {
         }
     }
 
+    if !pattern.ends_with('/') {
+        regex.push_str("(/.*)?");
+    }
     regex.push('$');
     regex
 }
@@ -228,6 +232,7 @@ fn render_read_rules(
     sb: &mut String,
     read_access: &ReadAccess,
     read_denied_roots: &[PathBuf],
+    read_denied_patterns: &[String],
     read_symlinks: &[PathBuf],
 ) -> fmt::Result {
     match read_access {
@@ -248,6 +253,11 @@ fn render_read_rules(
             for root in read_denied_roots {
                 let escaped = escape_sbpl_literal(&root.to_string_lossy());
                 writeln!(sb, "(deny file-read* (subpath \"{escaped}\"))")?;
+            }
+            for pattern in read_denied_patterns {
+                let regex = glob_to_sbpl_regex(pattern);
+                let escaped = escape_sbpl_regex_literal(&regex);
+                writeln!(sb, "(deny file-read* (regex #\"{escaped}\"))")?;
             }
         }
     }

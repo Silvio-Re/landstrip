@@ -35,11 +35,11 @@ impl PolicyFormat {
         }
         if let Some(paths) = value.pointer_mut("/filesystem/denyReadAlways") {
             let resolved = deserialize_paths(paths.take()).map_err(Error::parse_failed)?;
-            *paths = Value::Array(resolved.into_iter().map(Value::String).collect());
+            *paths = serde_json::to_value(resolved).map_err(Error::parse_failed)?;
         }
         if let Some(paths) = value.pointer_mut("/filesystem/denyWriteAlways") {
             let resolved = deserialize_paths(paths.take()).map_err(Error::parse_failed)?;
-            *paths = Value::Array(resolved.into_iter().map(Value::String).collect());
+            *paths = serde_json::to_value(resolved).map_err(Error::parse_failed)?;
         }
         Ok(value)
     }
@@ -53,21 +53,49 @@ pub(crate) struct Settings {
     pub(crate) windows: SandboxWindows,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub(crate) enum PathSelector {
+    Literal { literal: String },
+    Glob { glob: String },
+    Bare(String),
+}
+
+impl PathSelector {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Literal { literal } | Self::Glob { glob: literal } | Self::Bare(literal) => {
+                literal
+            }
+        }
+    }
+
+    pub(crate) fn is_literal(&self) -> bool {
+        matches!(self, Self::Literal { .. })
+    }
+}
+
+impl AsRef<str> for PathSelector {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct SandboxFilesystem {
     #[serde(deserialize_with = "deserialize_paths")]
-    pub(crate) allow_write: Vec<String>,
+    pub(crate) allow_write: Vec<PathSelector>,
     #[serde(deserialize_with = "deserialize_paths")]
-    pub(crate) deny_write: Vec<String>,
+    pub(crate) deny_write: Vec<PathSelector>,
     #[serde(deserialize_with = "deserialize_paths")]
-    pub(crate) allow_read: Vec<String>,
+    pub(crate) allow_read: Vec<PathSelector>,
     #[serde(deserialize_with = "deserialize_paths")]
-    pub(crate) deny_read: Vec<String>,
+    pub(crate) deny_read: Vec<PathSelector>,
     #[serde(deserialize_with = "deserialize_paths")]
-    pub(crate) deny_read_always: Vec<String>,
+    pub(crate) deny_read_always: Vec<PathSelector>,
     #[serde(deserialize_with = "deserialize_paths")]
-    pub(crate) deny_write_always: Vec<String>,
+    pub(crate) deny_write_always: Vec<PathSelector>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -77,7 +105,7 @@ pub(crate) struct SandboxNetwork {
     pub(crate) allow_local_binding: bool,
     pub(crate) allow_all_unix_sockets: bool,
     #[serde(deserialize_with = "deserialize_paths")]
-    pub(crate) allow_unix_sockets: Vec<String>,
+    pub(crate) allow_unix_sockets: Vec<PathSelector>,
     pub(crate) http_proxy_port: Option<u16>,
     pub(crate) socks_proxy_port: Option<u16>,
 }
@@ -344,7 +372,7 @@ where
     ))
 }
 
-fn deserialize_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+fn deserialize_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<PathSelector>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -355,11 +383,11 @@ where
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum PathInput {
-    List(Vec<String>),
+    List(Vec<PathSelector>),
     Lines(String),
 }
 
-impl From<PathInput> for Vec<String> {
+impl From<PathInput> for Vec<PathSelector> {
     fn from(input: PathInput) -> Self {
         match input {
             PathInput::List(paths) => paths,
@@ -367,7 +395,7 @@ impl From<PathInput> for Vec<String> {
                 .lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
-                .map(ToOwned::to_owned)
+                .map(|line| PathSelector::Bare(line.to_owned()))
                 .collect(),
         }
     }

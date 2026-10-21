@@ -15,7 +15,7 @@
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
 //! while lowering the policy.
 
-use crate::config::{AppContainerMode, SandboxNetwork, Settings};
+use crate::config::{AppContainerMode, PathSelector, SandboxNetwork, Settings};
 use crate::error::{Error, PathIo};
 use crate::paths::{NormalizeRoots, PathCoverage, normalize_path, normalize_path_lexically};
 use anyhow::Result;
@@ -33,11 +33,13 @@ pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
     pub(crate) write_denied_roots: Vec<PathBuf>,
     pub(crate) write_denied_always_roots: Box<[PathBuf]>,
+    pub(crate) write_denied_always_patterns: Box<[String]>,
     pub(crate) write_denied_patterns: Vec<String>,
     pub(crate) write_denied_links: Vec<PathBuf>,
     pub(crate) read_access: ReadAccess,
     pub(crate) read_denied_roots: Vec<PathBuf>,
     pub(crate) read_denied_always_roots: Box<[PathBuf]>,
+    pub(crate) read_denied_always_patterns: Box<[String]>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) read_symlinks: Vec<PathBuf>,
     pub(crate) network_access: NetworkAccess,
@@ -65,10 +67,40 @@ impl AccessPolicy {
     pub(crate) fn is_write_denied(&self, canonical: &Path, lexical: &Path) -> bool {
         canonical.is_under_any(&self.write_denied_roots)
             || lexical.is_under_any(&self.write_denied_links)
+            || matches_any_pattern(canonical, &self.write_denied_patterns)
+            || matches_any_pattern(lexical, &self.write_denied_patterns)
+    }
+
+    pub(crate) fn is_write_denied_always(&self, canonical: &Path, lexical: &Path) -> bool {
+        canonical.is_under_any(&self.write_denied_always_roots)
+            || lexical.is_under_any(&self.write_denied_always_roots)
+            || matches_any_pattern(canonical, &self.write_denied_always_patterns)
+            || matches_any_pattern(lexical, &self.write_denied_always_patterns)
+    }
+
+    pub(crate) fn is_read_denied_always(&self, path: &Path) -> bool {
+        path.is_under_any(&self.read_denied_always_roots)
+            || matches_any_pattern(path, &self.read_denied_always_patterns)
+    }
+
+    pub(crate) fn has_read_denied_always_under(&self, dir: &Path) -> bool {
+        self.read_denied_always_roots
+            .iter()
+            .any(|root| root.is_under(dir))
             || self
-                .write_denied_patterns
+                .read_denied_always_patterns
                 .iter()
-                .any(|pattern| GlobPattern::new(pattern).matches_path(lexical))
+                .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
+    }
+
+    pub(crate) fn has_write_denied_always_under(&self, dir: &Path) -> bool {
+        self.write_denied_always_roots
+            .iter()
+            .any(|root| root.is_under(dir))
+            || self
+                .write_denied_always_patterns
+                .iter()
+                .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
     }
 
     /// Why a write to `canonical` is mediated, or `None` when the policy permits
@@ -95,7 +127,7 @@ impl AccessPolicy {
         match &self.read_access {
             ReadAccess::Unrestricted => None,
             ReadAccess::AllowRoots(roots) => {
-                if path.is_under_any(&self.read_denied_roots) {
+                if path.is_under_any(&self.read_denied_roots) || self.is_read_denied_always(path) {
                     Some(DenialReason::DenyMatch)
                 } else if path.is_under_any(roots) {
                     None
@@ -162,6 +194,7 @@ impl AccessPolicy {
         if network.allows_local_binding() {
             return Err(Error::PolicyLocalBindingUnsupported);
         }
+
         Ok(())
     }
 }
@@ -307,48 +340,51 @@ impl Settings {
         };
         let policy_base = normalize_path_lexically(&policy_base);
 
-        let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
+        let mut write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
         // Missing Windows allow roots cannot receive ACL entries. Dropping them is
         // fail-closed because sandbox SIDs receive no access to those paths.
         #[cfg(target_os = "windows")]
-        let write_allow = write_allow
-            .into_iter()
-            .filter(|path| path.try_exists().unwrap_or(false))
-            .collect::<Vec<_>>();
-        let resolved_deny = resolve_deny_paths(&filesystem.deny_write, &policy_base, home)?;
+        write_allow.retain(|path| path.try_exists().unwrap_or(false));
+        let resolved_deny = resolve_deny_paths(&filesystem.deny_write, &policy_base, home, false)?;
         let mut write_deny = resolved_deny.concrete;
-        let write_denied_patterns = resolved_deny.patterns;
+        let mut write_denied_patterns = resolved_deny.patterns;
         let mut write_denied_links =
             collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
-        let write_denied_always_roots =
-            resolve_paths(&filesystem.deny_write_always, &policy_base, home)?;
-        let write_allow: Vec<_> = write_allow
-            .into_iter()
-            .filter(|path| !path.is_under_any(&write_denied_always_roots))
-            .collect();
+        let resolved_write_always =
+            resolve_deny_paths(&filesystem.deny_write_always, &policy_base, home, true)?;
+        let write_denied_always_roots = resolved_write_always.concrete;
+        let write_denied_always_patterns = resolved_write_always.patterns;
+        write_allow.retain(|path| {
+            !path.is_under_any(&write_denied_always_roots)
+                && !matches_any_pattern(path, &write_denied_always_patterns)
+        });
         write_deny.extend(write_denied_always_roots.iter().cloned());
         write_deny.normalize_roots();
-        let write_always_links =
-            collect_symlink_ancestors(&filesystem.deny_write_always, &policy_base, home)?;
-        write_denied_links.extend(write_always_links);
+        write_denied_patterns.extend(write_denied_always_patterns.iter().cloned());
+        write_denied_patterns.sort_unstable();
+        write_denied_patterns.dedup();
+        write_denied_links.extend(collect_symlink_ancestors(
+            &filesystem.deny_write_always,
+            &policy_base,
+            home,
+        )?);
         write_denied_links.sort_unstable();
         write_denied_links.dedup();
 
-        let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
+        let mut read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
         #[cfg(target_os = "windows")]
-        let read_allow = read_allow
-            .into_iter()
-            .filter(|path| path.try_exists().unwrap_or(false))
-            .collect::<Vec<_>>();
+        read_allow.retain(|path| path.try_exists().unwrap_or(false));
 
         let mut read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
         let mut read_denied_roots = effective_denied_roots(&read_deny, &read_allow);
-        let read_denied_always_roots =
-            resolve_paths(&filesystem.deny_read_always, &policy_base, home)?;
-        let read_allow: Vec<_> = read_allow
-            .into_iter()
-            .filter(|path| !path.is_under_any(&read_denied_always_roots))
-            .collect();
+        let resolved_read_always =
+            resolve_deny_paths(&filesystem.deny_read_always, &policy_base, home, true)?;
+        let read_denied_always_roots = resolved_read_always.concrete;
+        let read_denied_always_patterns = resolved_read_always.patterns;
+        read_allow.retain(|path| {
+            !path.is_under_any(&read_denied_always_roots)
+                && !matches_any_pattern(path, &read_denied_always_patterns)
+        });
         read_deny.extend(read_denied_always_roots.iter().cloned());
         read_deny.normalize_roots();
         // Windows cannot attach deny entries to missing paths.
@@ -361,7 +397,12 @@ impl Settings {
             (write_roots.allow, write_roots.deny)
         };
 
-        let lowered_read = lower_read_access(&read_allow, &read_deny, &mut read_denied_roots)?;
+        let lowered_read = lower_read_access(
+            &read_allow,
+            &read_deny,
+            &read_denied_always_patterns,
+            &mut read_denied_roots,
+        )?;
         let (read_access, read_symlinks) = (lowered_read.access, lowered_read.symlinks);
         read_denied_roots.extend(read_denied_always_roots.iter().cloned());
         read_denied_roots.normalize_roots();
@@ -369,11 +410,13 @@ impl Settings {
             write_roots: write_allow,
             write_denied_roots: write_deny,
             write_denied_always_roots: write_denied_always_roots.into_boxed_slice(),
+            write_denied_always_patterns: write_denied_always_patterns.into_boxed_slice(),
             write_denied_patterns,
             write_denied_links,
             read_access,
             read_denied_roots,
             read_denied_always_roots: read_denied_always_roots.into_boxed_slice(),
+            read_denied_always_patterns: read_denied_always_patterns.into_boxed_slice(),
             read_symlinks,
             network_access: lower_network_policy(network, &policy_base, home)?,
             app_container_mode: windows.app_container_mode,
@@ -458,6 +501,7 @@ fn lower_windows_write_access(
 fn lower_read_access(
     read_allow: &[PathBuf],
     read_deny: &[PathBuf],
+    read_denied_always_patterns: &[String],
     read_denied_roots: &mut Vec<PathBuf>,
 ) -> Result<LoweredReadAccess> {
     let fs_root = normalize_path(Path::new("/"));
@@ -468,15 +512,16 @@ fn lower_read_access(
         return Err(Error::PolicyUnrestrictedRead.into());
     }
 
-    if read_deny.is_empty() {
+    if read_deny.is_empty() && read_denied_always_patterns.is_empty() {
         Ok(LoweredReadAccess {
             access: ReadAccess::Unrestricted,
             symlinks: Vec::new(),
         })
-    } else if read_allow.contains(&fs_root)
-        && !read_deny
-            .iter()
-            .any(|deny| read_allow.iter().any(|allow| allow.is_strictly_under(deny)))
+    } else if read_deny.is_empty()
+        || (read_allow.contains(&fs_root)
+            && !read_deny
+                .iter()
+                .any(|deny| read_allow.iter().any(|allow| allow.is_strictly_under(deny))))
     {
         // Layer surviving denyRead roots over a full-tree allowRead grant.
         // Windows rejects the full-volume grant above.
@@ -576,6 +621,7 @@ fn lower_network_policy(
     }
     connect_tcp_ports.sort_unstable();
     connect_tcp_ports.dedup();
+
     let bind = if network.allow_local_binding {
         IpBindAccess::Localhost
     } else {
@@ -589,17 +635,20 @@ fn lower_network_policy(
 }
 
 fn resolve_paths(
-    paths: &[String],
+    paths: &[PathSelector],
     policy_base: &Path,
     home: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     let mut resolved = Vec::new();
-    for path in paths {
-        let path = resolve_sandbox_path(path, policy_base, home)?;
+    for selector in paths {
+        let path = resolve_sandbox_path(selector.as_str(), policy_base, home)?;
         let path_str = path.to_string_lossy();
-        if GlobPattern::is_glob_str(&path_str) {
+        if !selector.is_literal() && GlobPattern::is_glob_str(&path_str) {
             let matches = GlobPattern::new(&path_str).expand()?;
-            if matches.is_empty() && fs::symlink_metadata(&path).is_ok() {
+            if matches!(selector, PathSelector::Bare(_))
+                && matches.is_empty()
+                && fs::symlink_metadata(&path).is_ok()
+            {
                 push_path_variants(&mut resolved, &path);
             } else {
                 for candidate in &matches {
@@ -617,31 +666,34 @@ fn resolve_paths(
 }
 
 fn resolve_deny_paths(
-    paths: &[String],
+    paths: &[PathSelector],
     policy_base: &Path,
     home: Option<&Path>,
+    expand_existing: bool,
 ) -> Result<ResolvedDenyPaths> {
     let mut concrete: Vec<PathBuf> = Vec::new();
     let mut patterns: Vec<String> = Vec::new();
 
-    for path in paths {
-        let resolved = resolve_sandbox_path(path, policy_base, home)?;
+    for selector in paths {
+        let resolved = resolve_sandbox_path(selector.as_str(), policy_base, home)?;
         let resolved_str = resolved.to_string_lossy();
-        if GlobPattern::is_glob_str(&resolved_str) {
+        if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
+            if expand_existing {
+                for candidate in GlobPattern::new(&resolved_str).expand()? {
+                    push_path_variants(&mut concrete, &candidate);
+                }
+            }
             patterns.push(resolved_str.clone().into_owned());
-            #[cfg(target_os = "macos")]
-            {
-                let base = GlobPattern::new(&resolved_str).base();
-                if let Ok(canonical) = fs::canonicalize(&base) {
-                    let base_str = base.to_string_lossy();
-                    let canonical_str = canonical.to_string_lossy();
-                    if canonical_str != base_str
-                        && let Some(suffix) = resolved_str.strip_prefix(base_str.as_ref())
-                    {
-                        let mut canonical_pattern = canonical_str.into_owned();
-                        canonical_pattern.push_str(suffix);
-                        patterns.push(canonical_pattern);
-                    }
+            let base = GlobPattern::new(&resolved_str).base();
+            if let Ok(canonical) = fs::canonicalize(&base) {
+                let base_str = base.to_string_lossy();
+                let canonical_str = canonical.to_string_lossy();
+                if canonical_str != base_str
+                    && let Some(suffix) = resolved_str.strip_prefix(base_str.as_ref())
+                {
+                    let mut canonical_pattern = canonical_str.into_owned();
+                    canonical_pattern.push_str(suffix);
+                    patterns.push(canonical_pattern);
                 }
             }
         } else {
@@ -654,6 +706,13 @@ fn resolve_deny_paths(
     patterns.dedup();
 
     Ok(ResolvedDenyPaths { concrete, patterns })
+}
+
+fn matches_any_pattern(path: &Path, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        let glob = GlobPattern::new(pattern);
+        path.ancestors().any(|ancestor| glob.matches_path(ancestor))
+    })
 }
 
 const MAX_TRAVERSAL_DEPTH: u32 = 40;
@@ -755,15 +814,21 @@ fn effective_denied_roots(read_deny: &[PathBuf], read_allow: &[PathBuf]) -> Vec<
 }
 
 fn collect_symlink_ancestors(
-    paths: &[String],
+    paths: &[PathSelector],
     policy_base: &Path,
     home: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     let mut links = Vec::new();
-    for path in paths {
-        let resolved = resolve_sandbox_path(path, policy_base, home)?;
+    for selector in paths {
+        let resolved = resolve_sandbox_path(selector.as_str(), policy_base, home)?;
+        let resolved_str = resolved.to_string_lossy();
+        let check_path = if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
+            GlobPattern::new(&resolved_str).base()
+        } else {
+            resolved
+        };
         let mut current = PathBuf::new();
-        for component in resolved.components() {
+        for component in check_path.components() {
             current.push(component);
             match fs::symlink_metadata(&current) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -855,6 +920,19 @@ impl<'a> GlobPattern<'a> {
         let pattern_len = pattern_bytes.len();
         let mut memo = vec![None; (pattern_len + 1) * (path_len + 1)];
         self.matches_at(pattern_bytes, path_bytes.as_bytes(), 0, 0, &mut memo)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn matches_under(&self, root: &Path) -> bool {
+        let base = self.base();
+        if base.is_under(root) {
+            return true;
+        }
+        if !root.is_under(&base) {
+            return false;
+        }
+        let mut matches = Vec::new();
+        self.collect_matches(root, &mut matches, 0).is_err() || !matches.is_empty()
     }
 
     pub(crate) fn expand(&self) -> Result<Vec<PathBuf>> {

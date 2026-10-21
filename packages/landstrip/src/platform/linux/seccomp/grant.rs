@@ -6,7 +6,6 @@ use super::network::{SocketAddrCall, TargetSocket};
 use super::notify::{NotificationChannel, NotificationResponse};
 use super::process::{ResolvedPath, label_under_root};
 use crate::error::Error as LandstripError;
-use crate::paths::PathCoverage;
 use crate::policy::AccessPolicy;
 use nix::errno::Errno;
 use nix::sys::stat::fstat;
@@ -227,13 +226,13 @@ impl OpenGrant {
     fn check_label(&self, policy: &AccessPolicy, label: &Path) -> SysResult<()> {
         let moved = label != self.label;
         if self.flags & libc::O_WRONLY == 0
-            && (label.is_under_any(&policy.read_denied_always_roots)
+            && (policy.is_read_denied_always(label)
                 || (moved && policy.read_reason(label).is_some()))
         {
             return Err(BrokerError::syscall(libc::EACCES));
         }
         if self.flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0
-            && (label.is_under_any(&policy.write_denied_always_roots)
+            && (policy.is_write_denied_always(label, label)
                 || (moved && policy.write_reason(label, label, true).is_some()))
         {
             return Err(BrokerError::syscall(libc::EACCES));
