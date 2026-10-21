@@ -8,7 +8,7 @@ use super::grant::{Grant, MutationGrant, OpenGrant, SocketGrant};
 use super::network::{handle_bind, handle_connect, handle_sendmmsg, handle_sendmsg, handle_sendto};
 use super::notify::{NotificationChannel, NotificationResponse, NotificationResult, QueryDecision};
 use crate::error::Error as LandstripError;
-use crate::policy::AccessPolicy;
+use crate::policy::{AccessPolicy, DenialReason};
 use crate::trap::{FilesystemDenial, NetworkOperation, ProcessContext, Trap, TrapOperation};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
@@ -36,7 +36,9 @@ pub(super) enum Denial {
 impl Denial {
     fn report_on_success(&self) -> bool {
         match self {
-            Self::Filesystem(denial) => denial.operation == TrapOperation::Write,
+            Self::Filesystem(denial) => {
+                denial.operation == TrapOperation::Write || denial.reason == DenialReason::DenyMatch
+            }
             Self::Network(_, _, _) => true,
         }
     }

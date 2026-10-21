@@ -50,7 +50,8 @@ On Linux, the stream is bidirectional and uses the existing broker query
 protocol, not merely passive monitoring. For `state: "query"` events, reply on
 the same socket with `controlResponseLine(trap.query_id, "allow")` (or `"deny"`);
 the syscall waits for an answer. Completed events have `state: "info"`.
-macOS reports setup/launch failures on the trap
+Explicit read denials (`DenyMatch`, JSON `reason: "deny_match"`) are reported
+even when the command exits 0. macOS reports setup/launch failures on the trap
 transport and closes it on successful exec; use Seatbelt logs for runtime denials.
 
 ## Development

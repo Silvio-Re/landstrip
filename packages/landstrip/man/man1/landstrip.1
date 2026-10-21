@@ -249,6 +249,9 @@ Failures and reported Linux broker denials are JSON lines on stderr with stable
 and
 .Va code
 fields.
+Linux explicit read denials
+.Pq Dv DenyMatch , Va reason No set to Dq deny_match
+are reported even when the program exits 0.
 .Fl -trap
 receives these events except usage errors.
 Linux approval queries require a bidirectional stream socket on

@@ -51,6 +51,9 @@ socket before sandbox setup; the sandboxed child never inherits the trap
 transport. On Linux the stream is bidirectional, using the existing broker
 query/response protocol, not merely passive monitoring.
 
+Linux explicit read denials (`DenyMatch`, JSON `reason: "deny_match"`) are
+reported even when the command exits 0.
+
 ## Integrations
 
 - [Node.js API](packages/landstrip-api/README.md)
