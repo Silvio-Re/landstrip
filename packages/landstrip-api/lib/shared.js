@@ -142,6 +142,7 @@ const LANDSTRIP_INTERNAL_CODES = new Set([
   'POLICY_DENY_WRITE_SYMLINK_ANCESTOR',
   'POLICY_INVALID_PORT',
   'POLICY_EMPTY_PATH',
+  'POLICY_INVALID_LOG_TAG',
   'POLICY_HOME_UNAVAILABLE',
   'POLICY_TRAVERSAL_DEPTH',
   'SUPERVISE_FAILED',
@@ -465,6 +466,14 @@ function resolveFilesystemPolicy(filesystem, baseDirectory) {
   return resolved;
 }
 
+function validateDarwinLogTag(value) {
+  if (typeof value !== 'string' || value.length === 0 || /["\\\x00-\x1f\x7f]/.test(value)) {
+    throw new Error(
+      'macos.logTag must be a nonempty string without double quotes, backslashes, ASCII control characters or DEL',
+    );
+  }
+}
+
 function buildLandstripPolicy(options) {
   const policy = {};
   if (options.network) {
@@ -497,6 +506,20 @@ function buildLandstripPolicy(options) {
       options.filesystem,
       options.baseDirectory,
     );
+  }
+  if (options.macos) {
+    policy.macos = {
+      allowTrustd: Boolean(options.macos.allowTrustd),
+      allowMachLookup: Array.isArray(options.macos.allowMachLookup)
+        ? [...options.macos.allowMachLookup]
+        : [],
+      allowAppleEvents: Boolean(options.macos.allowAppleEvents),
+      allowPty: Boolean(options.macos.allowPty),
+    };
+    if (options.macos.logTag !== undefined) {
+      validateDarwinLogTag(options.macos.logTag);
+      policy.macos.logTag = options.macos.logTag;
+    }
   }
   if (options.windows) {
     policy.windows = {
@@ -579,7 +602,14 @@ function mergeArray(base, override) {
 
 function parseSandboxConfig(value) {
   requireSandboxObject(value, 'sandbox config');
-  rejectUnknownSandboxFields(value, ['enabled', 'shell', 'network', 'filesystem', 'windows']);
+  rejectUnknownSandboxFields(value, [
+    'enabled',
+    'shell',
+    'network',
+    'filesystem',
+    'macos',
+    'windows',
+  ]);
   validateBooleanFields(value, ['enabled']);
 
   const config = {};
@@ -678,6 +708,38 @@ function parseSandboxConfig(value) {
     }
   }
 
+  if (value.macos !== undefined) {
+    requireSandboxObject(value.macos, 'macos');
+    rejectUnknownSandboxFields(
+      value.macos,
+      ['allowTrustd', 'allowMachLookup', 'allowAppleEvents', 'allowPty', 'logTag'],
+      'macos.',
+    );
+    validateBooleanFields(
+      value.macos,
+      ['allowTrustd', 'allowAppleEvents', 'allowPty'],
+      'macos.',
+    );
+    validateStringArrayFields(value.macos, ['allowMachLookup'], 'macos.');
+    config.macos = {};
+    if (value.macos.allowTrustd !== undefined) {
+      config.macos.allowTrustd = value.macos.allowTrustd;
+    }
+    if (value.macos.allowMachLookup !== undefined) {
+      config.macos.allowMachLookup = [...value.macos.allowMachLookup];
+    }
+    if (value.macos.allowAppleEvents !== undefined) {
+      config.macos.allowAppleEvents = value.macos.allowAppleEvents;
+    }
+    if (value.macos.allowPty !== undefined) {
+      config.macos.allowPty = value.macos.allowPty;
+    }
+    if (value.macos.logTag !== undefined) {
+      validateDarwinLogTag(value.macos.logTag);
+      config.macos.logTag = value.macos.logTag;
+    }
+  }
+
   if (value.windows !== undefined) {
     requireSandboxObject(value.windows, 'windows');
     rejectUnknownSandboxFields(value.windows, ['appContainerMode', 'allowLoopback'], 'windows.');
@@ -707,6 +769,7 @@ function deepMergeSandboxConfig(base, overrides) {
   const shell = overrides.shell;
   const network = overrides.network;
   const filesystem = overrides.filesystem;
+  const macos = overrides.macos;
   const windows = overrides.windows;
 
   const result = {
@@ -733,6 +796,19 @@ function deepMergeSandboxConfig(base, overrides) {
     result.shell = {
       readAccess: shell?.readAccess ?? base.shell?.readAccess ?? 'host',
     };
+  }
+
+  if (base.macos !== undefined || macos !== undefined) {
+    result.macos = {
+      allowTrustd: macos?.allowTrustd ?? base.macos?.allowTrustd ?? false,
+      allowMachLookup: mergeArray(base.macos?.allowMachLookup ?? [], macos?.allowMachLookup),
+      allowAppleEvents: macos?.allowAppleEvents ?? base.macos?.allowAppleEvents ?? false,
+      allowPty: macos?.allowPty ?? base.macos?.allowPty ?? false,
+    };
+    const logTag = macos?.logTag ?? base.macos?.logTag;
+    if (logTag !== undefined) {
+      result.macos.logTag = logTag;
+    }
   }
 
   if (base.windows !== undefined || windows !== undefined) {

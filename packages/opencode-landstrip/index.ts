@@ -214,6 +214,7 @@ function writePolicyFile(
     buildLandstripPolicy({
       network: config.network,
       filesystem: config.filesystem,
+      macos: config.macos,
       baseDirectory,
       httpProxyPort: proxyPort,
     }),

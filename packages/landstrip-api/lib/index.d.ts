@@ -93,6 +93,7 @@ export type LandstripPolicyErrorCode =
   | 'POLICY_DENY_WRITE_SYMLINK_ANCESTOR'
   | 'POLICY_INVALID_PORT'
   | 'POLICY_EMPTY_PATH'
+  | 'POLICY_INVALID_LOG_TAG'
   | 'POLICY_HOME_UNAVAILABLE'
   | 'POLICY_TRAVERSAL_DEPTH';
 
@@ -168,6 +169,15 @@ export interface LandstripNetworkPolicy {
   socksProxyPort?: number;
 }
 
+export interface LandstripDarwinPolicy {
+  /** Seatbelt log correlation tag: nonempty, without double quotes, backslashes, ASCII controls or DEL; not null. */
+  logTag?: string;
+  allowTrustd?: boolean;
+  allowMachLookup?: string[];
+  allowAppleEvents?: boolean;
+  allowPty?: boolean;
+}
+
 export type LandstripWindowsAppContainerMode = 'lpac' | 'standard';
 
 export interface LandstripWindowsPolicy {
@@ -178,6 +188,7 @@ export interface LandstripWindowsPolicy {
 export interface LandstripPolicy {
   filesystem?: LandstripFilesystemPolicy;
   network?: LandstripNetworkPolicy;
+  macos?: LandstripDarwinPolicy;
   windows?: LandstripWindowsPolicy;
 }
 
@@ -227,6 +238,15 @@ export interface SandboxNetworkConfig {
   deniedDomains: string[];
 }
 
+export interface SandboxDarwinConfig {
+  /** Optional Seatbelt log correlation tag; same restrictions as LandstripDarwinPolicy.logTag. */
+  logTag?: string;
+  allowTrustd: boolean;
+  allowMachLookup: string[];
+  allowAppleEvents: boolean;
+  allowPty: boolean;
+}
+
 export interface SandboxWindowsConfig {
   appContainerMode: LandstripWindowsAppContainerMode;
   allowLoopback: boolean;
@@ -237,12 +257,14 @@ export interface SandboxConfig {
   shell?: SandboxShellConfig;
   network: SandboxNetworkConfig;
   filesystem: SandboxFilesystemConfig;
+  macos?: SandboxDarwinConfig;
   windows?: SandboxWindowsConfig;
 }
 
 export type SandboxFilesystemConfigFile = Partial<SandboxFilesystemConfig>;
 export type SandboxShellConfigFile = Partial<SandboxShellConfig>;
 export type SandboxNetworkConfigFile = Partial<SandboxNetworkConfig>;
+export type SandboxDarwinConfigFile = Partial<SandboxDarwinConfig>;
 export type SandboxWindowsConfigFile = Partial<SandboxWindowsConfig>;
 
 export interface SandboxConfigFile {
@@ -250,6 +272,7 @@ export interface SandboxConfigFile {
   shell?: SandboxShellConfigFile;
   network?: SandboxNetworkConfigFile;
   filesystem?: SandboxFilesystemConfigFile;
+  macos?: SandboxDarwinConfigFile;
   windows?: SandboxWindowsConfigFile;
 }
 

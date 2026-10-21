@@ -149,7 +149,8 @@ Example fields, subject to the platform limits below:
   },
   "macos": {
     "allowTrustd": false, "allowMachLookup": [],
-    "allowAppleEvents": false, "allowPty": false
+    "allowAppleEvents": false, "allowPty": false,
+    "logTag": "agent-session-42"
   },
   "windows": { "appContainerMode": "lpac", "allowLoopback": false }
 }
@@ -224,6 +225,15 @@ prefix wildcards),
 and
 .Va macos.allowPty
 grant the corresponding IPC or pseudo-terminal access.
+The optional
+.Va macos.logTag
+string tags Seatbelt denial logs for correlation.
+It must be nonempty and contain no double quote, backslash, ASCII control
+character (0x00-0x1f), or DEL (0x7f).
+The JSON section remains
+.Va macos ,
+not
+.Va darwin .
 .Dv AF_ROUTE
 sockets remain available for route/interface discovery.
 .It Windows

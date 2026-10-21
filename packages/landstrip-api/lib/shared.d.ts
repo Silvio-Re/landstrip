@@ -4,6 +4,7 @@ import type {
   DoctorReport,
   FeatureCapabilities,
   LandstripControlResponse,
+  LandstripDarwinPolicy,
   LandstripFilesystemPolicy,
   LandstripFilesystemTrap,
   LandstripNetworkPolicy,
@@ -15,6 +16,8 @@ import type {
   SandboxConfig,
   SandboxConfigFile,
   SandboxConfigOverrides,
+  SandboxDarwinConfig,
+  SandboxDarwinConfigFile,
   SandboxFilesystemConfig,
   SandboxFilesystemConfigFile,
   SandboxImplementation,
@@ -33,10 +36,13 @@ export type LandstripQueryTrap = LandstripDenialTrap & { state: 'query' };
 export type {
   DoctorReport,
   FeatureCapabilities,
+  LandstripDarwinPolicy,
   LandstripPathSelector,
   SandboxConfig,
   SandboxConfigFile,
   SandboxConfigOverrides,
+  SandboxDarwinConfig,
+  SandboxDarwinConfigFile,
   SandboxFilesystemConfig,
   SandboxFilesystemConfigFile,
   SandboxImplementation,
@@ -100,12 +106,13 @@ export function controlResponseLine(
 
 
 export interface BuildLandstripPolicyOptions {
-  filesystem?: LandstripFilesystemPolicy;
-  network?: LandstripNetworkPolicy;
-  windows?: LandstripWindowsPolicy;
-  baseDirectory?: string;
-  httpProxyPort?: number | null;
-  socksProxyPort?: number | null;
+  filesystem?: LandstripFilesystemPolicy | undefined;
+  network?: LandstripNetworkPolicy | undefined;
+  macos?: LandstripDarwinPolicy | undefined;
+  windows?: LandstripWindowsPolicy | undefined;
+  baseDirectory?: string | undefined;
+  httpProxyPort?: number | null | undefined;
+  socksProxyPort?: number | null | undefined;
 }
 
 export function resolveFilesystemPatterns(
@@ -117,6 +124,7 @@ export function resolveFilesystemPolicy(
   baseDirectory?: string,
 ): LandstripFilesystemPolicy;
 
+/** Forwards macos.logTag; throws if it is empty, non-string, or contains a double quote, backslash, ASCII control or DEL. */
 export function buildLandstripPolicy(
   options: BuildLandstripPolicyOptions,
 ): LandstripPolicy;
@@ -130,8 +138,10 @@ export function writeLandstripPolicyFile(
 
 
 export function mergeArray<T = string>(base: T[], override?: T[]): T[];
+/** Parses sandbox settings, validating macos.logTag with the same rules as buildLandstripPolicy (null is invalid). */
 export function parseSandboxConfig(value: unknown): SandboxConfigFile;
 
+/** Merges arrays and applies override scalar precedence, including macos.logTag. */
 export function deepMergeSandboxConfig<T extends SandboxConfig = SandboxConfig>(
   base: T,
   overrides?: SandboxConfigFile,

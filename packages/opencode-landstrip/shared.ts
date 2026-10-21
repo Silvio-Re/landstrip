@@ -13,6 +13,7 @@ import type { SandboxConfig, SandboxConfigOverrides } from '@landstrip/landstrip
 
 export type {
   LandstripControlResponse,
+  LandstripDarwinPolicy,
   LandstripFilesystemPolicy,
   LandstripNetworkPolicy,
   LandstripPathSelector,
@@ -69,6 +70,7 @@ export {
   type SandboxConfig,
   type SandboxConfigFile,
   type SandboxConfigOverrides,
+  type SandboxDarwinConfig,
   type SandboxFilesystemConfig,
   type SandboxNetworkConfig,
   type SandboxShellConfig,

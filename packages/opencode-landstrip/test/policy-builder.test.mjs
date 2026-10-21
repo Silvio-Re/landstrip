@@ -69,6 +69,12 @@ test('buildLandstripPolicy constructs complete policy with proxy ports and windo
       allowAllUnixSockets: false,
       allowUnixSockets: ['/tmp/sock'],
     },
+    macos: {
+      allowTrustd: true,
+      allowMachLookup: ['com.example.service'],
+      allowAppleEvents: true,
+      allowPty: false,
+    },
     windows: {
       appContainerMode: 'standard',
       allowLoopback: true,
@@ -94,6 +100,12 @@ test('buildLandstripPolicy constructs complete policy with proxy ports and windo
       allowWrite: ['/app'],
       denyWrite: ['/app/locked'],
       denyWriteAlways: ['/app/never-write'],
+    },
+    macos: {
+      allowTrustd: true,
+      allowMachLookup: ['com.example.service'],
+      allowAppleEvents: true,
+      allowPty: false,
     },
     windows: {
       appContainerMode: 'standard',

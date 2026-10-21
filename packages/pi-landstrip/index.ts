@@ -1383,6 +1383,7 @@ function createLandstripIntegrationWithPrompts(
         denyWrite: mergeArray(config.filesystem.denyWrite, allowances?.protectedPaths),
         denyWriteAlways: mergeArray(config.filesystem.denyWriteAlways, allowances?.protectedPaths),
       },
+      macos: config.macos,
       windows: config.windows,
       httpProxyPort: proxyPort,
     });

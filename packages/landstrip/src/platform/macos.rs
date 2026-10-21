@@ -4,7 +4,7 @@
 //! macOS Seatbelt (SBPL) sandbox platform.
 
 use super::unix::close_inherited_fds;
-use crate::config::SandboxMacos;
+use crate::config::SandboxDarwin;
 use crate::error::Error;
 use crate::paths::PathCoverage;
 use crate::policy::{AccessPolicy, GlobPattern, NetworkAccess, ReadAccess, UnixSocketAccess};
@@ -71,14 +71,19 @@ fn apply_profile(profile: &str) -> Result<()> {
 
 fn render_profile(policy: &AccessPolicy) -> std::result::Result<String, fmt::Error> {
     let mut sb = String::new();
+    let message = policy
+        .macos
+        .log_tag
+        .as_ref()
+        .map_or_else(String::new, |tag| format!(" (with message \"{tag}\")"));
     writeln!(sb, "(version 1)")?;
-    writeln!(sb, "(deny default)")?;
+    writeln!(sb, "(deny default{message})")?;
 
     render_process_rules(&mut sb)?;
     render_mach_rules(&mut sb, &policy.macos)?;
-    render_write_rules(&mut sb, policy)?;
-    render_read_rules(&mut sb, policy)?;
-    render_network_rules(&mut sb, &policy.network_access)?;
+    render_write_rules(&mut sb, policy, &message)?;
+    render_read_rules(&mut sb, policy, &message)?;
+    render_network_rules(&mut sb, &policy.network_access, &message)?;
     Ok(sb)
 }
 
@@ -97,7 +102,7 @@ fn render_process_rules(sb: &mut String) -> fmt::Result {
 
 /// Default Mach services, matching the Anthropic sandbox-runtime (srt) base
 /// profile plus `SecurityServer` for Keychain access.
-fn render_mach_rules(sb: &mut String, macos: &SandboxMacos) -> fmt::Result {
+fn render_mach_rules(sb: &mut String, macos: &SandboxDarwin) -> fmt::Result {
     writeln!(sb, "(allow mach-lookup")?;
     writeln!(sb, "  (global-name \"com.apple.SecurityServer\")")?;
     if macos.allow_trustd {
@@ -242,7 +247,7 @@ fn render_pattern_filter(pattern: &str, carveouts: &[PathBuf]) -> String {
     wrapped
 }
 
-fn render_write_rules(sb: &mut String, policy: &AccessPolicy) -> fmt::Result {
+fn render_write_rules(sb: &mut String, policy: &AccessPolicy, message: &str) -> fmt::Result {
     for root in &policy.write_roots {
         let escaped = escape_sbpl_literal(&root.to_string_lossy());
         writeln!(sb, "(allow file-write* (subpath \"{escaped}\"))")?;
@@ -258,7 +263,7 @@ fn render_write_rules(sb: &mut String, policy: &AccessPolicy) -> fmt::Result {
     // subtracts the denied subtrees from the granted write roots.
     for root in &policy.write_denied_roots {
         let escaped = escape_sbpl_literal(&root.to_string_lossy());
-        writeln!(sb, "(deny file-write* (subpath \"{escaped}\"))")?;
+        writeln!(sb, "(deny file-write* (subpath \"{escaped}\"){message})")?;
     }
 
     // Regex rules are evaluated at syscall time, so unlike expand_glob_path
@@ -266,17 +271,20 @@ fn render_write_rules(sb: &mut String, policy: &AccessPolicy) -> fmt::Result {
     for pattern in &policy.write_denied_patterns {
         let regex = glob_to_sbpl_regex(pattern);
         let escaped = escape_sbpl_regex_literal(&regex);
-        writeln!(sb, "(deny file-write* (regex #\"{escaped}\"))")?;
+        writeln!(sb, "(deny file-write* (regex #\"{escaped}\"){message})")?;
     }
 
     if !policy.write_roots.is_empty() {
         for root in &policy.read_denied_roots {
             let escaped = escape_sbpl_literal(&root.to_string_lossy());
-            writeln!(sb, "(deny file-write-unlink (subpath \"{escaped}\"))")?;
+            writeln!(
+                sb,
+                "(deny file-write-unlink (subpath \"{escaped}\"){message})"
+            )?;
         }
         for pattern in &policy.read_denied_patterns {
             let filter = render_pattern_filter(pattern, &policy.read_carveouts);
-            writeln!(sb, "(deny file-write-unlink {filter})")?;
+            writeln!(sb, "(deny file-write-unlink {filter}{message})")?;
         }
 
         let mut ancestors: Vec<PathBuf> = Vec::new();
@@ -307,18 +315,21 @@ fn render_write_rules(sb: &mut String, policy: &AccessPolicy) -> fmt::Result {
         ancestors.dedup();
         for ancestor in &ancestors {
             let escaped = escape_sbpl_literal(&ancestor.to_string_lossy());
-            writeln!(sb, "(deny file-write-unlink (literal \"{escaped}\"))")?;
+            writeln!(
+                sb,
+                "(deny file-write-unlink (literal \"{escaped}\"){message})"
+            )?;
         }
     }
 
     Ok(())
 }
 
-fn render_read_rules(sb: &mut String, policy: &AccessPolicy) -> fmt::Result {
+fn render_read_rules(sb: &mut String, policy: &AccessPolicy, message: &str) -> fmt::Result {
     match &policy.read_access {
         ReadAccess::Unrestricted => sb.push_str("(allow file-read*)\n"),
         ReadAccess::AllowRoots(roots) => {
-            writeln!(sb, "(deny file-read*)")?;
+            writeln!(sb, "(deny file-read*{message})")?;
             writeln!(sb, "(allow file-read* (literal \"/\"))")?;
             for root in roots {
                 let escaped = escape_sbpl_literal(&root.to_string_lossy());
@@ -339,11 +350,11 @@ fn render_read_rules(sb: &mut String, policy: &AccessPolicy) -> fmt::Result {
     // precedence subtracts the denied subtrees from the read grants.
     for root in &policy.read_denied_roots {
         let escaped = escape_sbpl_literal(&root.to_string_lossy());
-        writeln!(sb, "(deny file-read* (subpath \"{escaped}\"))")?;
+        writeln!(sb, "(deny file-read* (subpath \"{escaped}\"){message})")?;
     }
     for pattern in &policy.read_denied_patterns {
         let filter = render_pattern_filter(pattern, &policy.read_carveouts);
-        writeln!(sb, "(deny file-read* {filter})")?;
+        writeln!(sb, "(deny file-read* {filter}{message})")?;
     }
 
     Ok(())
@@ -388,12 +399,12 @@ fn render_symlink_metadata_rules(sb: &mut String, symlinks: &[PathBuf]) -> fmt::
     Ok(())
 }
 
-fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result {
+fn render_network_rules(sb: &mut String, network: &NetworkAccess, message: &str) -> fmt::Result {
     if network.is_unrestricted() {
         sb.push_str("(allow network*)\n");
         if !matches!(network.unix_socket_access(), UnixSocketAccess::Unrestricted) {
-            sb.push_str("(deny network-outbound (remote unix-socket))\n");
-            sb.push_str("(deny network-bind (local unix-socket))\n");
+            writeln!(sb, "(deny network-outbound (remote unix-socket){message})")?;
+            writeln!(sb, "(deny network-bind (local unix-socket){message})")?;
         }
         if let UnixSocketAccess::AllowPaths(paths) = network.unix_socket_access() {
             for path in paths {
@@ -419,7 +430,7 @@ fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result
     // matching the macOS Anthropic Sandbox Runtime behavior. On some hosts it
     // also matches addresses assigned to other local interfaces; Seatbelt
     // cannot express a stricter loopback-only rule.
-    sb.push_str("(deny network-outbound)\n");
+    writeln!(sb, "(deny network-outbound{message})")?;
     for port in network.connect_tcp_ports() {
         writeln!(
             sb,

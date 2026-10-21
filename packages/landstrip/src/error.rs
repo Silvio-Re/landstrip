@@ -85,6 +85,7 @@ pub(crate) enum Error {
     PolicyInvalidPort,
     PolicyEmptyPath,
     PolicyInvalidMachLookup,
+    PolicyInvalidLogTag,
     PolicyHomeUnavailable,
     PolicyTraversalDepth,
     /// The sandbox could not be installed on the process.
@@ -203,6 +204,9 @@ impl Error {
             Self::PolicyInvalidMachLookup => {
                 Some("Mach service lookup names must not be empty or bare wildcards")
             }
+            Self::PolicyInvalidLogTag => Some(
+                "Darwin logTag must not be empty or contain quotes, backslashes, or control characters",
+            ),
             Self::PolicyHomeUnavailable => {
                 Some("the home directory is unavailable for a tilde-prefixed policy path")
             }

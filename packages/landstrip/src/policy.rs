@@ -15,7 +15,7 @@
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
 //! while lowering the policy.
 
-use crate::config::{AppContainerMode, PathSelector, SandboxMacos, SandboxNetwork, Settings};
+use crate::config::{AppContainerMode, PathSelector, SandboxDarwin, SandboxNetwork, Settings};
 use crate::error::{Error, PathIo};
 use crate::paths::{
     NormalizeRoots, PathCoverage, canonicalize_existing_prefix, normalize_path,
@@ -49,7 +49,7 @@ pub(crate) struct AccessPolicy {
     pub(crate) read_symlinks: Vec<PathBuf>,
     pub(crate) network_access: NetworkAccess,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub(crate) macos: SandboxMacos,
+    pub(crate) macos: SandboxDarwin,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) app_container_mode: AppContainerMode,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -452,7 +452,7 @@ impl Settings {
             read_denied_always_patterns: read_denied_always_patterns.into_boxed_slice(),
             read_symlinks,
             network_access: lower_network_policy(network, &policy_base, home)?,
-            macos: lower_macos_policy(&self.macos)?,
+            macos: lower_darwin_policy(&self.macos)?,
             app_container_mode: windows.app_container_mode,
             allow_windows_loopback: windows.allow_loopback,
         };
@@ -687,7 +687,7 @@ fn lower_network_policy(
     })
 }
 
-fn lower_macos_policy(macos: &SandboxMacos) -> Result<SandboxMacos> {
+fn lower_darwin_policy(macos: &SandboxDarwin) -> Result<SandboxDarwin> {
     let mut allow_mach_lookup = Vec::with_capacity(macos.allow_mach_lookup.len());
     for service in &macos.allow_mach_lookup {
         if service.strip_suffix('*').unwrap_or(service).is_empty() {
@@ -698,11 +698,21 @@ fn lower_macos_policy(macos: &SandboxMacos) -> Result<SandboxMacos> {
     allow_mach_lookup.sort_unstable();
     allow_mach_lookup.dedup();
 
-    Ok(SandboxMacos {
+    if let Some(tag) = &macos.log_tag
+        && (tag.is_empty()
+            || tag
+                .bytes()
+                .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'"' || byte == b'\\'))
+    {
+        return Err(Error::PolicyInvalidLogTag.into());
+    }
+
+    Ok(SandboxDarwin {
         allow_trustd: macos.allow_trustd,
         allow_mach_lookup,
         allow_apple_events: macos.allow_apple_events,
         allow_pty: macos.allow_pty,
+        log_tag: macos.log_tag.clone(),
     })
 }
 

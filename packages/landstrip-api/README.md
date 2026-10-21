@@ -39,6 +39,22 @@ Proxy helpers: [`/proxy`](lib/proxy.d.ts). [`/shared`](lib/shared.d.ts) provides
   Failed writes clean up; failed cleanup reports both errors and the directory
   path in an `AggregateError`.
 
+## macOS log correlation
+
+Both `LandstripDarwinPolicy` and `SandboxDarwinConfig` accept optional
+`logTag?: string`, under the JSON key `macos` (not `darwin`):
+
+```js
+const { buildLandstripPolicy } = require("@landstrip/landstrip-api/shared");
+const policy = buildLandstripPolicy({ macos: { logTag: "agent-session-42" } });
+```
+
+`macos.logTag` tags Seatbelt denial logs for correlation. It must be nonempty
+and contain no double quote, backslash, ASCII control character (0x00–0x1f),
+or DEL (0x7f). `null` is invalid. `buildLandstripPolicy` and `parseSandboxConfig`
+validate and forward it; `deepMergeSandboxConfig` uses the override tag when
+provided, otherwise preserving the base tag.
+
 ## Trap transport and reporting
 
 On Unix, `--trap FD|PATH` accepts either an inherited open FD ≥3 or an absolute

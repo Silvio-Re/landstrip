@@ -48,7 +48,7 @@ impl PolicyFormat {
 pub(crate) struct Settings {
     pub(crate) filesystem: SandboxFilesystem,
     pub(crate) network: SandboxNetwork,
-    pub(crate) macos: SandboxMacos,
+    pub(crate) macos: SandboxDarwin,
     pub(crate) windows: SandboxWindows,
 }
 
@@ -115,12 +115,14 @@ pub(crate) struct SandboxNetwork {
     clippy::struct_field_names,
     reason = "field names match the JSON policy schema"
 )]
-pub(crate) struct SandboxMacos {
+pub(crate) struct SandboxDarwin {
     pub(crate) allow_trustd: bool,
     #[serde(deserialize_with = "deserialize_strings")]
     pub(crate) allow_mach_lookup: Vec<String>,
     pub(crate) allow_apple_events: bool,
     pub(crate) allow_pty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) log_tag: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]

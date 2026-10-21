@@ -54,6 +54,10 @@ query/response protocol, not merely passive monitoring.
 Linux explicit read denials (`DenyMatch`, JSON `reason: "deny_match"`) are
 reported even when the command exits 0.
 
+The optional `macos.logTag` policy field tags Seatbelt denial logs for
+correlation. It must be a nonempty string without double quotes, backslashes,
+ASCII control characters (0x00–0x1f), or DEL (0x7f).
+
 ## Integrations
 
 - [Node.js API](packages/landstrip-api/README.md)

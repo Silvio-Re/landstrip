@@ -40,6 +40,12 @@ test('parseSandboxConfig parses valid config and partial config', () => {
       denyWrite: ['/workspace/src'],
       denyWriteAlways: ['/workspace/.git'],
     },
+    macos: {
+      allowTrustd: true,
+      allowMachLookup: ['com.example.service'],
+      allowAppleEvents: false,
+      allowPty: true,
+    },
     windows: {
       appContainerMode: 'lpac',
       allowLoopback: false,
@@ -78,6 +84,10 @@ test('parseSandboxConfig rejects unknown fields', () => {
   assert.throws(
     () => parseSandboxConfig({ filesystem: { unknown: true } }),
     /unknown sandbox field filesystem\.unknown/,
+  );
+  assert.throws(
+    () => parseSandboxConfig({ macos: { unknown: true } }),
+    /unknown sandbox field macos\.unknown/,
   );
   assert.throws(
     () => parseSandboxConfig({ windows: { unknown: true } }),
@@ -129,6 +139,12 @@ test('deepMergeSandboxConfig deep merges partial config into base config', () =>
       denyWrite: ['/base/denyWrite'],
       denyWriteAlways: ['/base/denyWriteAlways'],
     },
+    macos: {
+      allowTrustd: false,
+      allowMachLookup: ['com.example.one'],
+      allowAppleEvents: false,
+      allowPty: false,
+    },
     windows: {
       appContainerMode: 'standard',
       allowLoopback: false,
@@ -145,6 +161,10 @@ test('deepMergeSandboxConfig deep merges partial config into base config', () =>
     filesystem: {
       allowWrite: ['/base/overrideWrite'],
       denyWriteAlways: ['/base/overrideDenyWriteAlways'],
+    },
+    macos: {
+      allowTrustd: true,
+      allowMachLookup: ['com.example.two'],
     },
     windows: {
       allowLoopback: true,
@@ -164,6 +184,12 @@ test('deepMergeSandboxConfig deep merges partial config into base config', () =>
     '/base/overrideDenyWriteAlways',
   ]); // merged
   assert.deepEqual(merged.filesystem.denyRead, ['/base/denyRead']); // preserved
+  assert.deepEqual(merged.macos, {
+    allowTrustd: true,
+    allowMachLookup: ['com.example.one', 'com.example.two'],
+    allowAppleEvents: false,
+    allowPty: false,
+  });
   assert.equal(merged.windows?.appContainerMode, 'standard'); // preserved
   assert.equal(merged.windows?.allowLoopback, true); // overridden
 });
