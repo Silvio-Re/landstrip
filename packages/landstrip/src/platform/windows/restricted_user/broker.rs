@@ -18,8 +18,8 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessWithLogonW, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+    CREATE_SUSPENDED, CreateProcessWithLogonW, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
 };
 
 pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path) -> Result<u32> {
@@ -56,7 +56,7 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
             username.as_ptr(),
             domain.as_ptr(),
             password.as_ptr(),
-            0,
+            LOGON_WITH_PROFILE,
             executable.as_ptr(),
             command_line.as_mut_ptr(),
             CREATE_SUSPENDED,

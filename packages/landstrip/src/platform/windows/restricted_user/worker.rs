@@ -115,7 +115,7 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
     })?;
     let mut command_line = command_line.to_wide_nul();
     let cwd = cwd.to_wide_nul();
-    validate_environment(environment)?;
+    let environment = merge_profile_environment(environment, &worker_profile_vars())?;
     let mut startup = unsafe { mem::zeroed::<STARTUPINFOW>() };
     startup.cb = u32::try_from(mem::size_of::<STARTUPINFOW>())?;
     startup.dwFlags = STARTF_USESTDHANDLES;
@@ -261,6 +261,74 @@ fn validate_environment(environment: &[u16]) -> Result<()> {
     Ok(())
 }
 
+const PROFILE_ENV_KEYS: [&str; 8] = [
+    "APPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "USERNAME",
+    "USERPROFILE",
+];
+
+fn worker_profile_vars() -> Vec<(&'static str, OsString)> {
+    PROFILE_ENV_KEYS
+        .into_iter()
+        .filter_map(|key| std::env::var_os(key).map(|value| (key, value)))
+        .collect()
+}
+
+fn entry_matches_key(entry: &[u16], key: &str) -> bool {
+    let key_bytes = key.as_bytes();
+    entry.len() > key_bytes.len()
+        && entry[key_bytes.len()] == u16::from(b'=')
+        && entry[..key_bytes.len()]
+            .iter()
+            .zip(key_bytes)
+            .all(|(&unit, &expected)| {
+                u8::try_from(unit).is_ok_and(|actual| actual.eq_ignore_ascii_case(&expected))
+            })
+}
+
+fn merge_profile_environment(
+    request_env: &[u16],
+    profile_vars: &[(&str, OsString)],
+) -> Result<Vec<u16>> {
+    validate_environment(request_env)?;
+    let mut merged = Vec::with_capacity(request_env.len() + 256);
+
+    for entry in request_env[..request_env.len() - 1].split(|&unit| unit == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        if profile_vars
+            .iter()
+            .any(|(key, _)| entry_matches_key(entry, key))
+        {
+            continue;
+        }
+        merged.extend_from_slice(entry);
+        merged.push(0);
+    }
+
+    for (key, value) in profile_vars {
+        if value.encode_wide().any(|unit| unit == 0) {
+            bail!("restricted-user profile environment variable {key} contains an interior NUL");
+        }
+        merged.extend(key.encode_utf16());
+        merged.push(u16::from(b'='));
+        merged.extend(value.encode_wide());
+        merged.push(0);
+    }
+
+    if merged.is_empty() {
+        merged.push(0);
+    }
+    merged.push(0);
+    Ok(merged)
+}
+
 fn verify_current_sid(expected: &str) -> Result<()> {
     let token = current_process_token(TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY)
         .map_err(|source| {
@@ -285,4 +353,64 @@ fn verify_current_sid(expected: &str) -> Result<()> {
         bail!("restricted-user worker account SID does not match request");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_env_block(entries: &[&str]) -> Vec<u16> {
+        let mut block = Vec::new();
+        for entry in entries {
+            block.extend(entry.encode_utf16());
+            block.push(0);
+        }
+        if block.is_empty() {
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
+    fn decode_env_block(block: &[u16]) -> Result<Vec<String>> {
+        validate_environment(block)?;
+        block[..block.len() - 1]
+            .split(|&unit| unit == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| Ok(String::from_utf16(entry)?))
+            .collect()
+    }
+
+    #[test]
+    fn merge_profile_environment_replaces_host_profile_variables() -> Result<()> {
+        let request = encode_env_block(&[
+            "=C:=C:\\work",
+            "Path=C:\\Windows\\System32",
+            "userprofile=C:\\Users\\host",
+            "TEMP=C:\\Users\\host\\AppData\\Local\\Temp",
+            "CUSTOM_VAR=keep",
+        ]);
+        let profile = [
+            ("USERPROFILE", OsString::from("C:\\Users\\landstrip-sb-0")),
+            (
+                "TEMP",
+                OsString::from("C:\\Users\\landstrip-sb-0\\AppData\\Local\\Temp"),
+            ),
+        ];
+
+        let merged = merge_profile_environment(&request, &profile)?;
+        let entries = decode_env_block(&merged)?;
+
+        assert_eq!(
+            entries,
+            vec![
+                "=C:=C:\\work",
+                "Path=C:\\Windows\\System32",
+                "CUSTOM_VAR=keep",
+                "USERPROFILE=C:\\Users\\landstrip-sb-0",
+                "TEMP=C:\\Users\\landstrip-sb-0\\AppData\\Local\\Temp",
+            ]
+        );
+        Ok(())
+    }
 }
