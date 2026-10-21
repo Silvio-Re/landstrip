@@ -9,15 +9,15 @@ import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-a
 import { isRecord } from '@landstrip/landstrip-api/shared';
 
 export const LANDSTRIP_CONTEXT_ENV = 'LANDSTRIP_CONTEXT';
-export const LANDSTRIP_RUNTIME_VERSION = 2;
+export const LANDSTRIP_RUNTIME_VERSION = 3;
 
-const RUNTIME_REGISTER_EVENT = 'landstrip:runtime:register:v2';
-const RUNTIME_DISCOVER_EVENT = 'landstrip:runtime:discover:v2';
+const RUNTIME_REGISTER_EVENT = 'landstrip:runtime:register:v3';
+const RUNTIME_DISCOVER_EVENT = 'landstrip:runtime:discover:v3';
 
 export type LandstripSandboxState = 'enabled' | 'disabled' | 'unavailable';
 
-export interface LandstripContextV2 {
-  readonly version: 2;
+export interface LandstripContextV3 {
+  readonly version: 3;
   readonly host: 'pi';
   readonly role: 'primary' | 'subagent';
   readonly sandbox: LandstripSandboxState;
@@ -64,7 +64,7 @@ export interface LandstripPermissionAsk {
 }
 
 export interface LandstripPermissionAskRequest {
-  readonly context: LandstripContextV2;
+  readonly context: LandstripContextV3;
   readonly toolName: string;
   readonly input: Readonly<Record<string, unknown>>;
   readonly permissions: readonly LandstripPermissionAsk[];
@@ -134,17 +134,17 @@ export type LandstripSpawn = (
 ) => ChildProcess;
 
 export type LandstripEvent =
-  | { readonly type: 'sandbox.changed'; readonly context: LandstripContextV2 }
-  | { readonly type: 'subagent.start'; readonly context: LandstripContextV2 }
+  | { readonly type: 'sandbox.changed'; readonly context: LandstripContextV3 }
+  | { readonly type: 'subagent.start'; readonly context: LandstripContextV3 }
   | {
       readonly type: 'subagent.end';
-      readonly context: LandstripContextV2;
+      readonly context: LandstripContextV3;
       readonly status: 'completed' | 'cancelled' | 'error';
     };
 
-export interface PiLandstripRuntimeV2 {
-  readonly version: 2;
-  getContext(ctx?: ExtensionContext): LandstripContextV2;
+export interface PiLandstripRuntimeV3 {
+  readonly version: 3;
+  getContext(ctx?: ExtensionContext): LandstripContextV3;
   registerShellProvider(provider: LandstripShellProvider): () => void;
   registerPermissionAskProvider(provider: LandstripPermissionAskProvider): () => void;
   prepareProcess(options: LandstripProcessOptions): Promise<LandstripPreparedProcess>;
@@ -157,13 +157,13 @@ export interface PiLandstripRuntimeV2 {
 }
 
 interface RuntimeRegistration {
-  readonly version: 2;
-  readonly runtime: PiLandstripRuntimeV2;
+  readonly version: 3;
+  readonly runtime: PiLandstripRuntimeV3;
 }
 
 interface RuntimeDiscovery {
-  readonly version: 2;
-  register(runtime: PiLandstripRuntimeV2): void;
+  readonly version: 3;
+  register(runtime: PiLandstripRuntimeV3): void;
 }
 
 interface EventBusLike {
@@ -175,7 +175,7 @@ function eventBus(pi: ExtensionAPI): EventBusLike | undefined {
   return (pi as ExtensionAPI & { events?: EventBusLike }).events;
 }
 
-function isRuntime(value: unknown): value is PiLandstripRuntimeV2 {
+function isRuntime(value: unknown): value is PiLandstripRuntimeV3 {
   return (
     isRecord(value) &&
     value['version'] === LANDSTRIP_RUNTIME_VERSION &&
@@ -213,18 +213,18 @@ function isPreparedProcess(value: unknown): value is LandstripPreparedProcess {
 
 function discoverLandstrip(
   pi: ExtensionAPI,
-  callback: (runtime: PiLandstripRuntimeV2) => void,
+  callback: (runtime: PiLandstripRuntimeV3) => void,
   onInvalid?: (error: Error) => void,
 ): () => void {
   const events = eventBus(pi);
   if (!events) return () => undefined;
 
-  let current: PiLandstripRuntimeV2 | undefined;
+  let current: PiLandstripRuntimeV3 | undefined;
   let disposed = false;
   const register = (value: unknown): void => {
     if (disposed) return;
     if (!isRuntime(value)) {
-      onInvalid?.(new Error('Invalid Landstrip runtime v2 declaration'));
+      onInvalid?.(new Error('Invalid Landstrip runtime v3 declaration'));
       return;
     }
     if (value === current) return;
@@ -234,7 +234,7 @@ function discoverLandstrip(
   const unsubscribe = events.on(RUNTIME_REGISTER_EVENT, (value) => {
     if (disposed) return;
     if (!isRecord(value) || value['version'] !== LANDSTRIP_RUNTIME_VERSION) {
-      onInvalid?.(new Error('Invalid Landstrip runtime v2 registration'));
+      onInvalid?.(new Error('Invalid Landstrip runtime v3 registration'));
       return;
     }
     register(value['runtime']);
@@ -258,13 +258,13 @@ function discoverLandstrip(
 
 export function useLandstrip(
   pi: ExtensionAPI,
-  callback: (runtime: PiLandstripRuntimeV2) => void,
+  callback: (runtime: PiLandstripRuntimeV3) => void,
 ): () => void {
   return discoverLandstrip(pi, callback);
 }
 
 export function createLandstrip(pi: ExtensionAPI): Landstrip {
-  let runtime: PiLandstripRuntimeV2 | undefined;
+  let runtime: PiLandstripRuntimeV3 | undefined;
   let runtimeError: Error | undefined;
   let disposed = false;
   const stopDiscovery = discoverLandstrip(
@@ -339,7 +339,7 @@ export function createLandstrip(pi: ExtensionAPI): Landstrip {
 
 function provideExtensionProvider(
   pi: ExtensionAPI,
-  register: (runtime: PiLandstripRuntimeV2) => () => void,
+  register: (runtime: PiLandstripRuntimeV3) => () => void,
 ): () => void {
   let unregisterProvider: (() => void) | undefined;
   const stopDiscovery = useLandstrip(pi, (runtime) => {
@@ -369,7 +369,7 @@ export function provideLandstripPermissionAsk(
 
 export function publishLandstripRuntime(
   pi: ExtensionAPI,
-  runtime: PiLandstripRuntimeV2,
+  runtime: PiLandstripRuntimeV3,
 ): () => void {
   const events = eventBus(pi);
   if (!events) return () => undefined;
@@ -390,13 +390,13 @@ export function publishLandstripRuntime(
   }
 }
 
-export function encodeLandstripContext(context: LandstripContextV2): string {
+export function encodeLandstripContext(context: LandstripContextV3): string {
   return Buffer.from(JSON.stringify(context)).toString('base64url');
 }
 
 export function contextFromEnvironment(
   env: NodeJS.ProcessEnv = process.env,
-): LandstripContextV2 | undefined {
+): LandstripContextV3 | undefined {
   const encoded = env[LANDSTRIP_CONTEXT_ENV];
   if (!encoded) return undefined;
 
@@ -418,7 +418,7 @@ export function contextFromEnvironment(
     ) {
       return undefined;
     }
-    return value as unknown as LandstripContextV2;
+    return value as unknown as LandstripContextV3;
   } catch {
     return undefined;
   }

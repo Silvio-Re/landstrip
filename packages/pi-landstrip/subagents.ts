@@ -49,8 +49,9 @@ import { Type } from 'typebox';
 
 import {
   encodeLandstripContext,
-  type LandstripContextV2,
+  type LandstripContextV3,
   LANDSTRIP_CONTEXT_ENV,
+  LANDSTRIP_RUNTIME_VERSION,
   type LandstripPermissionAskDecision,
   type LandstripPermissionAskRequest,
 } from './api.ts';
@@ -3794,9 +3795,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     }
   }
 
-  private taskContext(task: TaskRecord, ctx: ExtensionContext): LandstripContextV2 {
+  private taskContext(task: TaskRecord, ctx: ExtensionContext): LandstripContextV3 {
     const context = this.integration.getContext?.(ctx) ?? {
-      version: 2,
+      version: LANDSTRIP_RUNTIME_VERSION,
       host: 'pi',
       role: 'primary',
       sandbox: 'unavailable',
@@ -3815,9 +3816,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     };
   }
 
-  private permissionContext(ctx: ExtensionContext): LandstripContextV2 {
+  private permissionContext(ctx: ExtensionContext): LandstripContextV3 {
     const context = this.integration.getContext?.(ctx) ?? {
-      version: 2,
+      version: LANDSTRIP_RUNTIME_VERSION,
       host: 'pi',
       role: 'primary',
       sandbox: 'unavailable',

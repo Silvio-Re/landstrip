@@ -108,7 +108,7 @@ export interface SandboxConfig extends BaseSandboxConfig {
   windows: SandboxWindowsConfig;
 }
 import {
-  type LandstripContextV2,
+  type LandstripContextV3,
   type LandstripEvent,
   type LandstripPermissionAskDecision,
   type LandstripPermissionAskProvider,
@@ -122,7 +122,7 @@ import {
   type LandstripSpawn,
   type LandstripWorkerExtension,
   LANDSTRIP_RUNTIME_VERSION,
-  type PiLandstripRuntimeV2,
+  type PiLandstripRuntimeV3,
   publishLandstripRuntime,
 } from './api.ts';
 import type { RpcSpawn } from './rpc-process.ts';
@@ -764,7 +764,7 @@ export interface FilesystemToolAuthorizationOptions {
 }
 
 /** Landstrip sandbox integration hooks for Pi. */
-export interface LandstripIntegration extends PiLandstripRuntimeV2 {
+export interface LandstripIntegration extends PiLandstripRuntimeV3 {
   /** Resolve a permission ask through the registered external provider. */
   resolvePermissionAsk(
     request: LandstripPermissionAskRequest,
@@ -842,7 +842,7 @@ export interface LandstripRpcWorkerLaunch extends Omit<LandstripPreparedProcess,
 }
 
 export type {
-  LandstripContextV2,
+  LandstripContextV3,
   LandstripEvent,
   LandstripPermissionAsk,
   LandstripPermissionAskDecision,
@@ -855,7 +855,7 @@ export type {
   LandstripShellPrepareOptions,
   LandstripShellProvider,
   LandstripWorkerExtension,
-  PiLandstripRuntimeV2,
+  PiLandstripRuntimeV3,
 } from './api.ts';
 
 /** Register the landstrip extension with Pi. */
@@ -908,7 +908,7 @@ function createLandstripIntegrationWithPrompts(
   const sessionAllowedWritePaths: string[] = [];
   const sessionAllowedTargets: string[] = [];
 
-  function getContext(ctx = activeContext): LandstripContextV2 {
+  function getContext(ctx = activeContext): LandstripContextV3 {
     return {
       version: LANDSTRIP_RUNTIME_VERSION,
       host: 'pi',
