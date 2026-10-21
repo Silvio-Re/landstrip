@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type {
+  DoctorReport,
+  FeatureCapabilities,
   LandstripControlResponse,
   LandstripFilesystemPolicy,
   LandstripFilesystemTrap,
@@ -15,6 +17,7 @@ import type {
   SandboxConfigOverrides,
   SandboxFilesystemConfig,
   SandboxFilesystemConfigFile,
+  SandboxImplementation,
   SandboxNetworkConfig,
   SandboxNetworkConfigFile,
   SandboxShellConfig,
@@ -28,12 +31,15 @@ export type LandstripDenialTrap = LandstripFilesystemTrap | LandstripNetworkTrap
 export type LandstripQueryTrap = LandstripDenialTrap & { state: 'query' };
 
 export type {
+  DoctorReport,
+  FeatureCapabilities,
   LandstripPathSelector,
   SandboxConfig,
   SandboxConfigFile,
   SandboxConfigOverrides,
   SandboxFilesystemConfig,
   SandboxFilesystemConfigFile,
+  SandboxImplementation,
   SandboxNetworkConfig,
   SandboxNetworkConfigFile,
   SandboxShellConfig,

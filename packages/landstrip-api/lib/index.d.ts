@@ -181,6 +181,28 @@ export interface LandstripPolicy {
   windows?: LandstripWindowsPolicy;
 }
 
+export type SandboxImplementation =
+  | 'landlock+seccomp'
+  | 'seatbelt'
+  | 'appContainer'
+  | 'restrictedUser';
+
+export interface FeatureCapabilities {
+  filesystemTiers: string[];
+  networkMediation: boolean;
+  unixSocketFiltering: boolean;
+  processIsolation: boolean;
+}
+
+export interface DoctorReport {
+  ok: boolean;
+  platform: string;
+  implementation: SandboxImplementation;
+  supported: FeatureCapabilities;
+  available: FeatureCapabilities;
+  error?: string;
+}
+
 export interface SandboxFilesystemConfig {
   denyRead: string[];
   denyReadAlways: string[];

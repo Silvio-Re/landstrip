@@ -24,15 +24,7 @@ pub(crate) enum SandboxImplementation {
 
 impl SandboxImplementation {
     fn capabilities(self) -> FeatureCapabilities {
-        let (unix_socket_filtering, process_isolation) = match self {
-            #[cfg(target_os = "linux")]
-            Self::LandlockSeccomp => (true, true),
-            #[cfg(target_os = "macos")]
-            Self::Seatbelt => (true, false),
-            #[cfg(target_os = "windows")]
-            Self::AppContainer | Self::RestrictedUser => (false, false),
-        };
-        FeatureCapabilities {
+        let capabilities = FeatureCapabilities {
             filesystem_tiers: &[
                 "allowWrite",
                 "denyWrite",
@@ -42,8 +34,26 @@ impl SandboxImplementation {
                 "denyWriteAlways",
             ],
             network_mediation: true,
-            unix_socket_filtering,
-            process_isolation,
+            unix_socket_filtering: false,
+            process_isolation: false,
+        };
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::LandlockSeccomp => FeatureCapabilities {
+                unix_socket_filtering: true,
+                process_isolation: true,
+                ..capabilities
+            },
+            #[cfg(target_os = "macos")]
+            Self::Seatbelt => FeatureCapabilities {
+                unix_socket_filtering: true,
+                ..capabilities
+            },
+            #[cfg(target_os = "windows")]
+            Self::AppContainer | Self::RestrictedUser => FeatureCapabilities {
+                filesystem_tiers: &["allowWrite", "denyWrite", "allowRead", "denyRead"],
+                ..capabilities
+            },
         }
     }
 }
