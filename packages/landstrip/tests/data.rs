@@ -9,7 +9,7 @@
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
 #[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -929,6 +929,7 @@ fn sandbox_connect(ctx: &Context, format: PolicyFormat, policies: &[PathBuf], po
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
 fn run_unix_allowed(
     ctx: &Context,
     format: PolicyFormat,
@@ -936,14 +937,8 @@ fn run_unix_allowed(
     sock: &Path,
 ) -> Result<(), String> {
     let _ = std::fs::remove_file(sock);
-    let mut server = Command::new(&ctx.nc)
-        .args(["-l", "-U"])
-        .arg(sock)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn unix server: {e}"))?;
-    wait_for_unix_socket(&mut server, sock)?;
+    let listener = UnixListener::bind(sock).map_err(|e| format!("bind unix server: {e}"))?;
+    let server = std::thread::spawn(move || listener.accept().is_ok());
 
     let output = landstrip_net(ctx, format, policies)
         .arg(&ctx.nc)
@@ -952,7 +947,9 @@ fn run_unix_allowed(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output();
-    stop(&mut server);
+    let _ = UnixStream::connect(sock);
+    let _ = server.join();
+    let _ = std::fs::remove_file(sock);
     match output {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => Err(format!(
@@ -964,9 +961,20 @@ fn run_unix_allowed(
     }
 }
 
+#[cfg(not(unix))]
+fn run_unix_allowed(
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+    _sock: &Path,
+) -> Result<(), String> {
+    Err("unix-allowed is unix-only".to_owned())
+}
+
 /// Denies socket(AF_UNIX) at connect/bind, not creation. Under a default-deny
 /// unix-socket policy the connect must fail with EACCES ("Permission denied")
 /// rather than EAFNOSUPPORT ("Address family not supported by protocol").
+#[cfg(unix)]
 fn run_unix_denied(
     ctx: &Context,
     format: PolicyFormat,
@@ -975,38 +983,29 @@ fn run_unix_denied(
 ) -> Result<(), String> {
     let sock = dir.join("denied.sock");
     let _ = std::fs::remove_file(&sock);
-    let mut server = Command::new(&ctx.nc)
-        .args(["-l", "-U"])
-        .arg(&sock)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn unix server: {e}"))?;
-    wait_for_unix_socket(&mut server, &sock)?;
+    let _listener = UnixListener::bind(&sock).map_err(|e| format!("bind unix server: {e}"))?;
 
-    let output = landstrip_net(ctx, format, policies)
-        .arg(&ctx.nc)
-        .arg("-U")
-        .arg(&sock)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-    stop(&mut server);
-    let output = output.map_err(|e| format!("unix connect spawn: {e}"))?;
-    let merged = merge(&output.stdout, &output.stderr);
+    let result = run_self_probe(
+        ctx,
+        format,
+        policies,
+        "unix-connect",
+        Some(sock.as_os_str()),
+        "unix connect spawn",
+        "unix connect not denied with EACCES/EPERM",
+    );
+    let _ = std::fs::remove_file(&sock);
+    result
+}
 
-    let denied = !output.status.success()
-        && merged.contains("Permission denied")
-        && !merged.contains("Address family not supported");
-    if denied {
-        Ok(())
-    } else {
-        Err(format!(
-            "unix connect not denied with EACCES; status={:?} output={}",
-            output.status,
-            merged.trim()
-        ))
-    }
+#[cfg(not(unix))]
+fn run_unix_denied(
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+    _dir: &Path,
+) -> Result<(), String> {
+    Err("unix-denied is unix-only".to_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -1035,7 +1034,7 @@ fn skip_old_landlock() -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn run_self_probe(
     ctx: &Context,
     format: PolicyFormat,
@@ -1157,42 +1156,6 @@ fn run_unix_abstract_denied(
     _policies: &[PathBuf],
 ) -> Result<(), String> {
     Err("unix-abstract-denied is linux-only".to_owned())
-}
-
-fn wait_for_unix_socket(server: &mut Child, sock: &Path) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if is_unix_socket(sock) {
-            return Ok(());
-        }
-
-        if let Some(status) = server
-            .try_wait()
-            .map_err(|e| format!("poll unix server: {e}"))?
-        {
-            return Err(format!(
-                "unix server exited before socket was ready status={status:?}"
-            ));
-        }
-
-        if Instant::now() >= deadline {
-            return Err(format!("unix socket was not ready: {}", sock.display()));
-        }
-
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-#[cfg(unix)]
-fn is_unix_socket(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_socket())
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_unix_socket(path: &Path) -> bool {
-    path.exists()
 }
 
 fn stop(child: &mut Child) {

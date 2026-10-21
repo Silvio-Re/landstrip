@@ -19,6 +19,7 @@ pub fn dispatch(subcommand: &std::ffi::OsStr, mut args: std::env::ArgsOs) -> Opt
         "openat2" => Some(fs::openat2_probe(args.next(), args.next())),
         "fd-metadata" => Some(fs::fd_metadata_probe(args.next(), args.next())),
         "abstract-connect" => Some(net::abstract_connect_probe(args.next())),
+        "unix-connect" => Some(net::unix_connect_probe(args.next())),
         "route-socket" => Some(net::route_socket_probe()),
         "udp-bind" => Some(net::udp_bind_probe()),
         "udp-local" => Some(net::udp_local_probe()),

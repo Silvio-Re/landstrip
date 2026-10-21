@@ -297,6 +297,23 @@ fn render_symlink_metadata_rules(sb: &mut String, symlinks: &[PathBuf]) -> fmt::
 fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result {
     if network.is_unrestricted() {
         sb.push_str("(allow network*)\n");
+        if !matches!(network.unix_socket_access(), UnixSocketAccess::Unrestricted) {
+            sb.push_str("(deny network-outbound (remote unix-socket))\n");
+            sb.push_str("(deny network-bind (local unix-socket))\n");
+        }
+        if let UnixSocketAccess::AllowPaths(paths) = network.unix_socket_access() {
+            for path in paths {
+                let escaped = escape_sbpl_literal(&path.to_string_lossy());
+                writeln!(
+                    sb,
+                    "(allow network-outbound (remote unix-socket (subpath \"{escaped}\")))"
+                )?;
+                writeln!(
+                    sb,
+                    "(allow network-bind (local unix-socket (subpath \"{escaped}\")))"
+                )?;
+            }
+        }
         return Ok(());
     }
 

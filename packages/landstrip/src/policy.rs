@@ -151,6 +151,10 @@ impl AccessPolicy {
         }
 
         let network = &self.network_access;
+        if !network.unix_socket_access().is_denied() {
+            return Err(Error::PolicyUnixSocketUnsupported);
+        }
+
         if network.is_unrestricted() {
             return Ok(());
         }
@@ -158,11 +162,6 @@ impl AccessPolicy {
         if network.allows_local_binding() {
             return Err(Error::PolicyLocalBindingUnsupported);
         }
-
-        if !network.unix_socket_access().is_denied() {
-            return Err(Error::PolicyUnixSocketUnsupported);
-        }
-
         Ok(())
     }
 }
@@ -177,7 +176,9 @@ pub(crate) enum ReadAccess {
 #[derive(Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase", tag = "mode")]
 pub(crate) enum NetworkAccess {
-    Unrestricted,
+    Unrestricted {
+        unix_socket_access: UnixSocketAccess,
+    },
     Restricted {
         connect_tcp_ports: Vec<u16>,
         bind: IpBindAccess,
@@ -194,12 +195,12 @@ pub(crate) enum IpBindAccess {
 
 impl NetworkAccess {
     pub(crate) fn is_unrestricted(&self) -> bool {
-        matches!(self, Self::Unrestricted)
+        matches!(self, Self::Unrestricted { .. })
     }
 
     pub(crate) fn connect_tcp_ports(&self) -> &[u16] {
         match self {
-            Self::Unrestricted => &[],
+            Self::Unrestricted { .. } => &[],
             Self::Restricted {
                 connect_tcp_ports, ..
             } => connect_tcp_ports,
@@ -208,8 +209,8 @@ impl NetworkAccess {
 
     pub(crate) fn unix_socket_access(&self) -> &UnixSocketAccess {
         match self {
-            Self::Unrestricted => const { &UnixSocketAccess::Unrestricted },
-            Self::Restricted {
+            Self::Unrestricted { unix_socket_access }
+            | Self::Restricted {
                 unix_socket_access, ..
             } => unix_socket_access,
         }
@@ -244,7 +245,7 @@ impl NetworkAccess {
     #[cfg(target_os = "linux")]
     pub(crate) fn needs_bind_broker(&self) -> bool {
         match self {
-            Self::Unrestricted => false,
+            Self::Unrestricted { unix_socket_access } => unix_socket_access.needs_broker(),
             Self::Restricted {
                 bind,
                 unix_socket_access,
@@ -256,7 +257,7 @@ impl NetworkAccess {
     #[cfg(target_os = "linux")]
     pub(crate) fn needs_network_broker(&self) -> bool {
         match self {
-            Self::Unrestricted => false,
+            Self::Unrestricted { unix_socket_access } => unix_socket_access.needs_broker(),
             Self::Restricted {
                 connect_tcp_ports, ..
             } => self.needs_bind_broker() || !connect_tcp_ports.is_empty(),
@@ -550,8 +551,17 @@ fn lower_network_policy(
     policy_base: &Path,
     home: Option<&Path>,
 ) -> Result<NetworkAccess> {
+    let unix_socket_paths = resolve_paths(&network.allow_unix_sockets, policy_base, home)?;
+    let unix_socket_access = if network.allow_all_unix_sockets {
+        UnixSocketAccess::Unrestricted
+    } else if unix_socket_paths.is_empty() {
+        UnixSocketAccess::Denied
+    } else {
+        UnixSocketAccess::AllowPaths(unix_socket_paths)
+    };
+
     if network.allow_network {
-        return Ok(NetworkAccess::Unrestricted);
+        return Ok(NetworkAccess::Unrestricted { unix_socket_access });
     }
 
     let mut connect_tcp_ports = Vec::new();
@@ -566,16 +576,6 @@ fn lower_network_policy(
     }
     connect_tcp_ports.sort_unstable();
     connect_tcp_ports.dedup();
-
-    let unix_socket_paths = resolve_paths(&network.allow_unix_sockets, policy_base, home)?;
-    let unix_socket_access = if network.allow_all_unix_sockets {
-        UnixSocketAccess::Unrestricted
-    } else if unix_socket_paths.is_empty() {
-        UnixSocketAccess::Denied
-    } else {
-        UnixSocketAccess::AllowPaths(unix_socket_paths)
-    };
-
     let bind = if network.allow_local_binding {
         IpBindAccess::Localhost
     } else {

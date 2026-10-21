@@ -149,6 +149,12 @@ pub(super) fn handle_bind(
 
     match socket.info.kind() {
         SocketKind::Tcp | SocketKind::Udp => {
+            if policy.network_access.is_unrestricted() {
+                return Ok(NotificationResult::Socket(SocketGrant::new(
+                    socket,
+                    libc::bind,
+                )));
+            }
             if !policy.network_access.allows_local_binding() {
                 if let Ok(endpoint) = ip_endpoint(&socket.addr, socket.info.domain) {
                     if query_enabled {
@@ -195,8 +201,14 @@ pub(super) fn handle_bind(
             )))
         }
         SocketKind::Unix => handle_unix_bind(policy, request.pid, socket),
+        SocketKind::NotSupported if policy.network_access.is_unrestricted() => Ok(
+            NotificationResult::Socket(SocketGrant::new(socket, libc::bind)),
+        ),
         SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
-        SocketKind::Other => Ok(NotificationResult::Continue),
+        SocketKind::Other => Ok(NotificationResult::Socket(SocketGrant::new(
+            socket,
+            libc::bind,
+        ))),
     }
 }
 
@@ -460,7 +472,17 @@ fn handle_unix_bind(
     mut socket: TargetSocket,
 ) -> SysResult<NotificationResult> {
     let Some(path) = unix_path_target(&socket.addr) else {
-        return Err(BrokerError::PolicyDenied);
+        return if matches!(
+            policy.network_access.unix_socket_access(),
+            UnixSocketAccess::Unrestricted
+        ) {
+            Ok(NotificationResult::Socket(SocketGrant::new(
+                socket,
+                libc::bind,
+            )))
+        } else {
+            Err(BrokerError::PolicyDenied)
+        };
     };
     let process = TargetProcess::from_raw(pid);
     let filesystem = process.filesystem()?;

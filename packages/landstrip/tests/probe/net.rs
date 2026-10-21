@@ -29,6 +29,29 @@ pub fn abstract_connect_probe(_name: Option<std::ffi::OsString>) -> i32 {
     2
 }
 
+#[cfg(unix)]
+pub fn unix_connect_probe(path: Option<std::ffi::OsString>) -> i32 {
+    use std::os::unix::net::UnixStream;
+
+    let Some(path) = path else {
+        return 2;
+    };
+    match UnixStream::connect(path) {
+        Ok(_) => 1,
+        Err(error) => match error.raw_os_error() {
+            Some(libc::EACCES) => 0,
+            #[cfg(target_os = "macos")]
+            Some(libc::EPERM) => 0,
+            _ => 2,
+        },
+    }
+}
+
+#[cfg(not(unix))]
+pub fn unix_connect_probe(_path: Option<std::ffi::OsString>) -> i32 {
+    2
+}
+
 #[cfg(target_os = "macos")]
 pub fn route_socket_probe() -> i32 {
     let fd = unsafe { libc::socket(libc::AF_ROUTE, libc::SOCK_RAW, 0) };

@@ -137,9 +137,9 @@ pub(super) fn build_errno_filter(
     let mut builder = FilterBuilder::new();
     if needs_network {
         builder.add_socket_family_filter(syscalls.socket, allow_local_binding)?;
-        builder.add_unix_socket_filters(syscalls.socket, unix_sockets)?;
         builder.add_network_bypass_filters(syscalls)?;
     }
+    builder.add_unix_socket_filters(syscalls.socket, unix_sockets)?;
     if builder.is_empty() {
         return Ok(None);
     }
