@@ -413,27 +413,21 @@ impl Settings {
             effective_denied_roots(&resolved_read_deny.concrete, &read_allow);
         let resolved_read_always =
             resolve_deny_paths(&filesystem.deny_read_always, &policy_base, home)?;
-        let read_carveouts: Vec<PathBuf> = read_allow
-            .iter()
-            .filter(|allow| {
-                !allow.is_under_any(&resolved_read_always.concrete)
-                    && !matches_any_pattern(allow, &resolved_read_always.patterns)
-                    && matches_any_pattern(allow, &resolved_read_deny.patterns)
-            })
-            .cloned()
-            .collect();
+        let read_carveouts = resolved_read_deny.carveouts(&resolved_read_always, &read_allow);
         resolved_read_deny.merge_always(&resolved_read_always, &mut read_allow);
         let read_deny = resolved_read_deny.concrete;
         let read_denied_patterns = resolved_read_deny.patterns;
         let read_denied_always_roots = resolved_read_always.concrete;
         let read_denied_always_patterns = resolved_read_always.patterns;
-        // Windows cannot attach deny entries to missing paths.
+        // Windows cannot attach deny entries to missing paths or volume roots.
         #[cfg(target_os = "windows")]
-        read_denied_roots.retain(|path| path.try_exists().unwrap_or(true));
+        read_denied_roots
+            .retain(|path| path.parent().is_some() && path.try_exists().unwrap_or(true));
 
         #[cfg(target_os = "windows")]
         let (write_allow, write_deny) = {
-            let write_roots = lower_windows_write_access(&write_allow, write_deny, &read_deny)?;
+            let write_roots =
+                lower_windows_write_access(&write_allow, write_deny, &read_denied_roots);
             (write_roots.allow, write_roots.deny)
         };
 
@@ -441,7 +435,7 @@ impl Settings {
             &read_allow,
             &read_deny,
             &read_denied_patterns,
-            &mut read_denied_roots,
+            &read_denied_roots,
         )?;
         let (read_access, read_symlinks) = (lowered_read.access, lowered_read.symlinks);
         read_denied_roots.extend(read_denied_always_roots.iter().cloned());
@@ -482,6 +476,17 @@ struct ResolvedDenyPaths {
 }
 
 impl ResolvedDenyPaths {
+    fn carveouts(&self, always: &Self, allow: &[PathBuf]) -> Vec<PathBuf> {
+        allow
+            .iter()
+            .filter(|path| {
+                !path.is_under_any(&always.concrete)
+                    && !matches_any_pattern(path, &always.patterns)
+                    && matches_any_pattern(path, &self.patterns)
+            })
+            .cloned()
+            .collect()
+    }
     fn merge_always(&mut self, always: &Self, allow: &mut Vec<PathBuf>) {
         allow.retain(|path| {
             !path.is_under_any(&always.concrete) && !matches_any_pattern(path, &always.patterns)
@@ -504,61 +509,35 @@ struct WindowsWriteRoots {
 fn lower_windows_write_access(
     write_allow: &[PathBuf],
     write_deny: Vec<PathBuf>,
-    read_deny: &[PathBuf],
-) -> Result<WindowsWriteRoots> {
-    // Windows ACLs cannot attach deny entries to paths that do not exist. Glob
-    // denials have the same snapshot limitation on both Windows backends.
+    read_denied_roots: &[PathBuf],
+) -> WindowsWriteRoots {
+    // Windows ACLs cannot attach deny entries to paths that do not exist or to
+    // volume roots. Nested denials under `allowWrite` are enforced by explicit
+    // DENY ACEs applied after the write grants so parent directories keep their
+    // write permission for sibling creation.
     let write_deny: Vec<PathBuf> = write_deny
         .into_iter()
-        .filter(|path| path.try_exists().unwrap_or(true))
+        .filter(|path| path.parent().is_some() && path.try_exists().unwrap_or(true))
         .collect();
 
-    // Carve nested denials out of inheriting write grants. Omit write roots
-    // fully covered by denyWrite.
-    let mut carve_denials = write_deny.clone();
-    for deny in read_deny {
-        if !carve_denials.iter().any(|existing| existing == deny) {
-            carve_denials.push(deny.clone());
-        }
-    }
-    carve_denials.normalize_roots();
-
-    let mut carved_writes = Vec::new();
-    for allow in write_allow {
-        let needs_carve = carve_denials
-            .iter()
-            .any(|deny| deny.is_strictly_under(allow));
-        if needs_carve {
-            let scan = scan_allowed_root(allow, &carve_denials, true, 0)?;
-            carved_writes.extend(scan.roots);
-        } else if allow.is_under_any(&write_deny) {
-            // Fully covered by a write deny — omit.
-        } else {
-            carved_writes.push(allow.clone());
-        }
-    }
+    let mut carved_writes: Vec<PathBuf> = write_allow
+        .iter()
+        .filter(|allow| !allow.is_under_any(&write_deny) && !allow.is_under_any(read_denied_roots))
+        .cloned()
+        .collect();
     carved_writes.normalize_roots();
 
-    // Independent denyWrite roots stay as DENY ACEs for defense in depth.
-    let write_deny = write_deny
-        .into_iter()
-        .filter(|deny| {
-            !carved_writes
-                .iter()
-                .any(|allow| deny.is_strictly_under(allow))
-        })
-        .collect();
-    Ok(WindowsWriteRoots {
+    WindowsWriteRoots {
         allow: carved_writes,
         deny: write_deny,
-    })
+    }
 }
 
 fn lower_read_access(
     read_allow: &[PathBuf],
     read_deny: &[PathBuf],
     read_denied_patterns: &[String],
-    read_denied_roots: &mut Vec<PathBuf>,
+    read_denied_roots: &[PathBuf],
 ) -> Result<LoweredReadAccess> {
     let fs_root = normalize_path(Path::new("/"));
     // Reject a full-volume Windows grant because propagating it over `C:\`
@@ -569,7 +548,8 @@ fn lower_read_access(
     }
 
     let has_dynamic_patterns = cfg!(not(target_os = "windows")) && !read_denied_patterns.is_empty();
-    if read_deny.is_empty() && !has_dynamic_patterns {
+    let has_windows_allow_roots = cfg!(target_os = "windows") && !read_allow.is_empty();
+    if read_deny.is_empty() && !has_dynamic_patterns && !has_windows_allow_roots {
         Ok(LoweredReadAccess {
             access: ReadAccess::Unrestricted,
             symlinks: Vec::new(),
@@ -595,27 +575,40 @@ fn lower_read_access(
 fn lower_restricted_read_access(
     read_allow: &[PathBuf],
     read_deny: &[PathBuf],
-    read_denied_roots: &mut Vec<PathBuf>,
+    read_denied_roots: &[PathBuf],
 ) -> Result<LoweredReadAccess> {
-    // Grant explicit roots and carve nested denials out of inheriting ALLOW
-    // entries.
-    let mut denied = read_deny.to_vec();
-    denied.normalize_roots();
+    // Denials that survive in `read_denied_roots` receive explicit DENY ACEs.
+    // Only non-root denials overridden by a more specific `allowRead` (and
+    // therefore omitted from `read_denied_roots`) need directory carving.
+    let mut carve_denials: Vec<PathBuf> = read_deny
+        .iter()
+        .filter(|deny| {
+            deny.parent().is_some()
+                && !read_denied_roots.contains(deny)
+                && read_allow.iter().any(|allow| allow.is_strictly_under(deny))
+        })
+        .cloned()
+        .collect();
+    carve_denials.normalize_roots();
+
     let mut roots = Vec::new();
     let mut symlinks = Vec::new();
     for allow in read_allow {
-        let needs_carve = denied.iter().any(|deny| deny.is_strictly_under(allow));
-        if needs_carve {
-            let scan = scan_allowed_root(allow, &denied, true, 0)?;
+        let nested_denials: Vec<PathBuf> = carve_denials
+            .iter()
+            .filter(|deny| deny.is_strictly_under(allow))
+            .cloned()
+            .collect();
+        if nested_denials.is_empty() {
+            roots.push(allow.clone());
+        } else {
+            let scan = scan_allowed_root(allow, &nested_denials, true, 0)?;
             roots.extend(scan.roots);
             symlinks.extend(scan.symlinks);
-        } else {
-            roots.push(allow.clone());
         }
     }
     roots.normalize_roots();
     symlinks.normalize_roots();
-    read_denied_roots.clear();
     Ok(LoweredReadAccess {
         access: ReadAccess::AllowRoots(roots),
         symlinks,
@@ -626,7 +619,7 @@ fn lower_restricted_read_access(
 fn lower_restricted_read_access(
     read_allow: &[PathBuf],
     read_deny: &[PathBuf],
-    _read_denied_roots: &mut Vec<PathBuf>,
+    _read_denied_roots: &[PathBuf],
 ) -> Result<LoweredReadAccess> {
     let mut denied = read_deny.to_vec();
     denied.normalize_roots();

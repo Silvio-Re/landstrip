@@ -68,7 +68,11 @@ impl GrantPlan {
             );
         }
         for path in &policy.read_denied_roots {
-            plan.add_subtree_deny(path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, DENY_ACCESS);
+            plan.add_subtree_deny(
+                path,
+                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | DELETE,
+                DENY_ACCESS,
+            );
         }
         plan.add_local(request_path, FILE_GENERIC_READ, GRANT_ACCESS);
         Ok(plan)

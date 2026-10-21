@@ -525,7 +525,11 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess
         )?;
     }
     for path in &policy.read_denied_roots {
-        deny_subtree_access(&mut granted, path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
+        deny_subtree_access(
+            &mut granted,
+            path,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | DELETE,
+        )?;
     }
 
     Ok(granted)
