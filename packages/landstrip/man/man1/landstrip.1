@@ -38,15 +38,13 @@ Execute a sandboxed program under the merged policy.
 Check parsing, paths, executable policy, and platform support.
 .It Cm resolve
 Print the normalized merged policy as JSON.
-.It Cm capabilities
-Output structured JSON capabilities and supported platform features.
 .It Cm doctor
-Report sandbox health.
+Report sandbox health and supported/available capabilities as JSON.
 .It Cm windows install
 Install restricted-user isolation; requires elevation.
 .It Cm windows prepare-appcontainer
-Prepare null-device and root directory lookup access for standard AppContainer and LPAC;
-requires elevation and verifies both modes without changing restricted users.
+Prepare null-device and root directory lookup access for standard AppContainer
+and LPAC; requires elevation and verifies both modes.
 .It Cm windows status
 Report the active implementation and its health.
 .It Cm windows uninstall
@@ -81,7 +79,8 @@ Select
 or
 .Va yaml .
 .It Fl -cwd Ar dir
-Set the working directory for policy resolution and execution (defaults to the current working directory).
+Set the working directory for policy resolution and execution
+(defaults to the current working directory).
 .It Fl -tool Ar program
 Include the resolved executable's policy when validating or resolving.
 .El
@@ -135,14 +134,25 @@ Example fields, subject to the platform limits below:
   "network": {
     "allowNetwork": false, "allowLocalBinding": false,
     "httpProxyPort": 8080, "socksProxyPort": 8081,
-    "allowUnixSockets": []
+    "allowUnixSockets": [], "allowAllUnixSockets": false
+  },
+  "macos": {
+    "allowTrustd": false, "allowMachLookup": [],
+    "allowAppleEvents": false, "allowPty": false
   },
   "windows": { "appContainerMode": "lpac", "allowLoopback": false }
 }
 .Ed
 .Pp
-Relative paths use the starting directory; tilde uses the current user's home.
-Entries accept shell-style globs.
+Relative paths resolve against
+.Fl -cwd
+(default: current working directory);
+.Sq ~
+expands to the user's home directory.
+Path entries accept bare strings, explicit literal selectors
+.Pq Dq literal ,
+or explicit glob selectors
+.Pq Dq glob .
 .Ss Filesystem
 Writes default to denied.
 .Va allowWrite
@@ -151,132 +161,95 @@ grants roots;
 takes precedence.
 .Va denyWriteAlways
 cannot be overridden by grants or broker approval.
-Reads default to unrestricted on Linux/macOS.
+Reads default to unrestricted on Linux/macOS and require explicit
+.Va allowRead
+grants on Windows.
 .Va allowRead
 adds exceptions to
 .Va denyRead ,
 but never
 .Va denyReadAlways .
-Protected roots and descendants stay denied through canonical symlink aliases
-and broker approval.
-Use concrete credential paths: read globs expand only at startup.
-.Pp
-Linux/macOS enforce concrete and glob write denials at access time;
-Windows enforces only concrete paths existing at startup.
-.Ss Network
-Direct TCP is denied by default.
-Linux/macOS proxy ports permit host-local TCP but do not start proxies.
-.Va allowLocalBinding
-permits host-local TCP/UDP binding and connections, not remote UDP.
-Linux mediates per-datagram destinations and permits AF_UNSPEC disconnection.
-macOS's localhost matcher may include other local interfaces, not just loopback.
-.Va allowUnixSockets
-permits listed pathname sockets, otherwise denied.
-Windows supports neither local binding nor Unix socket policy.
-.Va allowNetwork
-permits general access, including remote UDP, without relaxing filesystem or
-escape-prevention rules.
-.Ss Linux process isolation
-Commands always run in new user, PID, and mount namespaces with a private
-procfs that hides host processes.
-Execution fails if namespaces or procfs mounting are unavailable; it never
-falls back to the host process table.
-.Pp
-The tool runs under a native PID-1 reaper that forwards termination signals
-and removes remaining descendants, including double-forked processes.
-Landlock and seccomp remain responsible for filesystem and network enforcement.
-No network namespace is created; existing proxy access is unchanged.
-Inherited descriptors remain explicit grants and can expose host resources.
-.Pp
-.Cm capabilities
-and
-.Cm doctor
-report namespace availability as part of sandbox health, with the failure reason.
-.Ss Windows
-Requires explicit read grants and rejects nonempty
+Protected roots and descendants stay denied across moves, hard links,
+canonical symlink aliases, and broker approval.
+Linux/macOS enforce concrete and glob read/write denials at access time;
+Windows enforces only concrete non-root paths existing at startup and rejects
+nonempty
 .Va denyReadAlways
 and
-.Va denyWriteAlways
-before path resolution, even for missing paths or unmatched globs.
-.Va windows.appContainerMode
-selects
-.Va lpac
-(default, stronger) or
-.Va standard .
-.Va windows.allowLoopback
-exposes all local loopback services in AppContainer mode, without per-port
-proxy grants.
-Restricted-user mode permits only the proxy range chosen at installation.
-.Sh PLATFORM NOTES
+.Va denyWriteAlways .
+.Ss Network
+Direct TCP/UDP is denied by default.
+Linux/macOS proxy ports permit loopback TCP to those ports without starting
+a proxy.
+.Va allowLocalBinding
+permits host-local TCP/UDP binding and connections, not remote UDP.
+.Va allowUnixSockets
+permits listed pathname sockets and
+.Va allowAllUnixSockets
+permits all pathname Unix sockets, independently of
+.Va allowNetwork .
+Windows supports neither local binding nor Unix socket policy.
+.Va allowNetwork
+permits general IP networking without relaxing Unix socket, filesystem, or
+escape-prevention rules.
+.Ss Platform enforcement
 .Bl -tag -width Windows
 .It Linux
+Commands run in new user, PID, and mount namespaces with a private procfs and
+a PID-1 reaper that forwards termination signals and reaps all descendants
+on exit.
 Landlock enforces filesystem roots; seccomp brokers network/filesystem traps
-and blocks service-manager sockets even with unrestricted networking.
+and blocks service-manager sockets and io_uring.
 Linux 6.12+ also restricts abstract Unix sockets and signals outside
 the sandbox.
-io_uring setup/enter/register are blocked; an active
-.Dv IORING_SETUP_SQPOLL
-ring supplied by another process can consume shared-memory submissions outside
-this boundary.
 .It macOS
 Seatbelt fixes the profile at startup.
+.Va macos.allowTrustd ,
+.Va macos.allowMachLookup
+(exact service names or
+.Sq *
+prefix wildcards),
+.Va macos.allowAppleEvents ,
+and
+.Va macos.allowPty
+grant the corresponding IPC or pseudo-terminal access.
 .Dv AF_ROUTE
-sockets remain available under every network policy for route/interface
-discovery; kernel checks prevent unprivileged route changes.
+sockets remain available for route/interface discovery.
 .It Windows
-AppContainer or restricted users enforce explicit filesystem grants;
-restricted-user networking uses Windows Filtering Platform.
-.Pp
+Uses AppContainer
+.Pq Va lpac No default or Va standard
+or restricted users with Windows Filtering Platform.
+.Va windows.allowLoopback
+exposes local loopback services in AppContainer mode; restricted-user mode
+permits only the installed proxy port range.
 If AppContainer cannot open
 .Pa NUL ,
-Git for Windows and shell null redirections fail regardless of policy.
-Run
+run
 .Cm landstrip windows prepare-appcontainer
-from an interactive Windows session after each reboot.
-This repeatable, machine-wide change grants non-inheritable read/write access
-to ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES.
-Existing denies, ownership, and auditing are preserved.
-It adds no sandbox filesystem/network policy grants or background service;
-commands stay unelevated.
-.Pp
-In AppContainer mode,
-.Cm doctor
-and
-.Cm windows status
-probe fresh null-device and root directory lookup access with standard and LPAC tokens.
-Setup/access failures produce unhealthy reports with mode-specific errors,
-not certification that every tool or dependency can start.
-Integration tests require null-device preparation and do not request elevation.
+from an interactive session after reboot to grant non-inheritable null-device
+and root lookup access to AppContainer package SIDs.
 .El
 .Sh OUTPUT
 Policy, doctor, and Windows management commands write one JSON document
 to stdout.
 Failures and reported Linux broker denials are JSON lines on stderr with stable
 .Va kind
+.Pq Va filesystem , network , launch , usage , internal
 and
 .Va code
 fields.
-Kinds:
-.Va filesystem , network , launch , usage , internal .
-Filesystem/network events are Linux-only, not an exhaustive access audit.
-.Pp
 .Fl -trap
 receives these events except usage errors.
-Linux approval queries require a bidirectional stream socket and appear
-only there.
-Reply with a JSON line containing the unchanged string
+Linux approval queries require a bidirectional stream socket on
+.Fl -trap ;
+reply with a JSON line containing the unchanged
 .Va query_id
 and
 .Va action
-of
-.Dq allow
-or
-.Dq deny .
-An unanswered query holds the syscall.
+.Pq Dq allow No or Dq deny .
 .Sh EXIT STATUS
-Program execution returns the program's status.
-With a Linux seccomp broker, remaining descendants
-are terminated and reaped on exit; background processes cannot outlive the run.
+Program execution returns the program's status after terminating and reaping
+any remaining Linux sandbox descendants.
 Other failures, including invalid policies and unhealthy reports, return 1;
 usage errors return 2.
 .Sh EXAMPLES

@@ -18,7 +18,7 @@ See the [quick start](../../README.md#quick-start) for a policy and CLI example;
 const { execFileSync } = require("node:child_process");
 const { binaryPath } = require("@landstrip/landstrip-api");
 
-execFileSync(binaryPath(), ["-p", "policy.json", "--", "cargo", "test"], {
+execFileSync(binaryPath(), ["run", "-p", "policy.json", "--", "cargo", "test"], {
   stdio: "inherit",
 });
 ```
