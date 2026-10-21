@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::policy::AccessPolicy;
 use serde::Serialize;
 use std::io::{self, Write};
 #[cfg(target_os = "windows")]
@@ -156,65 +155,32 @@ impl WindowsStatusReport {
 #[derive(Debug)]
 pub(crate) enum CommandOutcome {
     Exit(i32),
-    PolicyValidated(PolicyValidationReport),
-    PolicyResolved(Box<AccessPolicy>),
-    Doctor(DoctorReport),
-    #[cfg(target_os = "windows")]
-    Windows(WindowsStatusReport),
+    Json {
+        exit_code: i32,
+        value: serde_json::Value,
+    },
 }
 
 impl CommandOutcome {
+    pub(crate) fn json(ok: bool, value: impl Serialize) -> anyhow::Result<Self> {
+        Ok(Self::Json {
+            exit_code: i32::from(!ok),
+            value: serde_json::to_value(value)?,
+        })
+    }
+
     pub(crate) fn exit_code(&self) -> i32 {
         match self {
             Self::Exit(code) => *code,
-            Self::PolicyValidated(report) => i32::from(!report.valid),
-            Self::Doctor(report) => i32::from(!report.ok),
-            #[cfg(target_os = "windows")]
-            Self::Windows(report) => i32::from(!report.healthy),
-            Self::PolicyResolved(_) => 0,
+            Self::Json { exit_code, .. } => *exit_code,
         }
     }
 
     pub(crate) fn write_to(&self, mut output: impl Write) -> io::Result<()> {
-        match self {
-            Self::Exit(_) => return Ok(()),
-            Self::PolicyValidated(report) => serde_json::to_writer(&mut output, report)?,
-            Self::PolicyResolved(policy) => serde_json::to_writer(&mut output, policy)?,
-            Self::Doctor(report) => serde_json::to_writer(&mut output, report)?,
-            #[cfg(target_os = "windows")]
-            Self::Windows(report) => serde_json::to_writer(&mut output, report)?,
+        if let Self::Json { value, .. } = self {
+            serde_json::to_writer(&mut output, value)?;
+            writeln!(output)?;
         }
-        writeln!(output)
-    }
-}
-
-impl From<i32> for CommandOutcome {
-    fn from(code: i32) -> Self {
-        Self::Exit(code)
-    }
-}
-
-impl From<PolicyValidationReport> for CommandOutcome {
-    fn from(report: PolicyValidationReport) -> Self {
-        Self::PolicyValidated(report)
-    }
-}
-
-impl From<AccessPolicy> for CommandOutcome {
-    fn from(policy: AccessPolicy) -> Self {
-        Self::PolicyResolved(Box::new(policy))
-    }
-}
-
-impl From<DoctorReport> for CommandOutcome {
-    fn from(report: DoctorReport) -> Self {
-        Self::Doctor(report)
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl From<WindowsStatusReport> for CommandOutcome {
-    fn from(report: WindowsStatusReport) -> Self {
-        Self::Windows(report)
+        Ok(())
     }
 }

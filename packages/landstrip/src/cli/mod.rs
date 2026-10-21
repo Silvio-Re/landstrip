@@ -73,11 +73,14 @@ fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
         Command::Run(command) => run(command),
         Command::Check(request) => check_policy(request),
         Command::Resolve(request) => resolve_policy(request),
-        Command::Doctor => platform::doctor().map(CommandOutcome::from),
+        Command::Doctor => {
+            platform::doctor().and_then(|report| CommandOutcome::json(report.ok, report))
+        }
         #[cfg(target_os = "windows")]
-        Command::Windows(command) => platform::manage_windows(command).map(CommandOutcome::from),
+        Command::Windows(command) => platform::manage_windows(command)
+            .and_then(|report| CommandOutcome::json(report.healthy, report)),
         #[cfg(target_os = "windows")]
-        Command::Worker { request } => platform::run_worker(request).map(CommandOutcome::from),
+        Command::Worker { request } => platform::run_worker(request).map(CommandOutcome::Exit),
     }
 }
 
@@ -104,18 +107,19 @@ fn run(command: &RunCommand) -> Result<CommandOutcome> {
     #[cfg(not(unix))]
     let result = platform::execute(&policy, &command.cwd, &command.tool, &command.tool_args);
 
-    result.map(CommandOutcome::from)
+    result.map(CommandOutcome::Exit)
 }
 
 fn check_policy(request: &PolicyRequest) -> Result<CommandOutcome> {
     let result = load_policy(&request.policy, &request.cwd, request.tool.as_deref())
         .and_then(|policy| platform::validate(&policy));
-    policy_validation_report(result).map(CommandOutcome::from)
+    let report = policy_validation_report(result)?;
+    CommandOutcome::json(report.valid, report)
 }
 
 fn resolve_policy(request: &PolicyRequest) -> Result<CommandOutcome> {
     let policy = load_policy(&request.policy, &request.cwd, request.tool.as_deref())?;
-    Ok(CommandOutcome::from(policy))
+    CommandOutcome::json(true, policy)
 }
 
 fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport> {

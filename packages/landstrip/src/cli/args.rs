@@ -62,10 +62,22 @@ pub(super) struct RunCommand {
     pub(super) tool_args: Vec<OsString>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Args)]
 pub(super) struct PolicyRequest {
+    #[command(flatten)]
     pub(super) policy: PolicyInput,
+
+    /// Working directory for execution and relative path resolution.
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = ".",
+        value_parser = PathBufValueParser::new().try_map(std::path::absolute)
+    )]
     pub(super) cwd: PathBuf,
+
+    /// Include policy attached to this executable.
+    #[arg(long, value_name = "PROGRAM")]
     pub(super) tool: Option<OsString>,
 }
 
@@ -100,10 +112,10 @@ enum CliCommand {
     /// Run a command inside the sandbox.
     Run(RunArgs),
     /// Check policy parsing, merging, resolution, and platform support.
-    Check(PolicyRequestArgs),
+    Check(PolicyRequest),
     /// Print the final normalized policy as JSON.
-    Resolve(PolicyRequestArgs),
-    /// Verify that the current OS sandbox is operational and report capabilities.
+    Resolve(PolicyRequest),
+    /// Verify sandbox health and report supported/available capabilities.
     Doctor,
     #[cfg(target_os = "windows")]
     /// Manage Windows sandbox preparation and restricted-user provisioning.
@@ -134,33 +146,17 @@ struct RunArgs {
     #[arg(long = "inherit", value_name = "FD[,FD...]", value_delimiter = ',', value_parser = parse_fd)]
     inherited_fds: Vec<i32>,
 
-    /// Program and arguments to run.
+    /// Program to run.
+    #[arg(required = true, value_name = "PROGRAM")]
+    tool: OsString,
+
+    /// Arguments passed to the program.
     #[arg(
-        required = true,
-        num_args = 1..,
         trailing_var_arg = true,
-        value_name = "PROGRAM [ARGS...]"
+        allow_hyphen_values = true,
+        value_name = "ARGS"
     )]
-    program: Vec<OsString>,
-}
-
-#[derive(Debug, Args)]
-struct PolicyRequestArgs {
-    #[command(flatten)]
-    policy: PolicyInput,
-
-    /// Working directory for execution and relative path resolution.
-    #[arg(
-        long,
-        value_name = "DIR",
-        default_value = ".",
-        value_parser = PathBufValueParser::new().try_map(std::path::absolute)
-    )]
-    cwd: PathBuf,
-
-    /// Include policy attached to this executable.
-    #[arg(long, value_name = "PROGRAM")]
-    tool: Option<OsString>,
+    tool_args: Vec<OsString>,
 }
 #[cfg(target_os = "windows")]
 #[derive(Debug, Args)]
@@ -261,82 +257,83 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
         }
     };
 
-    let command = match cli.command {
-        CliCommand::Run(args) => Command::Run(run_command(args)?),
-        CliCommand::Check(args) => Command::Check(args.into()),
-        CliCommand::Resolve(args) => Command::Resolve(args.into()),
-        CliCommand::Doctor => Command::Doctor,
-        #[cfg(target_os = "windows")]
-        CliCommand::Windows(args) => Command::Windows(match args.command {
-            WindowsAction::Install(args) => WindowsCommand::Install {
+    Ok(ParseOutcome::Invocation(Invocation {
+        debug: cli.debug,
+        command: Command::try_from(cli.command)?,
+    }))
+}
+
+impl TryFrom<CliCommand> for Command {
+    type Error = Error;
+
+    fn try_from(command: CliCommand) -> Result<Self, Self::Error> {
+        Ok(match command {
+            CliCommand::Run(args) => Self::Run(args.try_into()?),
+            CliCommand::Check(request) => Self::Check(request),
+            CliCommand::Resolve(request) => Self::Resolve(request),
+            CliCommand::Doctor => Self::Doctor,
+            #[cfg(target_os = "windows")]
+            CliCommand::Windows(args) => Self::Windows(args.into()),
+        })
+    }
+}
+
+impl TryFrom<RunArgs> for RunCommand {
+    type Error = Error;
+
+    fn try_from(args: RunArgs) -> Result<Self, Self::Error> {
+        #[cfg(unix)]
+        let inherited_fds = {
+            let mut fds = args.inherited_fds;
+            fds.sort_unstable();
+            if fds.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(Error::Usage {
+                    message: "--inherit must not contain duplicate descriptors".to_owned(),
+                });
+            }
+            if args.trap_fd.is_some_and(|fd| fds.contains(&fd)) {
+                return Err(Error::Usage {
+                    message: "--inherit must not include --trap".to_owned(),
+                });
+            }
+            fds.into_iter()
+                .map(|fd| {
+                    // SAFETY: parse_fd validated this inherited descriptor. The
+                    // CLI owns it; duplicate and trap checks ensure unique ownership.
+                    unsafe { OwnedFd::from_raw_fd(fd) }
+                })
+                .collect()
+        };
+        Ok(Self {
+            policy: args.policy,
+            cwd: args.cwd,
+            #[cfg(unix)]
+            trap_fd: args.trap_fd.map(|fd| {
+                // SAFETY: parse_fd established that the inherited descriptor is open,
+                // and `--trap` transfers its ownership to this process.
+                TrapFd::from(unsafe { OwnedFd::from_raw_fd(fd) })
+            }),
+            #[cfg(unix)]
+            inherited_fds,
+            tool: args.tool,
+            tool_args: args.tool_args,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl From<WindowsArgs> for WindowsCommand {
+    fn from(args: WindowsArgs) -> Self {
+        match args.command {
+            WindowsAction::Install(args) => Self::Install {
                 restricted_accounts: args.restricted_accounts,
                 unrestricted_accounts: args.unrestricted_accounts,
                 proxy_port_low: args.proxy_port_range.low,
                 proxy_port_high: args.proxy_port_range.high,
             },
-            WindowsAction::PrepareAppContainer => WindowsCommand::PrepareAppContainer,
-            WindowsAction::Status => WindowsCommand::Status,
-            WindowsAction::Uninstall => WindowsCommand::Uninstall,
-        }),
-    };
-
-    Ok(ParseOutcome::Invocation(Invocation {
-        debug: cli.debug,
-        command,
-    }))
-}
-
-fn run_command(args: RunArgs) -> Result<RunCommand, Error> {
-    let mut program = args.program.into_iter();
-    let Some(tool) = program.next() else {
-        return Err(Error::Usage {
-            message: "a program is required".to_owned(),
-        });
-    };
-    #[cfg(unix)]
-    let inherited_fds = {
-        let mut fds = args.inherited_fds;
-        fds.sort_unstable();
-        if fds.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(Error::Usage {
-                message: "--inherit must not contain duplicate descriptors".to_owned(),
-            });
-        }
-        if args.trap_fd.is_some_and(|fd| fds.contains(&fd)) {
-            return Err(Error::Usage {
-                message: "--inherit must not include --trap".to_owned(),
-            });
-        }
-        fds.into_iter()
-            .map(|fd| {
-                // SAFETY: parse_fd validated this inherited descriptor. The
-                // CLI owns it; duplicate and trap checks ensure unique ownership.
-                unsafe { OwnedFd::from_raw_fd(fd) }
-            })
-            .collect()
-    };
-    Ok(RunCommand {
-        policy: args.policy,
-        cwd: args.cwd,
-        #[cfg(unix)]
-        trap_fd: args.trap_fd.map(|fd| {
-            // SAFETY: parse_fd established that the inherited descriptor is open,
-            // and `--trap` transfers its ownership to this process.
-            TrapFd::from(unsafe { OwnedFd::from_raw_fd(fd) })
-        }),
-        #[cfg(unix)]
-        inherited_fds,
-        tool,
-        tool_args: program.collect(),
-    })
-}
-
-impl From<PolicyRequestArgs> for PolicyRequest {
-    fn from(args: PolicyRequestArgs) -> Self {
-        Self {
-            policy: args.policy,
-            cwd: args.cwd,
-            tool: args.tool,
+            WindowsAction::PrepareAppContainer => Self::PrepareAppContainer,
+            WindowsAction::Status => Self::Status,
+            WindowsAction::Uninstall => Self::Uninstall,
         }
     }
 }
