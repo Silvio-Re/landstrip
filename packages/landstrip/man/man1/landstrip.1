@@ -11,7 +11,7 @@
 .Op Fl p Ar file
 .Op Fl -policy-format Ar format
 .Op Fl -cwd Ar dir
-.Op Fl -trap Ar FD
+.Op Fl -trap Ar FD|PATH
 .Op Fl -inherit Ar FD[,FD...]
 .Op Fl -
 .Ar program
@@ -91,13 +91,18 @@ remain relative to the caller's working directory.
 Include the resolved executable's policy when validating or resolving.
 .El
 .Ss Run descriptors
-Linux/macOS only; descriptors must be open, distinct, and numbered 3 or higher.
+Unix (Linux/macOS) only; supplied descriptors must be open, distinct, and
+numbered 3 or higher.
 .Bl -tag -width Ds
-.It Fl -trap Ar FD
-Write events to one descriptor; not repeatable.
-The program never inherits it.
-Linux supports runtime broker traps and approval queries; macOS reports only
-setup/launch failures and closes it on successful exec.
+.It Fl -trap Ar FD|PATH
+Use an inherited open descriptor or an absolute Unix domain stream socket path;
+not repeatable.
+For a path, the host Landstrip process connects to an existing listener before
+sandbox setup.
+The sandboxed program never inherits the trap transport.
+On Linux the stream is bidirectional and uses the existing broker query/response
+protocol, not merely passive monitoring.
+macOS reports only setup/launch failures and closes it on successful exec.
 See
 .Sx OUTPUT .
 .It Fl -inherit Ar FD[,FD...]

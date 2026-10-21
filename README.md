@@ -43,6 +43,14 @@ private `/proc`. Landlock and seccomp still enforce filesystem and network
 policy. Execution fails closed when namespaces are unavailable; `check` and
 `doctor` report the kernel error.
 
+## Trap transport and denial reporting
+
+On Unix, `landstrip run --trap FD|PATH` accepts an inherited open FD ≥3 or
+an absolute Unix domain stream socket path. Landstrip connects to the listening
+socket before sandbox setup; the sandboxed child never inherits the trap
+transport. On Linux the stream is bidirectional, using the existing broker
+query/response protocol, not merely passive monitoring.
+
 ## Integrations
 
 - [Node.js API](packages/landstrip-api/README.md)

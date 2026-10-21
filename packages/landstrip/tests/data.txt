@@ -9,6 +9,7 @@
 # fd whenever landstrip still owns it ---
 
 name=usage error reports a usage trap | os=linux,macos | trap=true | status=2 | out=Usage: | out="kind":"usage" | out="code":"USAGE_ERROR" | trapfd_empty
+name=trap socket transport | os=linux,macos | launcher=python3 %REPO%/tests/probe/trap.py "$1"; exit $? | timeout_secs=30 | status=0 | out=trap socket verified
 name=executable policy follows requested working directory | os=linux,macos | launcher=python3 %REPO%/tests/probe/executable_policy.py "$1"; exit $? | timeout_secs=90 | status=0 | out=executable policy verified (51 cases)
 name=launch error reports a launch trap (linux) | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%TMP%/no-such-tool-%PID% | status=!0 | out="kind":"launch" | out="code":"LAUNCH_FAILED" | out="errno":"ENOENT" | out=no-such-tool | trapfd="kind":"launch" | trapfd="code":"LAUNCH_FAILED"
 name=launch error reports a launch trap (macos) | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%TMP%/no-such-tool-%PID% | status=!0 | out="kind":"launch" | out="code":"LAUNCH_FAILED" | out="errno":"ENOENT" | trapfd="kind":"launch" | trapfd="code":"LAUNCH_FAILED"
@@ -26,6 +27,9 @@ name=trap rejects fd overflow | os=linux,macos | cli=--trap 2147483648 | policy=
 name=trap rejects fd list | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 | cli=--trap 3,4 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
 name=trap rejects multiple descriptors | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 | cli=--trap 3 --trap 4 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
 name=trap rejects repeated descriptor | os=linux,macos | fd3=allowed/fds | cli=--trap 3 --trap 3 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects relative socket path | os=linux,macos | cli=--trap ./trap.sock | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects missing socket | os=linux,macos | cli=--trap %TMP%/missing.sock | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects regular file socket target | os=linux,macos | setup=write:trap.sock:data | cli=--trap %TMP%/trap.sock | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
 name=inherit rejects empty fd | os=linux,macos | cli=--inherit '' | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
 name=inherit rejects noninteger fd | os=linux,macos | cli=--inherit abc | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
 name=inherit rejects negative fd | os=linux,macos | cli=--inherit=-1 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran

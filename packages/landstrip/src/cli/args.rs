@@ -137,9 +137,9 @@ struct RunArgs {
     cwd: PathBuf,
 
     #[cfg(unix)]
-    /// Write traps to an already-open file descriptor.
-    #[arg(long = "trap", value_name = "FD", value_parser = parse_fd)]
-    trap_fd: Option<i32>,
+    /// Write traps to an open file descriptor or Unix domain socket path.
+    #[arg(long = "trap", value_name = "FD|PATH", value_parser = parse_trap_target)]
+    trap: Option<TrapTarget>,
 
     #[cfg(unix)]
     /// Preserve open descriptors across sandbox exec (grants access to those resources).
@@ -291,7 +291,9 @@ impl TryFrom<RunArgs> for RunCommand {
                     message: "--inherit must not contain duplicate descriptors".to_owned(),
                 });
             }
-            if args.trap_fd.is_some_and(|fd| fds.contains(&fd)) {
+            if let Some(TrapTarget::Fd(fd)) = args.trap
+                && fds.contains(&fd)
+            {
                 return Err(Error::Usage {
                     message: "--inherit must not include --trap".to_owned(),
                 });
@@ -304,15 +306,25 @@ impl TryFrom<RunArgs> for RunCommand {
                 })
                 .collect()
         };
+        #[cfg(unix)]
+        let trap_fd = match args.trap {
+            Some(TrapTarget::Fd(fd)) => {
+                // SAFETY: parse_fd established that the inherited descriptor is open,
+                // and `--trap` transfers its ownership to this process.
+                Some(TrapFd::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+            }
+            Some(TrapTarget::Socket(path)) => {
+                Some(TrapFd::connect(&path).map_err(|error| Error::Usage {
+                    message: format!("trap socket {}: {error}", path.display()),
+                })?)
+            }
+            None => None,
+        };
         Ok(Self {
             policy: args.policy,
             cwd: args.cwd,
             #[cfg(unix)]
-            trap_fd: args.trap_fd.map(|fd| {
-                // SAFETY: parse_fd established that the inherited descriptor is open,
-                // and `--trap` transfers its ownership to this process.
-                TrapFd::from(unsafe { OwnedFd::from_raw_fd(fd) })
-            }),
+            trap_fd,
             #[cfg(unix)]
             inherited_fds,
             tool: args.tool,
@@ -367,6 +379,21 @@ fn parse_policy_path(path: &str) -> Result<PathBuf, String> {
         return Err("policy path cannot be empty".to_owned());
     }
     Ok(PathBuf::from(path))
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+enum TrapTarget {
+    Fd(i32),
+    Socket(PathBuf),
+}
+
+#[cfg(unix)]
+fn parse_trap_target(value: &str) -> Result<TrapTarget, String> {
+    if value.starts_with('/') {
+        return Ok(TrapTarget::Socket(PathBuf::from(value)));
+    }
+    parse_fd(value).map(TrapTarget::Fd)
 }
 
 #[cfg(unix)]

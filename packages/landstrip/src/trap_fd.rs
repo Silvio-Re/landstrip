@@ -6,6 +6,8 @@
 use crate::trap::Trap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -32,6 +34,10 @@ impl AsRawFd for TrapFd {
 }
 
 impl TrapFd {
+    pub(crate) fn connect(path: &Path) -> io::Result<Self> {
+        UnixStream::connect(path).map(|stream| Self(OwnedFd::from(stream)))
+    }
+
     pub(crate) fn is_stream_socket(&self) -> bool {
         loop {
             let mut socket_type = 0;

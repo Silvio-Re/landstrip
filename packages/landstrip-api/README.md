@@ -39,6 +39,20 @@ Proxy helpers: [`/proxy`](lib/proxy.d.ts). [`/shared`](lib/shared.d.ts) provides
   Failed writes clean up; failed cleanup reports both errors and the directory
   path in an `AggregateError`.
 
+## Trap transport and reporting
+
+On Unix, `--trap FD|PATH` accepts either an inherited open FD ≥3 or an absolute
+Unix domain stream socket path. Start the socket listener before launching
+Landstrip: the host Landstrip process connects before sandbox setup, and the
+sandboxed child never inherits the trap transport.
+
+On Linux, the stream is bidirectional and uses the existing broker query
+protocol, not merely passive monitoring. For `state: "query"` events, reply on
+the same socket with `controlResponseLine(trap.query_id, "allow")` (or `"deny"`);
+the syscall waits for an answer. Completed events have `state: "info"`.
+macOS reports setup/launch failures on the trap
+transport and closes it on successful exec; use Seatbelt logs for runtime denials.
+
 ## Development
 
 Run `make ci` from the repository root.
