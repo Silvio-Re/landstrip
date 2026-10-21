@@ -9,6 +9,7 @@
 # fd whenever landstrip still owns it ---
 
 name=usage error reports a usage trap | os=linux,macos | trap=true | status=2 | out=Usage: | out="kind":"usage" | out="code":"USAGE_ERROR" | trapfd_empty
+name=executable policy follows requested working directory | os=linux,macos | launcher=python3 %REPO%/tests/probe/executable_policy.py "$1"; exit $? | timeout_secs=90 | status=0 | out=executable policy verified (51 cases)
 name=launch error reports a launch trap (linux) | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%TMP%/no-such-tool-%PID% | status=!0 | out="kind":"launch" | out="code":"LAUNCH_FAILED" | out="errno":"ENOENT" | out=no-such-tool | trapfd="kind":"launch" | trapfd="code":"LAUNCH_FAILED"
 name=launch error reports a launch trap (macos) | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%TMP%/no-such-tool-%PID% | status=!0 | out="kind":"launch" | out="code":"LAUNCH_FAILED" | out="errno":"ENOENT" | trapfd="kind":"launch" | trapfd="code":"LAUNCH_FAILED"
 name=policy parse error reports an internal trap | os=linux,macos | policy={bad | trap=true | cmd=%SHELL% -c 'printf ok' | status=!0 | out="kind":"internal" | out="code":"POLICY_PARSE_FAILED" | trapfd="kind":"internal" | trapfd="code":"POLICY_PARSE_FAILED"

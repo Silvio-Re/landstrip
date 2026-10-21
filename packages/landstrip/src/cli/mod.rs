@@ -158,7 +158,7 @@ fn load_policy(
 ) -> Result<AccessPolicy> {
     let format = PolicyFormat::try_from(input)?;
     log::debug!("cli: cwd: {}", cwd.display());
-    let settings = load_settings(&input.paths, format, tool)?;
+    let settings = load_settings(&input.paths, format, tool, cwd)?;
     settings.resolve(cwd)
 }
 

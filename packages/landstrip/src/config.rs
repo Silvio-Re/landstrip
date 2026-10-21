@@ -142,6 +142,7 @@ pub(crate) fn load_settings(
     policy_paths: &[PathBuf],
     format: PolicyFormat,
     tool: Option<&OsStr>,
+    cwd: &Path,
 ) -> Result<Settings> {
     let mut merged = Value::Object(Map::new());
 
@@ -165,7 +166,7 @@ pub(crate) fn load_settings(
     }
 
     if let Some(tool) = tool
-        && let Some(value) = read_executable_policy(tool, format)?
+        && let Some(value) = read_executable_policy(tool, format, cwd)?
     {
         merge_json(&mut merged, value);
     }
@@ -183,8 +184,8 @@ pub(crate) fn load_settings(
 /// search unless the name already names a location) and then canonicalized,
 /// so the attribute is always read from the real executable inode a `PATH`
 /// trick cannot relocate.
-fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<Value>> {
-    let Some(exe) = resolve_executable(tool) else {
+fn read_executable_policy(tool: &OsStr, format: PolicyFormat, cwd: &Path) -> Result<Option<Value>> {
+    let Some(exe) = resolve_executable(tool, cwd) else {
         return Ok(None);
     };
     let context = format!("executable policy {}", exe.display());
@@ -200,17 +201,19 @@ fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<V
     Ok(Some(value))
 }
 
-fn resolve_executable(tool: &OsStr) -> Option<PathBuf> {
+fn resolve_executable(tool: &OsStr, cwd: &Path) -> Option<PathBuf> {
+    let base = if cfg!(unix) { cwd } else { Path::new("") };
     let tool_path = Path::new(tool);
     let has_location = tool_path
         .parent()
         .is_some_and(|parent| !parent.as_os_str().is_empty());
 
     let candidate = if has_location {
-        locate_executable(tool_path)?
+        locate_executable(&base.join(tool_path))?
     } else {
         let path_var = std::env::var_os("PATH")?;
-        std::env::split_paths(&path_var).find_map(|dir| locate_executable(&dir.join(tool_path)))?
+        std::env::split_paths(&path_var)
+            .find_map(|dir| locate_executable(&base.join(dir).join(tool_path)))?
     };
 
     candidate.canonicalize().ok()

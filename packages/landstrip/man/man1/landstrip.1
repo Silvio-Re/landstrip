@@ -81,6 +81,12 @@ or
 .It Fl -cwd Ar dir
 Set the working directory for policy resolution and execution
 (defaults to the current working directory).
+On Unix, relative executable paths and relative or empty
+.Ev PATH
+entries also use this directory when locating executable policy.
+Paths passed to
+.Fl -policy
+remain relative to the caller's working directory.
 .It Fl -tool Ar program
 Include the resolved executable's policy when validating or resolving.
 .El
