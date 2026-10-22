@@ -55,159 +55,178 @@ use std::path::Path;
 use std::process::Command;
 use supervise::{NamespaceId, Supervisor};
 
-fn send_fd(socket: &mut File, fd: BorrowedFd<'_>) -> Result<()> {
-    let byte = [0_u8];
-    let iov = [IoSlice::new(&byte)];
-    let fds = [fd.as_raw_fd()];
-    loop {
-        match sendmsg::<()>(
-            socket.as_raw_fd(),
-            &iov,
-            &[ControlMessage::ScmRights(&fds)],
-            MsgFlags::empty(),
-            None,
-        ) {
-            Ok(_) => break,
-            Err(Errno::EINTR) => {}
-            Err(error) => return Err(LandstripError::from(error).into()),
-        }
-    }
-    read_ack(socket)
-}
-
-fn send_listener(socket: &mut File, fd: BorrowedFd<'_>) -> Result<()> {
-    socket
-        .write_all(&[0_u8])
-        .map_err(LandstripError::supervise)?;
-    socket
-        .write_all(&fd.as_raw_fd().to_ne_bytes())
-        .map_err(LandstripError::supervise)?;
-    read_ack(socket)
-}
-
-fn read_ack(socket: &mut File) -> Result<()> {
-    let mut ack = [0_u8];
-    socket
-        .read_exact(&mut ack)
-        .map_err(LandstripError::supervise)?;
-    if ack != [0] {
-        return Err(LandstripError::supervise("notify: invalid acknowledgment").into());
-    }
-    Ok(())
-}
-
-fn send_trap(socket: &mut File, trap: &Trap) -> Result<()> {
-    let payload = trap.to_string();
-    let length = u32::try_from(payload.len())
-        .map_err(|_| LandstripError::supervise("notify: trap is too large"))?;
-
-    socket
-        .write_all(&[1_u8])
-        .map_err(LandstripError::supervise)?;
-    socket
-        .write_all(&length.to_be_bytes())
-        .map_err(LandstripError::supervise)?;
-    socket
-        .write_all(payload.as_bytes())
-        .map_err(LandstripError::supervise)?;
-    Ok(())
-}
-
 enum NotifyStartup<'a> {
     Ready(BorrowedFd<'a>, NamespaceId),
     Trap(String),
 }
 
-fn get_notify_fd<'a>(
-    socket: &File,
+struct NotifySocket {
+    socket: File,
     handoff_by_pidfd: bool,
-    subreaper: &'a mut Subreaper,
-) -> Result<NotifyStartup<'a>> {
-    let mut marker = [0_u8];
-    let mut iov = [IoSliceMut::new(&mut marker)];
-    let mut control = nix::cmsg_space!([RawFd; 1], libc::ucred);
-    let (fd, sender) = loop {
-        let message = match recvmsg::<()>(
-            socket.as_raw_fd(),
-            &mut iov,
-            Some(&mut control),
-            MsgFlags::empty(),
-        ) {
-            Ok(message) => message,
-            Err(Errno::EINTR) => continue,
-            Err(error) => return Err(LandstripError::from(error).into()),
-        };
-        let mut fd = None;
-        let mut sender = None;
-        for control in message.cmsgs().map_err(LandstripError::from)? {
-            match control {
-                ControlMessageOwned::ScmRights(fds) => fd = fds.first().copied(),
-                ControlMessageOwned::ScmCredentials(credentials) => {
-                    sender = Some(credentials.pid());
-                }
-                _ => {}
-            }
-        }
-        if message.bytes == 0 {
-            return Err(LandstripError::supervise("notify: unexpected eof").into());
-        }
-        break (fd, sender);
-    };
+}
 
-    let mut socket = socket;
-    match marker[0] {
-        0 => {
-            let sender = sender
-                .ok_or_else(|| LandstripError::supervise("notify: missing sender credentials"))?;
-            let notify = if handoff_by_pidfd {
-                let mut number = [0_u8; mem::size_of::<RawFd>()];
-                socket
-                    .read_exact(&mut number)
-                    .map_err(LandstripError::supervise)?;
-                let target = TargetProcess::new(Pid::from_raw(sender));
-                target
-                    .duplicate_fd(RawFd::from_ne_bytes(number))
-                    .map_err(|error| {
-                        LandstripError::supervise(io::Error::from_raw_os_error(error.errno()))
-                    })?
-            } else {
-                let fd =
-                    fd.ok_or_else(|| LandstripError::supervise("notify: missing descriptor"))?;
-                // SAFETY: SCM_RIGHTS transfers ownership of the received descriptor.
-                unsafe { OwnedFd::from_raw_fd(fd) }
-            };
-            let notify = subreaper.retain_listener(notify);
-            // Pin namespace identity before acknowledging: the tool may exit immediately.
-            let namespace = NamespaceId::try_from(&TargetProcess::new(Pid::from_raw(sender)))
-                .map_err(LandstripError::supervise)?;
-            socket
+impl AsRawFd for NotifySocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
+    }
+}
+
+impl NotifySocket {
+    fn pair(handoff_by_pidfd: bool) -> Result<(Self, Self)> {
+        let (parent, child) = UnixStream::pair().map_err(LandstripError::supervise)?;
+        setsockopt(&parent, sockopt::PassCred, &true).map_err(LandstripError::from)?;
+        // File uses read/write; UnixStream's sendto would block on our own notify filter.
+        Ok((
+            Self {
+                socket: File::from(OwnedFd::from(parent)),
+                handoff_by_pidfd,
+            },
+            Self {
+                socket: File::from(OwnedFd::from(child)),
+                handoff_by_pidfd,
+            },
+        ))
+    }
+
+    fn send_listener(&mut self, fd: BorrowedFd<'_>) -> Result<()> {
+        if self.handoff_by_pidfd {
+            self.socket
                 .write_all(&[0_u8])
                 .map_err(LandstripError::supervise)?;
-            Ok(NotifyStartup::Ready(notify, namespace))
-        }
-        1 => {
-            let mut length = [0_u8; 4];
-            let mut socket = socket;
-            socket
-                .read_exact(&mut length)
+            self.socket
+                .write_all(&fd.as_raw_fd().to_ne_bytes())
                 .map_err(LandstripError::supervise)?;
-            let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
-            if length > 1_048_576 {
-                return Err(LandstripError::supervise("notify: trap is too large").into());
+        } else {
+            let byte = [0_u8];
+            let iov = [IoSlice::new(&byte)];
+            let fds = [fd.as_raw_fd()];
+            loop {
+                match sendmsg::<()>(
+                    self.socket.as_raw_fd(),
+                    &iov,
+                    &[ControlMessage::ScmRights(&fds)],
+                    MsgFlags::empty(),
+                    None,
+                ) {
+                    Ok(_) => break,
+                    Err(Errno::EINTR) => {}
+                    Err(error) => return Err(LandstripError::from(error).into()),
+                }
             }
-            let mut payload = vec![0_u8; length];
-            socket
-                .read_exact(&mut payload)
-                .map_err(LandstripError::supervise)?;
-            let trap = String::from_utf8(payload).map_err(|error| {
-                LandstripError::supervise(format!("notify: invalid trap: {error}"))
-            })?;
-            if serde_json::from_str::<serde_json::Value>(&trap).is_err() {
-                return Err(LandstripError::supervise("notify: invalid trap").into());
-            }
-            Ok(NotifyStartup::Trap(trap))
         }
-        _ => Err(LandstripError::supervise("notify: invalid marker").into()),
+        let mut ack = [0_u8];
+        self.socket
+            .read_exact(&mut ack)
+            .map_err(LandstripError::supervise)?;
+        if ack != [0] {
+            return Err(LandstripError::supervise("notify: invalid acknowledgment").into());
+        }
+        Ok(())
+    }
+
+    fn send_trap(&mut self, trap: &Trap) -> Result<()> {
+        let payload = trap.to_string();
+        let length = u32::try_from(payload.len())
+            .map_err(|_| LandstripError::supervise("notify: trap is too large"))?;
+
+        self.socket
+            .write_all(&[1_u8])
+            .map_err(LandstripError::supervise)?;
+        self.socket
+            .write_all(&length.to_be_bytes())
+            .map_err(LandstripError::supervise)?;
+        self.socket
+            .write_all(payload.as_bytes())
+            .map_err(LandstripError::supervise)?;
+        Ok(())
+    }
+
+    fn receive<'a>(&mut self, subreaper: &'a mut Subreaper) -> Result<NotifyStartup<'a>> {
+        let mut marker = [0_u8];
+        let mut iov = [IoSliceMut::new(&mut marker)];
+        let mut control = nix::cmsg_space!([RawFd; 1], libc::ucred);
+        let (fd, sender) = loop {
+            let message = match recvmsg::<()>(
+                self.socket.as_raw_fd(),
+                &mut iov,
+                Some(&mut control),
+                MsgFlags::empty(),
+            ) {
+                Ok(message) => message,
+                Err(Errno::EINTR) => continue,
+                Err(error) => return Err(LandstripError::from(error).into()),
+            };
+            let mut fd = None;
+            let mut sender = None;
+            for control in message.cmsgs().map_err(LandstripError::from)? {
+                match control {
+                    ControlMessageOwned::ScmRights(fds) => fd = fds.first().copied(),
+                    ControlMessageOwned::ScmCredentials(credentials) => {
+                        sender = Some(credentials.pid());
+                    }
+                    _ => {}
+                }
+            }
+            if message.bytes == 0 {
+                return Err(LandstripError::supervise("notify: unexpected eof").into());
+            }
+            break (fd, sender);
+        };
+
+        match marker[0] {
+            0 => {
+                let sender = sender.ok_or_else(|| {
+                    LandstripError::supervise("notify: missing sender credentials")
+                })?;
+                let notify = if self.handoff_by_pidfd {
+                    let mut number = [0_u8; mem::size_of::<RawFd>()];
+                    self.socket
+                        .read_exact(&mut number)
+                        .map_err(LandstripError::supervise)?;
+                    let target = TargetProcess::new(Pid::from_raw(sender));
+                    target
+                        .duplicate_fd(RawFd::from_ne_bytes(number))
+                        .map_err(|error| {
+                            LandstripError::supervise(io::Error::from_raw_os_error(error.errno()))
+                        })?
+                } else {
+                    let fd =
+                        fd.ok_or_else(|| LandstripError::supervise("notify: missing descriptor"))?;
+                    // SAFETY: SCM_RIGHTS transfers ownership of the received descriptor.
+                    unsafe { OwnedFd::from_raw_fd(fd) }
+                };
+                let notify = subreaper.retain_listener(notify);
+                // Pin namespace identity before acknowledging: the tool may exit immediately.
+                let namespace = NamespaceId::try_from(&TargetProcess::new(Pid::from_raw(sender)))
+                    .map_err(LandstripError::supervise)?;
+                self.socket
+                    .write_all(&[0_u8])
+                    .map_err(LandstripError::supervise)?;
+                Ok(NotifyStartup::Ready(notify, namespace))
+            }
+            1 => {
+                let mut length = [0_u8; 4];
+                self.socket
+                    .read_exact(&mut length)
+                    .map_err(LandstripError::supervise)?;
+                let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+                if length > 1_048_576 {
+                    return Err(LandstripError::supervise("notify: trap is too large").into());
+                }
+                let mut payload = vec![0_u8; length];
+                self.socket
+                    .read_exact(&mut payload)
+                    .map_err(LandstripError::supervise)?;
+                let trap = String::from_utf8(payload).map_err(|error| {
+                    LandstripError::supervise(format!("notify: invalid trap: {error}"))
+                })?;
+                if serde_json::from_str::<serde_json::Value>(&trap).is_err() {
+                    return Err(LandstripError::supervise("notify: invalid trap").into());
+                }
+                Ok(NotifyStartup::Trap(trap))
+            }
+            _ => Err(LandstripError::supervise("notify: invalid marker").into()),
+        }
     }
 }
 
@@ -252,11 +271,7 @@ pub(super) fn run_broker(
     );
     let filters = FilterSet::new(policy, &syscalls, &notify_syscalls)?;
     let notify_filesystem = needs_filesystem;
-    let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::supervise)?;
-    setsockopt(&parent, sockopt::PassCred, &true).map_err(LandstripError::from)?;
-    // File uses read/write; UnixStream's sendto would block on our own notify filter.
-    let parent = File::from(OwnedFd::from(parent));
-    let child_sock = File::from(OwnedFd::from(child_sock));
+    let (mut parent, mut child_sock) = NotifySocket::pair(handoff_by_pidfd)?;
     let launch = Launch::new().map_err(|error| {
         LandstripError::sandbox_setup(Mechanism::Namespace, error.into_boxed_dyn_error())
     })?;
@@ -269,7 +284,6 @@ pub(super) fn run_broker(
     match fork_result {
         super::namespace::ForkResult::Child(child) => {
             drop(parent);
-            let mut child_sock = child_sock;
             let mut handed_off = false;
 
             let result = (|| -> Result<()> {
@@ -283,11 +297,7 @@ pub(super) fn run_broker(
 
                 {
                     let notify = filters.install()?;
-                    if handoff_by_pidfd {
-                        send_listener(&mut child_sock, notify.as_fd())?;
-                    } else {
-                        send_fd(&mut child_sock, notify.as_fd())?;
-                    }
+                    child_sock.send_listener(notify.as_fd())?;
                     handed_off = true;
                 }
 
@@ -306,7 +316,7 @@ pub(super) fn run_broker(
 
             if let Err(error) = result {
                 let trap = Trap::from(&error);
-                if handed_off || send_trap(&mut child_sock, &trap).is_err() {
+                if handed_off || child_sock.send_trap(&trap).is_err() {
                     trap.emit_with_fd(trap_fd);
                 }
             }
@@ -319,7 +329,7 @@ pub(super) fn run_broker(
             drop(child_sock);
             let mut signals = ForwardSignals::new(child)
                 .map_err(|error| LandstripError::supervise(error.into_boxed_dyn_error()))?;
-            let result = (|| match get_notify_fd(&parent, handoff_by_pidfd, &mut subreaper)? {
+            let result = (|| match parent.receive(&mut subreaper)? {
                 NotifyStartup::Ready(notify, namespace) => {
                     signals.process_pending()?;
                     Supervisor {
