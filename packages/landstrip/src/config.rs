@@ -51,7 +51,25 @@ impl PolicyFormat {
             let resolved = deserialize_strings(services.take()).map_err(Error::parse_failed)?;
             *services = serde_json::to_value(resolved).map_err(Error::parse_failed)?;
         }
+        serde_json::from_value::<Settings>(value.clone()).map_err(Error::parse_failed)?;
         Ok(value)
+    }
+
+    fn read_executable_policy(self, tool: &OsStr, cwd: &Path) -> Result<Option<Value>> {
+        let Some(exe) = resolve_executable(tool, cwd) else {
+            return Ok(None);
+        };
+        let context = format!("executable policy {}", exe.display());
+
+        let Some(bytes) = read_policy_bytes(&exe).with_context(|| context.clone())? else {
+            return Ok(None);
+        };
+
+        let document = String::from_utf8(bytes)
+            .map_err(Error::parse_failed)
+            .with_context(|| context.clone())?;
+        let value = self.parse_document(&document).with_context(|| context)?;
+        Ok(Some(value))
     }
 }
 
@@ -95,17 +113,11 @@ impl AsRef<str> for PathSelector {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct SandboxFilesystem {
-    #[serde(deserialize_with = "deserialize_paths")]
     pub(crate) allow_write: Vec<PathSelector>,
-    #[serde(deserialize_with = "deserialize_paths")]
     pub(crate) deny_write: Vec<PathSelector>,
-    #[serde(deserialize_with = "deserialize_paths")]
     pub(crate) allow_read: Vec<PathSelector>,
-    #[serde(deserialize_with = "deserialize_paths")]
     pub(crate) deny_read: Vec<PathSelector>,
-    #[serde(deserialize_with = "deserialize_paths")]
     pub(crate) deny_read_always: Vec<PathSelector>,
-    #[serde(deserialize_with = "deserialize_paths")]
     pub(crate) deny_write_always: Vec<PathSelector>,
 }
 
@@ -115,7 +127,6 @@ pub(crate) struct SandboxNetwork {
     pub(crate) allow_network: bool,
     pub(crate) allow_local_binding: bool,
     pub(crate) allow_all_unix_sockets: bool,
-    #[serde(deserialize_with = "deserialize_paths")]
     pub(crate) allow_unix_sockets: Vec<PathSelector>,
     pub(crate) http_proxy_port: Option<u16>,
     pub(crate) socks_proxy_port: Option<u16>,
@@ -129,7 +140,6 @@ pub(crate) struct SandboxNetwork {
 )]
 pub(crate) struct SandboxDarwin {
     pub(crate) allow_trustd: bool,
-    #[serde(deserialize_with = "deserialize_strings")]
     pub(crate) allow_mach_lookup: Vec<String>,
     pub(crate) allow_apple_events: bool,
     pub(crate) allow_pty: bool,
@@ -181,7 +191,7 @@ impl Settings {
         }
 
         if let Some(tool) = tool
-            && let Some(value) = read_executable_policy(tool, format, cwd)?
+            && let Some(value) = format.read_executable_policy(tool, cwd)?
         {
             merge_json(&mut merged, value);
         }
@@ -190,31 +200,6 @@ impl Settings {
             .map_err(Error::parse_failed)
             .context("policy")
     }
-}
-
-/// Extra policy a sysadmin attaches to a specific tool's executable: a Unix
-/// extended attribute or a Windows alternate data stream, merged over the
-/// `--policy` documents.
-///
-/// The executable is resolved the same way the shell would find it (`PATH`
-/// search unless the name already names a location) and then canonicalized,
-/// so the attribute is always read from the real executable inode a `PATH`
-/// trick cannot relocate.
-fn read_executable_policy(tool: &OsStr, format: PolicyFormat, cwd: &Path) -> Result<Option<Value>> {
-    let Some(exe) = resolve_executable(tool, cwd) else {
-        return Ok(None);
-    };
-    let context = format!("executable policy {}", exe.display());
-
-    let Some(bytes) = read_policy_bytes(&exe).with_context(|| context.clone())? else {
-        return Ok(None);
-    };
-
-    let document = String::from_utf8(bytes)
-        .map_err(Error::parse_failed)
-        .with_context(|| context.clone())?;
-    let value = format.parse_document(&document).with_context(|| context)?;
-    Ok(Some(value))
 }
 
 fn resolve_executable(tool: &OsStr, cwd: &Path) -> Option<PathBuf> {
