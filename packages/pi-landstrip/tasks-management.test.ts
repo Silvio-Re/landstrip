@@ -468,3 +468,167 @@ describe('Landstrip Split Views (/landstrip-sandbox and /landstrip-subagents)', 
     }
   });
 });
+
+describe('Foreground vs Background Task Differentiation', () => {
+  test('filters tasks by mode/state and renders [bg]/[fg] badges across tools and TUI', async () => {
+    const root = mkdtempSync(join(homedir(), '.pi-landstrip-test-'));
+    try {
+      vi.stubEnv('PI_CODING_AGENT_DIR', root);
+      const mockApi = createMockExtensionAPI();
+      const integration = createLandstripIntegration({ registerBashTool: false, cwd: root });
+      const runtime = new SubagentRuntime(mockApi.api, integration);
+      integration.setSubagentRuntime?.(runtime);
+      integration.register(mockApi.api);
+      runtime.register();
+
+      const baseCtx = createMockExtensionContext(root);
+      for (const listener of mockApi.listeners.get('session_start') ?? []) {
+        await listener({}, baseCtx);
+      }
+
+      const bgTask: SubagentTaskRecord = {
+        version: 1,
+        id: 'bg-task-11111111',
+        kind: 'subagent',
+        agent: 'explore',
+        description: 'Background repo scan',
+        parentSessionId: 'test-session-123',
+        depth: 1,
+        state: 'running',
+        background: true,
+        toolCalls: 3,
+        startedAt: Date.now() - 2000,
+      };
+      const fgTask: SubagentTaskRecord = {
+        version: 1,
+        id: 'fg-task-22222222',
+        kind: 'subagent',
+        agent: 'scout',
+        description: 'Foreground symbol check',
+        parentSessionId: 'test-session-123',
+        depth: 1,
+        state: 'completed',
+        background: false,
+        toolCalls: 1,
+        startedAt: Date.now() - 4000,
+        finishedAt: Date.now() - 1000,
+      };
+      (runtime as any).tasks.set(bgTask.id, bgTask);
+      (runtime as any).tasks.set(fgTask.id, fgTask);
+
+      const tasksTool = mockApi.tools.get('tasks');
+      const bgList = await tasksTool.execute(
+        'call-bg',
+        { action: 'list', mode: 'background', state: 'running' } satisfies TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        baseCtx,
+      );
+      const bgEntries = JSON.parse(bgList.content[0].text);
+      expect(bgEntries).toHaveLength(1);
+      expect(bgEntries[0].id).toBe('bg-task-11111111');
+      expect(bgEntries[0].mode).toBe('background');
+      expect(bgEntries[0].background).toBe(true);
+      expect(bgEntries[0].toolCalls).toBe(3);
+
+      const fgList = await tasksTool.execute(
+        'call-fg',
+        { action: 'list', mode: 'foreground' } satisfies TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        baseCtx,
+      );
+      const fgEntries = JSON.parse(fgList.content[0].text);
+      expect(fgEntries).toHaveLength(1);
+      expect(fgEntries[0].id).toBe('fg-task-22222222');
+      expect(fgEntries[0].mode).toBe('foreground');
+      expect(fgEntries[0].background).toBe(false);
+
+      const inspectBg = await tasksTool.execute(
+        'call-inspect',
+        { action: 'inspect', task_id: 'bg-task-1' } satisfies TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        baseCtx,
+      );
+      expect(inspectBg.content[0].text).toContain('Mode: background');
+
+      const taskTool = mockApi.tools.get('task');
+      const plainTheme = {
+        fg: (_color: string, text: string) => text,
+        bold: (text: string) => text,
+      };
+      const renderedResult = taskTool
+        .renderResult(
+          {
+            content: [{ type: 'text', text: 'done' }],
+            details: inspectBg.details,
+          },
+          { expanded: false },
+          plainTheme,
+        )
+        .render(100)
+        .join('\n');
+      expect(renderedResult).toContain('[bg]');
+      expect(renderedResult).toContain('↳ /landstrip-subagents bg-task- to inspect');
+
+      let capturedComponent: any;
+      const tuiCtx = {
+        ...baseCtx,
+        mode: 'tui',
+        hasUI: true,
+        ui: {
+          notify: vi.fn(),
+          setWidget: vi.fn(),
+          custom: vi.fn(async (factory: any) => {
+            const tui = { terminal: { rows: 30 }, requestRender: vi.fn() };
+            capturedComponent = factory(tui, plainTheme, {}, () => {});
+          }),
+        } as any,
+      } as unknown as ExtensionContext;
+
+      bgTask.output = Array.from({ length: 30 }, (_, i) => `Line ${i + 1}`).join('\n');
+
+      const subagentsCommand = mockApi.commands.get('landstrip-subagents');
+      await subagentsCommand.handler('tasks', tuiCtx);
+      const tasksFrame = capturedComponent.render(100).join('\n');
+      expect(tasksFrame).toContain('[bg] @explore Background repo scan · 3 calls');
+      expect(tasksFrame).toContain('[fg] @scout Foreground symbol check');
+      expect(tasksFrame).toContain('S steer  ·  C cancel  ·  R clear finished');
+
+      // Press S from Tasks tab to jump directly into Log tab with Steer input active
+      capturedComponent.handleInput('s');
+      const steerFrame = capturedComponent.render(100).join('\n');
+      expect(steerFrame).toContain('@explore [bg] Background repo scan');
+      expect(steerFrame).toContain('Steer ›');
+      // Cancel steer input
+      capturedComponent.handleInput('\x1b');
+
+      const logFrame = capturedComponent.render(100).join('\n');
+      expect(logFrame).toContain('bg-task-11111111 · background · 3 tool calls');
+      expect(logFrame).toContain('Follow: on');
+
+      // Up arrow auto-pauses follow and scrolls up without needing F first
+      capturedComponent.handleInput('\x1b[A');
+      const scrolledLogFrame = capturedComponent.render(100).join('\n');
+      expect(scrolledLogFrame).toContain('Follow: off');
+
+      // End key resumes follow
+      capturedComponent.handleInput('\x1b[F');
+      const resumedLogFrame = capturedComponent.render(100).join('\n');
+      expect(resumedLogFrame).toContain('Follow: on');
+
+      // Return to Tasks tab and press R to clear finished tasks
+      capturedComponent.handleInput('\x1b');
+      capturedComponent.handleInput('r');
+      const clearConfirmFrame = capturedComponent.render(100).join('\n');
+      expect(clearConfirmFrame).toContain('Delete fg-task-?');
+      capturedComponent.handleInput('\r');
+      const afterClearFrame = capturedComponent.render(100).join('\n');
+      expect(afterClearFrame).not.toContain('fg-task-');
+      expect(afterClearFrame).toContain('bg-task-');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

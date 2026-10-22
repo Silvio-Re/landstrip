@@ -172,19 +172,21 @@ const SANDBOX_HELP_ROWS = [
 ] as const;
 const AGENTS_HELP_ROWS = [
   ['Tab', 'Next tab'],
-  ['↑ / ↓', 'Select item or scroll when follow is off'],
+  ['↑ / ↓', 'Select item or scroll task log (auto-pauses follow)'],
   ['Enter', 'Activate: set primary, open log, steer, confirm'],
   ['Esc', 'Back one level, or close from a top-level tab'],
   ['Ctrl+C', 'Close'],
   ['Space', 'Toggle agent enabled or select task'],
+  ['S', 'Steer selected running subagent task'],
   ['C', 'Cancel running task or execution'],
+  ['R', 'Clear finished task sessions'],
   ['X', 'Delete selected agent or task sessions'],
   ['E', 'Edit project agent'],
   ['I', 'Inherit global agent state'],
   ['/', 'Filter agents by name'],
   ['F', 'Toggle task log follow'],
   ['Page Up / Down', 'Scroll task output by page'],
-  ['Home / End', 'Jump to task output boundary'],
+  ['Home / End', 'Jump to task output boundary (End resumes follow)'],
   ['Backspace', 'Open parent task'],
 ] as const;
 
@@ -350,10 +352,33 @@ export const TasksToolSchema = Type.Object({
       description: 'Task ID or unique prefix (required for "inspect" and "cancel")',
     }),
   ),
+  mode: Type.Optional(
+    Type.Union([Type.Literal('all'), Type.Literal('background'), Type.Literal('foreground')], {
+      description:
+        'Optional execution mode filter for "list": "all", "background", or "foreground"',
+    }),
+  ),
+  state: Type.Optional(
+    Type.Union(
+      [
+        Type.Literal('queued'),
+        Type.Literal('running'),
+        Type.Literal('completed'),
+        Type.Literal('error'),
+        Type.Literal('cancelled'),
+        Type.Literal('interrupted'),
+      ],
+      {
+        description: 'Optional task state filter for "list"',
+      },
+    ),
+  ),
 });
 export type TasksToolInput = {
   action: 'list' | 'inspect' | 'cancel';
   task_id?: string;
+  mode?: 'all' | 'background' | 'foreground';
+  state?: TaskState;
 };
 
 interface TaskInput {
@@ -446,6 +471,7 @@ export interface TaskDetails {
   state: TaskState;
   agent: string;
   kind?: 'subagent' | 'command';
+  mode?: 'background' | 'foreground';
   command?: string;
   description?: string;
   background?: boolean;
@@ -470,9 +496,10 @@ function taskDetails(task: TaskRecord, state: TaskState = task.state): TaskDetai
     state,
     agent: task.agent,
     kind: task.kind ?? 'subagent',
+    mode: task.background ? 'background' : 'foreground',
     command: task.command,
     description: task.description,
-    background: task.background,
+    background: Boolean(task.background),
     currentTool: task.currentTool,
     toolCalls: task.toolCalls,
     retryAttempt: task.retryAttempt,
@@ -1770,8 +1797,8 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     let pendingTaskAction: TaskListAction | undefined;
     const selectedTaskIds = new Set<string>();
     let scroll = 0;
+    let lastMaxScroll = 0;
     let steering: Input | undefined;
-
     const reloadAgents = (): void => {
       const selectedName = agentsForTab()[selectedAgent]?.name;
       catalog = this.getAgentCatalog(ctx);
@@ -2470,8 +2497,15 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                 const selected = selectedTaskIds.has(task.id) ? theme.fg('accent', '✓') : ' ';
                 const indent = '  '.repeat(Math.max(0, task.depth - 1));
                 const tag = task.kind === 'command' ? '$ bash' : `@${task.agent}`;
+                const modeBadge = theme.fg(
+                  task.background ? 'accent' : 'muted',
+                  task.background ? '[bg]' : '[fg]',
+                );
+                const progress = taskProgress(task);
+                const progressSuffix =
+                  progress.length > 0 ? ` ${theme.fg('dim', `· ${progress.join(' · ')}`)}` : '';
                 listLines.push(
-                  `${cursor} ${selected} ${indent}${taskState(theme, task)} ${theme.fg('accent', tag)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
+                  `${cursor} ${selected} ${indent}${taskState(theme, task)} ${modeBadge} ${theme.fg('accent', tag)} ${theme.fg('text', task.description)}${progressSuffix} ${theme.fg('dim', task.id.slice(0, 8))}`,
                 );
               }
               if (status) listLines.push(theme.fg('dim', `  ${status}`));
@@ -2500,7 +2534,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                   ['↑ / ↓', 'move'],
                   ['Space', 'select'],
                   ['Enter', 'inspect'],
+                  ['S', 'steer'],
                   ['C', 'cancel'],
+                  ['R', 'clear finished'],
                   ['X', 'delete'],
                   ['Esc', 'close'],
                 ]),
@@ -2509,36 +2545,52 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             return pane([tabs, '', ...listLines]);
           },
           log: (frame) => {
-            const { tabs, pane, contentWidth } = frame;
+            const { tabs, pane, contentWidth, paneHeight } = frame;
             const task = tasks[selectedTask];
             if (!task) return pane([tabs, '', 'No task sessions in this session.']);
             const transcript = taskTranscript(task).flatMap((line) =>
               wrapTextWithAnsi(line, contentWidth),
             );
-            const maxScroll = Math.max(0, transcript.length - INSPECTOR_BODY_LINES);
+            const usage = formatTaskUsage(task.usage);
+            const baseChrome = 7 + (usage ? 1 : 0);
+            const rawBodyLines =
+              paneHeight === undefined
+                ? INSPECTOR_BODY_LINES
+                : Math.max(1, paneHeight - baseChrome);
+            const bodyLines =
+              paneHeight !== undefined && transcript.length > rawBodyLines
+                ? Math.max(1, rawBodyLines - 1)
+                : rawBodyLines;
+            const maxScroll = Math.max(0, transcript.length - bodyLines);
+            lastMaxScroll = maxScroll;
             scroll = follow ? maxScroll : Math.min(scroll, maxScroll);
-            const shown = transcript.slice(scroll, scroll + INSPECTOR_BODY_LINES);
+            const shown = transcript.slice(scroll, scroll + bodyLines);
             const duration = taskDuration(taskDetails(task));
             const metrics = [
               task.id,
+              task.background ? 'background' : 'foreground',
               task.toolCalls === undefined
                 ? undefined
                 : `${task.toolCalls} tool call${task.toolCalls === 1 ? '' : 's'}`,
               duration,
             ].filter(Boolean);
-            const usage = formatTaskUsage(task.usage);
             const tag = task.kind === 'command' ? '$ bash' : `@${task.agent}`;
+            const modeBadge = theme.fg(
+              task.background ? 'accent' : 'muted',
+              task.background ? '[bg]' : '[fg]',
+            );
             const lines = [
               tabs,
               '',
-              `${theme.fg('accent', theme.bold(tag))} ${theme.fg('text', task.description)}`,
+              `${theme.fg('accent', theme.bold(tag))} ${modeBadge} ${theme.fg('text', task.description)}`,
               `${taskState(theme, task)} ${theme.fg('dim', metrics.join(' · '))} ${theme.fg('dim', '·')} ${theme.fg(follow ? 'accent' : 'muted', `Follow: ${follow ? 'on' : 'off'}`)}`,
               ...(usage ? [theme.fg('dim', usage)] : []),
               '',
               ...shown.map((line) => theme.fg('toolOutput', line)),
             ];
-            while (lines.length < INSPECTOR_BODY_LINES + 5) lines.push('');
-            if (transcript.length > INSPECTOR_BODY_LINES) {
+            const headerAndBodyTarget = (usage ? 6 : 5) + bodyLines;
+            while (lines.length < headerAndBodyTarget) lines.push('');
+            if (transcript.length > bodyLines) {
               lines.push(
                 theme.fg('dim', `${scroll + 1}–${scroll + shown.length} of ${transcript.length}`),
               );
@@ -2547,10 +2599,18 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               const input =
                 steering.render(Math.max(2, contentWidth - visibleWidth('Steer ')))[0] ?? '';
               lines.push(`${theme.fg('accent', 'Steer')} ${input.replace(/^>/, '›')}`);
-            } else if (task.state === 'queued' || task.state === 'running') {
-              const keys: Array<[string, string]> = [];
-              if (task.kind !== 'command') keys.push(['Enter', 'steer']);
-              keys.push(['C', 'cancel'], ['F', 'follow'], ['Esc', 'tasks']);
+            } else {
+              const keys: Array<[string, string]> = [['↑ / ↓', 'scroll']];
+              if (
+                (task.state === 'queued' || task.state === 'running') &&
+                task.kind !== 'command'
+              ) {
+                keys.push(['Enter', 'steer']);
+              }
+              if (task.state === 'queued' || task.state === 'running') {
+                keys.push(['C', 'cancel']);
+              }
+              keys.push(['F', 'follow'], ['Esc', 'tasks']);
               lines.push(dialogKeys(theme, keys));
             }
             return pane(lines.map((line) => truncateToWidth(line, contentWidth)));
@@ -2731,6 +2791,71 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                 type: 'cancel',
                 taskIds: cancellable.map((task) => task.id),
               };
+            } else if (data.toLowerCase() === 's') {
+              const task = tasks[selectedTask];
+              if (
+                !task ||
+                (task.state !== 'running' && task.state !== 'queued') ||
+                task.kind === 'command'
+              ) {
+                ctx.ui.notify('Select a running or queued subagent to steer', 'warning');
+                return;
+              }
+              tab = 'log';
+              follow = true;
+              scroll = 0;
+              const input = new Input();
+              input.focused = true;
+              input.onEscape = () => {
+                steering = undefined;
+                tui.requestRender();
+              };
+              input.onSubmit = (value) => {
+                const message = value.trim();
+                if (!message) {
+                  ctx.ui.notify('Steering message must not be empty', 'warning');
+                  return;
+                }
+                steering = undefined;
+                void (async () => {
+                  const running = this.running.get(task.id);
+                  if (running) {
+                    await running.rpc.steer(message);
+                  } else if (
+                    (task.state === 'queued' || task.state === 'running') &&
+                    this.runPromises.has(task.id)
+                  ) {
+                    const pending = this.pendingSteers.get(task.id) ?? [];
+                    pending.push(message);
+                    this.pendingSteers.set(task.id, pending);
+                  } else {
+                    throw new Error('Task is no longer active');
+                  }
+                  ctx.ui.notify(`Steered task ${task.id.slice(0, 8)}`, 'info');
+                })()
+                  .catch((error: unknown) =>
+                    ctx.ui.notify(`Could not steer task: ${formatError(error)}`, 'error'),
+                  )
+                  .finally(() => tui.requestRender());
+                tui.requestRender();
+              };
+              steering = input;
+            } else if (data.toLowerCase() === 'r') {
+              const finished = tasks.filter(
+                (t) =>
+                  t.state === 'completed' ||
+                  t.state === 'error' ||
+                  t.state === 'cancelled' ||
+                  t.state === 'interrupted',
+              );
+              if (finished.length === 0) {
+                ctx.ui.notify('No finished tasks to clear', 'warning');
+                return;
+              }
+              pendingTaskAction = {
+                type: 'delete',
+                taskIds: finished.map((task) => task.id),
+              };
             } else if (data.toLowerCase() === 'x') {
               const targets = taskTargets();
               if (targets.length === 0) return;
@@ -2770,7 +2895,8 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               return;
             } else if (
               matchesKey(data, 'return') &&
-              (task.state === 'queued' || task.state === 'running')
+              (task.state === 'queued' || task.state === 'running') &&
+              task.kind !== 'command'
             ) {
               const input = new Input();
               input.focused = true;
@@ -2810,17 +2936,33 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               steering = input;
             } else if (data.toLowerCase() === 'f') {
               follow = !follow;
-            } else if (!follow && matchesKey(data, 'up')) {
+            } else if (matchesKey(data, 'up')) {
+              if (follow) {
+                follow = false;
+                scroll = lastMaxScroll;
+              }
               scroll = Math.max(0, scroll - 1);
-            } else if (!follow && matchesKey(data, 'down')) {
-              scroll += 1;
-            } else if (!follow && matchesKey(data, 'pageUp')) {
+            } else if (matchesKey(data, 'down')) {
+              if (!follow) {
+                scroll += 1;
+                if (scroll >= lastMaxScroll) follow = true;
+              }
+            } else if (matchesKey(data, 'pageUp')) {
+              if (follow) {
+                follow = false;
+                scroll = lastMaxScroll;
+              }
               scroll = Math.max(0, scroll - INSPECTOR_BODY_LINES);
-            } else if (!follow && matchesKey(data, 'pageDown')) {
-              scroll += INSPECTOR_BODY_LINES;
-            } else if (!follow && matchesKey(data, 'home')) {
+            } else if (matchesKey(data, 'pageDown')) {
+              if (!follow) {
+                scroll += INSPECTOR_BODY_LINES;
+                if (scroll >= lastMaxScroll) follow = true;
+              }
+            } else if (matchesKey(data, 'home')) {
+              follow = false;
               scroll = 0;
-            } else if (!follow && matchesKey(data, 'end')) {
+            } else if (matchesKey(data, 'end')) {
+              follow = true;
               scroll = Number.MAX_SAFE_INTEGER;
             } else if (matchesKey(data, 'backspace')) {
               const parentIndex = task.parentTaskId
@@ -3033,19 +3175,30 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         if (!ctx) throw new Error('Task context is unavailable');
         const action = input.action;
         if (action === 'list') {
-          const list = [...this.tasks.values()].map((task) => {
-            const details = taskDetails(task);
-            return {
-              id: details.taskId,
-              kind: details.kind,
-              agent: details.agent,
-              state: details.state,
-              command: details.command,
-              description: details.description,
-              duration: taskDuration(details),
-              exitCode: details.exitCode,
-            };
-          });
+          const modeFilter = input.mode ?? 'all';
+          const list = [...this.tasks.values()]
+            .filter((task) => {
+              if (modeFilter === 'background' && !task.background) return false;
+              if (modeFilter === 'foreground' && task.background) return false;
+              if (input.state && task.state !== input.state) return false;
+              return true;
+            })
+            .map((task) => {
+              const details = taskDetails(task);
+              return {
+                id: details.taskId,
+                kind: details.kind,
+                mode: details.mode,
+                background: Boolean(details.background),
+                agent: details.agent,
+                state: details.state,
+                command: details.command,
+                description: details.description,
+                toolCalls: details.toolCalls ?? 0,
+                duration: taskDuration(details),
+                exitCode: details.exitCode,
+              };
+            });
           return {
             content: [{ type: 'text', text: JSON.stringify(list, null, 2) }],
             details: { count: list.length },
@@ -3062,10 +3215,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           const details = taskDetails(task);
           const transcript = taskTranscript(task);
           const tail = transcript.slice(-100).join('\n');
+          const modeLabel = details.background ? 'background' : 'foreground';
           const header =
             task.kind === 'command'
-              ? `$ bash ${task.command ?? task.description}\nCWD: ${task.cwd}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nExit code: ${details.exitCode ?? 'none'}`
-              : `@${task.agent}: ${task.description}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nTool calls: ${task.toolCalls ?? 0}`;
+              ? `$ bash ${task.command ?? task.description}\nMode: ${modeLabel}\nCWD: ${task.cwd}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nExit code: ${details.exitCode ?? 'none'}`
+              : `@${task.agent}: ${task.description}\nMode: ${modeLabel}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nTool calls: ${task.toolCalls ?? 0}`;
           return {
             content: [{ type: 'text', text: `${header}\n\nRecent Output:\n${tail}` }],
             details,
@@ -3214,12 +3368,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         this.updateTaskWidget(ctx);
       }
     })();
-
     return {
       content: [
         {
           type: 'text',
-          text: `Command launched in background.\nTask ID: ${taskId}\nOutput file: ${outputFile}\nUse /landstrip tasks to view live progress or cancel.`,
+          text: `Command launched in background.\nTask ID: ${taskId}\nOutput file: ${outputFile}\nUse /landstrip-subagents tasks to view live progress or cancel.`,
         },
       ],
       details: {
@@ -3259,12 +3412,15 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       parameters: taskParameters,
       executionMode: 'parallel',
       renderCall: (input, theme) => {
-        const background = input.background ? theme.fg('muted', ' (background)') : '';
+        const mode = theme.fg(
+          input.background ? 'accent' : 'muted',
+          input.background ? ' [bg]' : ' [fg]',
+        );
         const description = input.description?.trim() || '...';
         const agent = input.subagent_type?.trim() || '...';
         const title = theme.fg('toolTitle', theme.bold('Agent'));
         return new Text(
-          `${title}${background}${theme.fg('muted', ' — ')}${theme.fg('text', description)}\n` +
+          `${title}${mode}${theme.fg('muted', ' — ')}${theme.fg('text', description)}\n` +
             theme.fg('dim', `  @${agent}`),
           0,
           0,
@@ -3287,7 +3443,8 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                     state: 'running',
                     agent: input.subagent_type,
                     description: input.description,
-                    background: input.background,
+                    mode: input.background ? 'background' : 'foreground',
+                    background: Boolean(input.background),
                   },
             }),
         );
@@ -3310,7 +3467,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           description: details.description ?? '',
           state: details.state,
         };
-        let text = taskState(theme, stateView);
+        const modeBadge = theme.fg(
+          details.background ? 'accent' : 'muted',
+          details.background ? '[bg]' : '[fg]',
+        );
+        let text = `${taskState(theme, stateView)} ${modeBadge}`;
         if (details.currentTool) text += theme.fg('muted', `  → ${details.currentTool}`);
         if (details.retryAttempt) text += theme.fg('warning', `  retry ${details.retryAttempt}`);
 
@@ -3333,7 +3494,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             text += `\n${theme.fg('muted', `… ${keyHint('app.tools.expand', 'to expand')}`)}`;
           }
         }
-        text += `\n${theme.fg('dim', `↳ /agents ${details.taskId.slice(0, 8)} to inspect`)}`;
+        text += `\n${theme.fg('dim', `↳ /landstrip-subagents ${details.taskId.slice(0, 8)} to inspect`)}`;
         return new Text(text, 0, 0);
       },
     };
@@ -3498,7 +3659,6 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       this.releaseForeground(task.id);
     }
   }
-
   private createRecord(
     input: TaskInput,
     ctx: ExtensionContext,
@@ -4183,6 +4343,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
     const tasks = [...this.tasks.values()];
     const active = tasks.filter((task) => task.state === 'queued' || task.state === 'running');
+    const activeBg = active.filter((task) => task.background);
+    ctx.ui.setStatus?.(
+      'landstrip-tasks',
+      activeBg.length > 0 ? `⚙ ${activeBg.length} bg` : undefined,
+    );
     if (active.length === 0 && this.recentCompletions.size === 0) {
       ctx.ui.setWidget(TASK_WIDGET, undefined);
       return;
@@ -4204,15 +4369,19 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           const tag = task.kind === 'command' ? '$ bash' : `@${task.agent}`;
           const agent = theme.fg('accent', tag);
           const record = byId.get(task.id)!;
+          const mode = theme.fg(
+            record.background ? 'accent' : 'muted',
+            record.background ? '[bg]' : '[fg]',
+          );
           const progress = taskProgress(record);
           const suffix = progress.length > 0 ? theme.fg('dim', `  ·  ${progress.join(' · ')}`) : '';
           const indentWidth = 3 + Math.max(0, record.depth) * 3;
           const descriptionWidth = Math.max(
             1,
-            width - indentWidth - visibleWidth(`${state}  ${agent}  ${suffix}`),
+            width - indentWidth - visibleWidth(`${state}  ${mode}  ${agent}  ${suffix}`),
           );
           const description = theme.fg('text', truncateToWidth(task.description, descriptionWidth));
-          return `${state}  ${agent}  ${description}${suffix}`;
+          return `${state}  ${mode}  ${agent}  ${description}${suffix}`;
         });
         const shown = tree.slice(0, 8);
         if (tree.length > shown.length) {
