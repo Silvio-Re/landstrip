@@ -115,29 +115,72 @@ pub(super) struct IpEndpoint {
     pub(super) loopback: bool,
 }
 
-fn network_query(
-    operation: NetworkOperation,
-    target: String,
-    pid: u32,
-    socket: TargetSocket,
-    call: SocketAddrCall,
-    next_query_id: &mut u64,
-) -> NotificationResult {
-    let qid = *next_query_id;
-    *next_query_id += 1;
-    let trap = Trap::network(
-        operation,
-        target,
-        TargetProcess::from_raw(pid).context(),
-        Some(qid),
-    );
-    let grant = Grant::Socket(SocketGrant {
-        sock: socket.sock,
-        addr: socket.addr,
-        call,
-        _path: None,
-    });
-    NotificationResult::query(qid, trap, Some(grant))
+impl TargetSocket {
+    fn ip_endpoint(&self) -> SysResult<IpEndpoint> {
+        IpEndpoint::parse(&self.addr, self.info.domain)
+    }
+
+    fn family(&self) -> SysResult<i32> {
+        sockaddr_family(&self.addr)
+    }
+
+    fn unix_path(&self) -> Option<PathBuf> {
+        let sun_path = mem::size_of::<libc::sa_family_t>();
+        if self.addr.len() <= sun_path || self.addr[sun_path] == 0 {
+            return None;
+        }
+
+        let path = &self.addr[sun_path..];
+        let end = path
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(path.len());
+        if end == 0 {
+            return None;
+        }
+
+        Some(PathBuf::from(OsStr::from_bytes(&path[..end])))
+    }
+
+    fn rewrite_unix_path(&mut self, target: &Path) -> SysResult<()> {
+        let sun_path = mem::size_of::<libc::sa_family_t>();
+        let path = target.as_os_str().as_bytes();
+        let max_path = mem::size_of::<libc::sockaddr_un>() - sun_path;
+        if path.len() + 1 > max_path {
+            return Err(BrokerError::NameTooLong);
+        }
+
+        let mut rewritten = vec![0_u8; sun_path + path.len() + 1];
+        rewritten[..sun_path].copy_from_slice(&self.addr[..sun_path]);
+        rewritten[sun_path..sun_path + path.len()].copy_from_slice(path);
+        self.addr = rewritten;
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deny(
+        self,
+        operation: NetworkOperation,
+        endpoint: IpEndpoint,
+        pid: u32,
+        call: SocketAddrCall,
+        denials: &mut Denials<'_>,
+        query_enabled: bool,
+        next_query_id: &mut u64,
+    ) -> SysResult<NotificationResult> {
+        let target = endpoint.addr.to_string();
+        let process = TargetProcess::from_raw(pid).context();
+        if query_enabled {
+            let qid = *next_query_id;
+            *next_query_id += 1;
+            let trap = Trap::network(operation, target, process, Some(qid));
+            let grant = Grant::from(SocketGrant::new(self, call));
+            return Ok(NotificationResult::query(qid, trap, Some(grant)));
+        }
+        denials.record(Denial::Network(operation, target, process));
+        Err(BrokerError::PolicyDenied)
+    }
 }
 
 pub(super) fn handle_bind(
@@ -158,43 +201,30 @@ pub(super) fn handle_bind(
                 )));
             }
             if !policy.network_access.allows_local_binding() {
-                if let Ok(endpoint) = ip_endpoint(&socket.addr, socket.info.domain) {
-                    if query_enabled {
-                        return Ok(network_query(
-                            NetworkOperation::Bind,
-                            endpoint.addr.to_string(),
-                            request.pid,
-                            socket,
-                            libc::bind,
-                            next_query_id,
-                        ));
-                    }
-                    denials.record(Denial::Network(
+                if let Ok(endpoint) = socket.ip_endpoint() {
+                    return socket.deny(
                         NetworkOperation::Bind,
-                        endpoint.addr.to_string(),
-                        TargetProcess::from_raw(request.pid).context(),
-                    ));
+                        endpoint,
+                        request.pid,
+                        libc::bind,
+                        denials,
+                        query_enabled,
+                        next_query_id,
+                    );
                 }
                 return Err(BrokerError::PolicyDenied);
             }
-            let endpoint = ip_endpoint(&socket.addr, socket.info.domain)?;
+            let endpoint = socket.ip_endpoint()?;
             if !endpoint.loopback {
-                if query_enabled {
-                    return Ok(network_query(
-                        NetworkOperation::Bind,
-                        endpoint.addr.to_string(),
-                        request.pid,
-                        socket,
-                        libc::bind,
-                        next_query_id,
-                    ));
-                }
-                denials.record(Denial::Network(
+                return socket.deny(
                     NetworkOperation::Bind,
-                    endpoint.addr.to_string(),
-                    TargetProcess::from_raw(request.pid).context(),
-                ));
-                return Err(BrokerError::PolicyDenied);
+                    endpoint,
+                    request.pid,
+                    libc::bind,
+                    denials,
+                    query_enabled,
+                    next_query_id,
+                );
             }
 
             Ok(NotificationResult::grant(SocketGrant::new(
@@ -228,7 +258,7 @@ pub(super) fn handle_connect(
             if policy.network_access.is_unrestricted() {
                 return Ok(NotificationResult::Continue);
             }
-            let endpoint = ip_endpoint(&socket.addr, socket.info.domain)?;
+            let endpoint = socket.ip_endpoint()?;
             if !endpoint.loopback
                 || (!policy.network_access.allows_local_binding()
                     && !policy
@@ -236,22 +266,15 @@ pub(super) fn handle_connect(
                         .connect_tcp_ports()
                         .contains(&endpoint.port))
             {
-                if query_enabled {
-                    return Ok(network_query(
-                        NetworkOperation::Connect,
-                        endpoint.addr.to_string(),
-                        request.pid,
-                        socket,
-                        libc::connect,
-                        next_query_id,
-                    ));
-                }
-                denials.record(Denial::Network(
+                return socket.deny(
                     NetworkOperation::Connect,
-                    endpoint.addr.to_string(),
-                    TargetProcess::from_raw(request.pid).context(),
-                ));
-                return Err(BrokerError::PolicyDenied);
+                    endpoint,
+                    request.pid,
+                    libc::connect,
+                    denials,
+                    query_enabled,
+                    next_query_id,
+                );
             }
 
             Ok(NotificationResult::grant(SocketGrant::new(
@@ -263,30 +286,23 @@ pub(super) fn handle_connect(
             if policy.network_access.is_unrestricted() {
                 return Ok(NotificationResult::Continue);
             }
-            if sockaddr_family(&socket.addr)? == libc::AF_UNSPEC {
+            if socket.family()? == libc::AF_UNSPEC {
                 return Ok(NotificationResult::grant(SocketGrant::new(
                     socket,
                     libc::connect,
                 )));
             }
-            let endpoint = ip_endpoint(&socket.addr, socket.info.domain)?;
+            let endpoint = socket.ip_endpoint()?;
             if !endpoint.loopback || !policy.network_access.allows_local_binding() {
-                if query_enabled {
-                    return Ok(network_query(
-                        NetworkOperation::Connect,
-                        endpoint.addr.to_string(),
-                        request.pid,
-                        socket,
-                        libc::connect,
-                        next_query_id,
-                    ));
-                }
-                denials.record(Denial::Network(
+                return socket.deny(
                     NetworkOperation::Connect,
-                    endpoint.addr.to_string(),
-                    TargetProcess::from_raw(request.pid).context(),
-                ));
-                return Err(BrokerError::PolicyDenied);
+                    endpoint,
+                    request.pid,
+                    libc::connect,
+                    denials,
+                    query_enabled,
+                    next_query_id,
+                );
             }
 
             Ok(NotificationResult::grant(SocketGrant::new(
@@ -321,7 +337,7 @@ fn check_target_datagram_addr(
     let info = SocketInfo::try_from(sock.as_fd())?;
     match info.kind() {
         SocketKind::Tcp | SocketKind::Udp => {
-            let endpoint = ip_endpoint(&addr, info.domain)?;
+            let endpoint = IpEndpoint::parse(&addr, info.domain)?;
             if endpoint.loopback {
                 Ok(NotificationResult::Continue)
             } else {
@@ -410,9 +426,9 @@ pub(super) fn handle_sendmmsg(
 fn handle_unix_connect(
     policy: &AccessPolicy,
     pid: u32,
-    socket: TargetSocket,
+    mut socket: TargetSocket,
 ) -> SysResult<NotificationResult> {
-    let Some(path) = unix_path_target(&socket.addr) else {
+    let Some(path) = socket.unix_path() else {
         return if matches!(
             policy.network_access.unix_socket_access(),
             UnixSocketAccess::Unrestricted
@@ -434,15 +450,11 @@ fn handle_unix_connect(
         anchor.target.as_ref().map(AsFd::as_fd),
     )?;
     let object = anchor.target.as_ref().ok_or(BrokerError::InvalidAddress)?;
-    let mut addr = socket.addr;
-    rewrite_unix_path(
-        &mut addr,
-        &PathBuf::from(format!("/proc/self/fd/{}", object.as_raw_fd())),
-    )?;
+    socket.rewrite_unix_path(&Path::new("/proc/self/fd").join(object.as_raw_fd().to_string()))?;
 
     Ok(NotificationResult::grant(SocketGrant {
         sock: socket.sock,
-        addr,
+        addr: socket.addr,
         call: libc::connect,
         _path: Some(anchor),
     }))
@@ -453,7 +465,7 @@ fn handle_unix_bind(
     pid: u32,
     mut socket: TargetSocket,
 ) -> SysResult<NotificationResult> {
-    let Some(path) = unix_path_target(&socket.addr) else {
+    let Some(path) = socket.unix_path() else {
         return if matches!(
             policy.network_access.unix_socket_access(),
             UnixSocketAccess::Unrestricted
@@ -484,10 +496,7 @@ fn handle_unix_bind(
         return Err(BrokerError::PolicyDenied);
     }
     let broker_path = anchor.path()?;
-    rewrite_unix_path(
-        &mut socket.addr,
-        Path::new(OsStr::from_bytes(broker_path.as_bytes())),
-    )?;
+    socket.rewrite_unix_path(Path::new(OsStr::from_bytes(broker_path.as_bytes())))?;
 
     Ok(NotificationResult::grant(SocketGrant {
         sock: socket.sock,
@@ -495,24 +504,6 @@ fn handle_unix_bind(
         call: libc::bind,
         _path: Some(anchor),
     }))
-}
-
-fn unix_path_target(addr: &[u8]) -> Option<PathBuf> {
-    let sun_path = mem::size_of::<libc::sa_family_t>();
-    if addr.len() <= sun_path || addr[sun_path] == 0 {
-        return None;
-    }
-
-    let path = &addr[sun_path..];
-    let end = path
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(path.len());
-    if end == 0 {
-        return None;
-    }
-
-    Some(PathBuf::from(OsStr::from_bytes(&path[..end])))
 }
 
 fn authorize_unix_path(
@@ -561,22 +552,6 @@ fn same_socket_inode(left: BorrowedFd<'_>, right: &Path) -> bool {
     stat.st_dev == right.dev() && stat.st_ino == right.ino()
 }
 
-fn rewrite_unix_path(addr: &mut Vec<u8>, target: &Path) -> SysResult<()> {
-    let sun_path = mem::size_of::<libc::sa_family_t>();
-    let path = target.as_os_str().as_bytes();
-    let max_path = mem::size_of::<libc::sockaddr_un>() - sun_path;
-    if path.len() + 1 > max_path {
-        return Err(BrokerError::NameTooLong);
-    }
-
-    let mut rewritten = vec![0_u8; sun_path + path.len() + 1];
-    rewritten[..sun_path].copy_from_slice(&addr[..sun_path]);
-    rewritten[sun_path..sun_path + path.len()].copy_from_slice(path);
-    *addr = rewritten;
-
-    Ok(())
-}
-
 fn sockaddr_family(addr: &[u8]) -> SysResult<i32> {
     let family = addr
         .get(..mem::size_of::<libc::sa_family_t>())
@@ -585,38 +560,40 @@ fn sockaddr_family(addr: &[u8]) -> SysResult<i32> {
     Ok(i32::from(libc::sa_family_t::from_ne_bytes(family)))
 }
 
-fn ip_endpoint(addr: &[u8], domain: i32) -> SysResult<IpEndpoint> {
-    match (domain, sockaddr_family(addr)?) {
-        (libc::AF_INET, libc::AF_INET) => {
-            if addr.len() < mem::size_of::<libc::sockaddr_in>() {
-                return Err(BrokerError::InvalidAddress);
-            }
+impl IpEndpoint {
+    fn parse(addr: &[u8], domain: i32) -> SysResult<Self> {
+        match (domain, sockaddr_family(addr)?) {
+            (libc::AF_INET, libc::AF_INET) => {
+                if addr.len() < mem::size_of::<libc::sockaddr_in>() {
+                    return Err(BrokerError::InvalidAddress);
+                }
 
-            let port = u16::from_be_bytes([addr[2], addr[3]]);
-            let ip = Ipv4Addr::new(addr[4], addr[5], addr[6], addr[7]);
-            Ok(IpEndpoint {
-                addr: SocketAddr::from((ip, port)),
-                port,
-                loopback: ip.is_loopback(),
-            })
-        }
-        (libc::AF_INET6, libc::AF_INET6) => {
-            if addr.len() < mem::size_of::<libc::sockaddr_in6>() {
-                return Err(BrokerError::InvalidAddress);
+                let port = u16::from_be_bytes([addr[2], addr[3]]);
+                let ip = Ipv4Addr::new(addr[4], addr[5], addr[6], addr[7]);
+                Ok(Self {
+                    addr: SocketAddr::from((ip, port)),
+                    port,
+                    loopback: ip.is_loopback(),
+                })
             }
+            (libc::AF_INET6, libc::AF_INET6) => {
+                if addr.len() < mem::size_of::<libc::sockaddr_in6>() {
+                    return Err(BrokerError::InvalidAddress);
+                }
 
-            let port = u16::from_be_bytes([addr[2], addr[3]]);
-            let ip = Ipv6Addr::from(
-                <[u8; 16]>::try_from(&addr[8..24]).map_err(|_| BrokerError::InvalidAddress)?,
-            );
-            Ok(IpEndpoint {
-                addr: SocketAddr::from((ip, port)),
-                port,
-                loopback: ip.is_loopback()
-                    || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
-            })
+                let port = u16::from_be_bytes([addr[2], addr[3]]);
+                let ip = Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&addr[8..24]).map_err(|_| BrokerError::InvalidAddress)?,
+                );
+                Ok(Self {
+                    addr: SocketAddr::from((ip, port)),
+                    port,
+                    loopback: ip.is_loopback()
+                        || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+                })
+            }
+            _ => Err(BrokerError::AddressFamilyNotSupported),
         }
-        _ => Err(BrokerError::AddressFamilyNotSupported),
     }
 }
 
