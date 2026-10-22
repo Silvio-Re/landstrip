@@ -3,25 +3,19 @@
 
 mod args;
 
-use self::args::{
-    Command, Invocation, ParseOutcome, PolicyInput, PolicyRequest, RunCommand, parse_cli,
-};
-use crate::config::{PolicyFormat, load_settings};
+use self::args::{Command, Invocation, ParseOutcome, PolicyRequest, RunCommand};
 use crate::error::Error;
-use crate::outcome::{CommandOutcome, PolicyValidationError, PolicyValidationReport};
+use crate::outcome::{CommandOutcome, PolicyValidationReport};
 use crate::platform;
-use crate::policy::AccessPolicy;
 use crate::trap::Trap;
 #[cfg(unix)]
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
-use std::error::Error as StdError;
 use std::io;
-use std::path::Path;
 use std::process;
 
 pub fn execute() {
-    let invocation = match parse_cli() {
+    let invocation = match ParseOutcome::parse() {
         Ok(ParseOutcome::Invocation(invocation)) => invocation,
         Ok(ParseOutcome::Display(error)) => {
             if let Err(error) = error.print() {
@@ -85,11 +79,9 @@ fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
 }
 
 fn run(command: &RunCommand) -> Result<CommandOutcome> {
-    let policy = load_policy(
-        &command.policy,
-        &command.cwd,
-        Some(command.tool.as_os_str()),
-    )?;
+    let policy = command
+        .policy
+        .resolve(&command.cwd, Some(command.tool.as_os_str()))?;
     platform::validate(&policy)?;
     #[cfg(unix)]
     let result = platform::execute(
@@ -111,55 +103,19 @@ fn run(command: &RunCommand) -> Result<CommandOutcome> {
 }
 
 fn check_policy(request: &PolicyRequest) -> Result<CommandOutcome> {
-    let result = load_policy(&request.policy, &request.cwd, request.tool.as_deref())
+    let result = request
+        .policy
+        .resolve(&request.cwd, request.tool.as_deref())
         .and_then(|policy| platform::validate(&policy));
-    let report = policy_validation_report(result)?;
+    let report = PolicyValidationReport::try_from(result)?;
     CommandOutcome::json(report.valid, report)
 }
 
 fn resolve_policy(request: &PolicyRequest) -> Result<CommandOutcome> {
-    let policy = load_policy(&request.policy, &request.cwd, request.tool.as_deref())?;
+    let policy = request
+        .policy
+        .resolve(&request.cwd, request.tool.as_deref())?;
     CommandOutcome::json(true, policy)
-}
-
-fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport> {
-    match result {
-        Ok(()) => Ok(PolicyValidationReport {
-            valid: true,
-            error: None,
-        }),
-        Err(error) => {
-            let Some(engine_error) = find_engine_error(&error) else {
-                return Err(error);
-            };
-            let Some(fallback_message) = engine_error.policy_validation_message() else {
-                return Err(error);
-            };
-            let code = engine_error.code();
-            let rendered_message = format!("{error:#}");
-            let message = if rendered_message == code {
-                fallback_message.to_owned()
-            } else {
-                rendered_message
-            };
-
-            Ok(PolicyValidationReport {
-                valid: false,
-                error: Some(PolicyValidationError { code, message }),
-            })
-        }
-    }
-}
-
-fn load_policy(
-    input: &PolicyInput,
-    cwd: &Path,
-    tool: Option<&std::ffi::OsStr>,
-) -> Result<AccessPolicy> {
-    let format = PolicyFormat::try_from(input)?;
-    log::debug!("cli: cwd: {}", cwd.display());
-    let settings = load_settings(&input.paths, format, tool, cwd)?;
-    settings.resolve(cwd)
 }
 
 fn exit_with_error(
@@ -176,18 +132,11 @@ fn exit_with_error(
 }
 
 fn error_trap(error: &anyhow::Error) -> (Trap, i32) {
-    let engine_error = find_engine_error(error);
-    let trap = engine_error.map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from);
-    let exit_code = if matches!(engine_error, Some(Error::Usage { .. })) {
+    let trap = Trap::from(error);
+    let exit_code = if matches!(Error::find_in(error), Some(Error::Usage { .. })) {
         2
     } else {
         1
     };
     (trap, exit_code)
-}
-
-fn find_engine_error(error: &anyhow::Error) -> Option<&Error> {
-    error
-        .chain()
-        .find_map(<dyn StdError + 'static>::downcast_ref::<Error>)
 }

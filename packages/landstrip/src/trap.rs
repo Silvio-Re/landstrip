@@ -292,6 +292,12 @@ impl From<&Error> for Trap {
     }
 }
 
+impl From<&anyhow::Error> for Trap {
+    fn from(error: &anyhow::Error) -> Self {
+        Error::find_in(error).map_or_else(|| Self::internal(format!("{error:#}")), Self::from)
+    }
+}
+
 impl fmt::Display for Trap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_json())

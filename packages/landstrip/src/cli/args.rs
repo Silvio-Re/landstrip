@@ -1,23 +1,25 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::config::PolicyFormat;
+use crate::config::{PolicyFormat, Settings};
 #[allow(unused_imports)]
 use crate::error::{Error, Mechanism};
 #[cfg(target_os = "windows")]
 use crate::platform::WindowsCommand;
+use crate::policy::AccessPolicy;
 #[cfg(unix)]
 use crate::trap_fd::TrapFd;
+use anyhow::Result;
 use clap::builder::{PathBufValueParser, TypedValueParser};
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "windows")]
 use std::num::NonZeroU16;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "windows")]
+#[cfg(any(unix, target_os = "windows"))]
 use std::str::FromStr;
 
 const PROGRAM_NAME: &str = "landstrip";
@@ -138,7 +140,7 @@ struct RunArgs {
 
     #[cfg(unix)]
     /// Write traps to an open file descriptor or Unix domain socket path.
-    #[arg(long = "trap", value_name = "FD|PATH", value_parser = parse_trap_target)]
+    #[arg(long = "trap", value_name = "FD|PATH")]
     trap: Option<TrapTarget>,
 
     #[cfg(unix)]
@@ -224,43 +226,45 @@ impl FromStr for ProxyPortRange {
     }
 }
 
-pub(super) fn parse_cli() -> Result<ParseOutcome, Error> {
-    let mut args = env::args_os();
-    let program = args.next().unwrap_or_else(|| OsString::from(PROGRAM_NAME));
-    let args = args.collect::<Vec<_>>();
+impl ParseOutcome {
+    pub(super) fn parse() -> Result<Self, Error> {
+        let mut args = env::args_os();
+        let program = args.next().unwrap_or_else(|| OsString::from(PROGRAM_NAME));
+        let args = args.collect::<Vec<_>>();
 
-    #[cfg(target_os = "windows")]
-    if is_restricted_user_runner()? {
-        return parse_worker(&args).map(ParseOutcome::Invocation);
+        #[cfg(target_os = "windows")]
+        if is_restricted_user_runner()? {
+            return Invocation::try_from_worker_args(&args).map(Self::Invocation);
+        }
+
+        Self::parse_from(program, args)
     }
 
-    parse_from(program, args)
-}
+    fn parse_from(program: OsString, args: Vec<OsString>) -> Result<Self, Error> {
+        let cli = match Cli::try_parse_from(std::iter::once(program).chain(args)) {
+            Ok(cli) => cli,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp
+                        | ErrorKind::DisplayVersion
+                        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                ) =>
+            {
+                return Ok(Self::Display(error));
+            }
+            Err(error) => {
+                return Err(Error::Usage {
+                    message: error.to_string(),
+                });
+            }
+        };
 
-fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Error> {
-    let cli = match Cli::try_parse_from(std::iter::once(program).chain(args)) {
-        Ok(cli) => cli,
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::DisplayHelp
-                    | ErrorKind::DisplayVersion
-                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-            ) =>
-        {
-            return Ok(ParseOutcome::Display(error));
-        }
-        Err(error) => {
-            return Err(Error::Usage {
-                message: error.to_string(),
-            });
-        }
-    };
-
-    Ok(ParseOutcome::Invocation(Invocation {
-        debug: cli.debug,
-        command: Command::try_from(cli.command)?,
-    }))
+        Ok(Self::Invocation(Invocation {
+            debug: cli.debug,
+            command: Command::try_from(cli.command)?,
+        }))
+    }
 }
 
 impl TryFrom<CliCommand> for Command {
@@ -307,19 +311,7 @@ impl TryFrom<RunArgs> for RunCommand {
                 .collect()
         };
         #[cfg(unix)]
-        let trap_fd = match args.trap {
-            Some(TrapTarget::Fd(fd)) => {
-                // SAFETY: parse_fd established that the inherited descriptor is open,
-                // and `--trap` transfers its ownership to this process.
-                Some(TrapFd::from(unsafe { OwnedFd::from_raw_fd(fd) }))
-            }
-            Some(TrapTarget::Socket(path)) => {
-                Some(TrapFd::connect(&path).map_err(|error| Error::Usage {
-                    message: format!("trap socket {}: {error}", path.display()),
-                })?)
-            }
-            None => None,
-        };
+        let trap_fd = args.trap.map(TrapFd::try_from).transpose()?;
         Ok(Self {
             policy: args.policy,
             cwd: args.cwd,
@@ -360,18 +352,20 @@ fn is_restricted_user_runner() -> Result<bool, Error> {
 }
 
 #[cfg(target_os = "windows")]
-fn parse_worker(args: &[OsString]) -> Result<Invocation, Error> {
-    let [request] = args else {
-        return Err(Error::Usage {
-            message: "restricted-user runner requires one request path".to_owned(),
-        });
-    };
-    Ok(Invocation {
-        debug: false,
-        command: Command::Worker {
-            request: PathBuf::from(request),
-        },
-    })
+impl Invocation {
+    fn try_from_worker_args(args: &[OsString]) -> Result<Self, Error> {
+        let [request] = args else {
+            return Err(Error::Usage {
+                message: "restricted-user runner requires one request path".to_owned(),
+            });
+        };
+        Ok(Self {
+            debug: false,
+            command: Command::Worker {
+                request: PathBuf::from(request),
+            },
+        })
+    }
 }
 
 fn parse_policy_path(path: &str) -> Result<PathBuf, String> {
@@ -389,11 +383,33 @@ enum TrapTarget {
 }
 
 #[cfg(unix)]
-fn parse_trap_target(value: &str) -> Result<TrapTarget, String> {
-    if value.starts_with('/') {
-        return Ok(TrapTarget::Socket(PathBuf::from(value)));
+impl FromStr for TrapTarget {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.starts_with('/') {
+            return Ok(Self::Socket(PathBuf::from(value)));
+        }
+        parse_fd(value).map(Self::Fd)
     }
-    parse_fd(value).map(TrapTarget::Fd)
+}
+
+#[cfg(unix)]
+impl TryFrom<TrapTarget> for TrapFd {
+    type Error = Error;
+
+    fn try_from(target: TrapTarget) -> Result<Self, Self::Error> {
+        match target {
+            TrapTarget::Fd(fd) => {
+                // SAFETY: parse_fd established that the inherited descriptor is open,
+                // and `--trap` transfers its ownership to this process.
+                Ok(Self::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+            }
+            TrapTarget::Socket(path) => Self::connect(&path).map_err(|error| Error::Usage {
+                message: format!("trap socket {}: {error}", path.display()),
+            }),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -457,5 +473,14 @@ impl TryFrom<&PolicyInput> for PolicyFormat {
             });
         }
         Ok(input.format.unwrap_or_default())
+    }
+}
+
+impl PolicyInput {
+    pub(super) fn resolve(&self, cwd: &Path, tool: Option<&OsStr>) -> Result<AccessPolicy> {
+        let format = PolicyFormat::try_from(self)?;
+        log::debug!("cli: cwd: {}", cwd.display());
+        let settings = Settings::load(&self.paths, format, tool, cwd)?;
+        settings.resolve(cwd)
     }
 }

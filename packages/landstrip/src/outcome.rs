@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
+use crate::error::Error;
 use serde::Serialize;
 use std::io::{self, Write};
 #[cfg(target_os = "windows")]
@@ -69,6 +70,39 @@ pub(crate) struct PolicyValidationReport {
     pub(crate) valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<PolicyValidationError>,
+}
+
+impl TryFrom<anyhow::Result<()>> for PolicyValidationReport {
+    type Error = anyhow::Error;
+
+    fn try_from(result: anyhow::Result<()>) -> anyhow::Result<Self> {
+        match result {
+            Ok(()) => Ok(Self {
+                valid: true,
+                error: None,
+            }),
+            Err(error) => {
+                let Some(engine_error) = Error::find_in(&error) else {
+                    return Err(error);
+                };
+                let Some(fallback_message) = engine_error.policy_validation_message() else {
+                    return Err(error);
+                };
+                let code = engine_error.code();
+                let rendered_message = format!("{error:#}");
+                let message = if rendered_message == code {
+                    fallback_message.to_owned()
+                } else {
+                    rendered_message
+                };
+
+                Ok(Self {
+                    valid: false,
+                    error: Some(PolicyValidationError { code, message }),
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

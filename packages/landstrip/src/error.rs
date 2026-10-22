@@ -274,6 +274,12 @@ impl Error {
 
         message
     }
+
+    pub(crate) fn find_in(error: &anyhow::Error) -> Option<&Self> {
+        error
+            .chain()
+            .find_map(<dyn StdError + 'static>::downcast_ref::<Self>)
+    }
 }
 
 /// The symbolic name of `errno`, or `None` when it has no POSIX name (a Win32

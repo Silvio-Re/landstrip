@@ -152,42 +152,44 @@ pub(crate) struct SandboxWindows {
     pub(crate) allow_loopback: bool,
 }
 
-pub(crate) fn load_settings(
-    policy_paths: &[PathBuf],
-    format: PolicyFormat,
-    tool: Option<&OsStr>,
-    cwd: &Path,
-) -> Result<Settings> {
-    let mut merged = Value::Object(Map::new());
+impl Settings {
+    pub(crate) fn load(
+        policy_paths: &[PathBuf],
+        format: PolicyFormat,
+        tool: Option<&OsStr>,
+        cwd: &Path,
+    ) -> Result<Self> {
+        let mut merged = Value::Object(Map::new());
 
-    for path in policy_paths {
-        let (document, source_name) = if path.as_path() == Path::new("-") {
-            let mut document = String::new();
-            io::stdin()
-                .read_to_string(&mut document)
-                .context("policy stdin")?;
-            (document, "policy stdin".to_owned())
-        } else {
-            log::debug!("config: {}", path.display());
-            let document = fs::read_to_string(path)
-                .with_context(|| format!("policy file {}", path.display()))?;
-            (document, format!("policy file {}", path.display()))
-        };
-        let value = format
-            .parse_document(&document)
-            .with_context(|| source_name)?;
-        merge_json(&mut merged, value);
+        for path in policy_paths {
+            let (document, source_name) = if path.as_path() == Path::new("-") {
+                let mut document = String::new();
+                io::stdin()
+                    .read_to_string(&mut document)
+                    .context("policy stdin")?;
+                (document, "policy stdin".to_owned())
+            } else {
+                log::debug!("config: {}", path.display());
+                let document = fs::read_to_string(path)
+                    .with_context(|| format!("policy file {}", path.display()))?;
+                (document, format!("policy file {}", path.display()))
+            };
+            let value = format
+                .parse_document(&document)
+                .with_context(|| source_name)?;
+            merge_json(&mut merged, value);
+        }
+
+        if let Some(tool) = tool
+            && let Some(value) = read_executable_policy(tool, format, cwd)?
+        {
+            merge_json(&mut merged, value);
+        }
+
+        serde_json::from_value(merged)
+            .map_err(Error::parse_failed)
+            .context("policy")
     }
-
-    if let Some(tool) = tool
-        && let Some(value) = read_executable_policy(tool, format, cwd)?
-    {
-        merge_json(&mut merged, value);
-    }
-
-    serde_json::from_value(merged)
-        .map_err(Error::parse_failed)
-        .context("policy")
 }
 
 /// Extra policy a sysadmin attaches to a specific tool's executable: a Unix
