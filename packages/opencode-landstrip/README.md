@@ -17,11 +17,12 @@ Only AI `bash` is OS-isolated; the plugin API cannot replace user shell commands
 Tool approval never overrides hard sandbox denials. Interactive requests without
 a live presenter remain denied.
 
-Configuration: bundled [`sandbox.json`](sandbox.json) → global →
-`.opencode/sandbox.json` → plugin options. Global:
-`$XDG_CONFIG_HOME/opencode/sandbox.json`, with `~/.config` as fallback for an unset,
-empty, or relative `XDG_CONFIG_HOME`. Arrays combine; later scalars win.
-Persistent approvals update the selected global/project file.
+Configuration is loaded in order from the bundled [`sandbox.json`](sandbox.json),
+the global config at `$XDG_CONFIG_HOME/opencode/sandbox.json` (or
+`~/.config/opencode/sandbox.json` when `XDG_CONFIG_HOME` is unset, empty, or
+relative), `.opencode/sandbox.json`, and plugin options. Later sources append to
+list settings and override non-list settings. Persistent approvals are written to
+the selected global or project file.
 
 Defaults allow project writes, deny sensitive-file writes, and block networking.
 Unusable sandboxing fails closed; `enabled: false` permits unsandboxed Bash.

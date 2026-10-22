@@ -126,8 +126,9 @@ Set the restricted-user loopback proxy range.
 .El
 .Sh POLICY
 Policies and their filesystem sections must be objects.
-Objects merge recursively, arrays combine without duplicates, and later scalars
-win; executable policy merges last.
+When multiple policy documents are given, sections merge recursively, list
+entries are appended without duplicates, and later documents override non-list
+fields; executable policy is merged last.
 Hard-denial roots
 .Pq Va denyReadAlways No and Va denyWriteAlways
 accumulate across documents, including newline-string lists;

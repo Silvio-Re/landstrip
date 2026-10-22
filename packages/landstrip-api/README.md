@@ -27,8 +27,9 @@ execFileSync(binaryPath(), ["run", "-p", "policy.json", "--", "cargo", "test"], 
 returns its package name. Both accept `platform` and `arch`, defaulting to the
 current process.
 
-Types: [`LandstripTrap`, `LandstripControlResponse`](lib/index.d.ts).
-Proxy helpers: [`/proxy`](lib/proxy.d.ts). [`/shared`](lib/shared.d.ts) provides:
+[`lib/index.d.ts`](lib/index.d.ts) exports `LandstripTrap` and
+`LandstripControlResponse`, and [`/proxy`](lib/proxy.d.ts) exports the proxy
+helpers. [`/shared`](lib/shared.d.ts) provides:
 
 - `decodeLandstripTrap(value)` / `parseTrapLine(line)`: validated trap or `null`.
   Extra fields survive; missing/unknown denial states become `info`, never queries.

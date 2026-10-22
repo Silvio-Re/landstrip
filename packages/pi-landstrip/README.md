@@ -18,9 +18,10 @@ With sandboxing enabled, Bash (`bash`, `!`, `!!`) and workers are OS-isolated.
 Primary file tools run in trusted Pi and preflight paths against the sandbox
 filesystem policy. Tool approval never bypasses hard denials.
 
-Configuration: bundled [`sandbox.json`](sandbox.json) → `~/.pi/agent/sandbox.json`
-→ trusted-project `.pi/sandbox.json`. Arrays combine; later scalars win.
-Persistent approvals update global/project overrides. For policy-only shell reads:
+Configuration is loaded in order from the bundled [`sandbox.json`](sandbox.json),
+`~/.pi/agent/sandbox.json`, and `.pi/sandbox.json` in a trusted project. Later
+files append to list settings and override non-list settings. Persistent
+approvals are written to the global or project file. For policy-only shell reads:
 
 ```json
 { "shell": { "readAccess": "policy" } }
@@ -56,8 +57,8 @@ Configure `~/.pi/agent/landstrip.json`, trusted-project `.pi/landstrip.json`, or
 }
 ```
 
-`maxSubagents`: 0–16. Agent definitions can override model, prompt, mode, options,
-and permissions.
+`maxSubagents` accepts values from 0 to 16. Agent definitions can override
+model, prompt, mode, options, and permissions.
 
 Use `/landstrip-sandbox` for sandbox overview/policy (`Overview`, `Policy`, `Help`)
 and `/landstrip-subagents` for subagent/task management (`Tasks`, `Log`, `Subagent`,
