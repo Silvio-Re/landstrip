@@ -60,11 +60,13 @@ Configure `~/.pi/agent/landstrip.json`, trusted-project `.pi/landstrip.json`, or
 `maxSubagents`: 0–16. Agent definitions can override model, prompt, mode, options,
 and permissions.
 
-Use `/landstrip` for the management pane and `/landstrip help` for commands.
-Task IDs accept unique prefixes; bare IDs open logs. `/landstrip tasks kill <id>`
-terminates a task. `Ctrl+Shift+A` cycles primary agents while idle.
-The `task` tool accepts `background: true` for immediate return and `task_id`
-to continue a saved task. Press `Enter` in running/queued logs to steer workers.
+Use `/landstrip-sandbox` for sandbox overview/policy (`Overview`, `Policy`, `Help`)
+and `/landstrip-subagents` for subagent/task management (`Tasks`, `Log`, `Subagent`,
+`Primary`, `Settings`, `Help`). Task IDs accept unique prefixes; bare IDs open logs.
+`/landstrip-subagents tasks kill <id>` terminates a task. `Ctrl+Shift+A` cycles
+primary agents while idle. The `task` tool accepts `background: true`, `include_context: true`,
+and `task_id` to continue a saved task; the `tasks` tool supports `list`, `inspect`, `wait`,
+`steer`, and `cancel`. Press `S` in `Tasks` or `Enter` in running/queued logs to steer workers.
 
 ### Worker environment and authentication
 

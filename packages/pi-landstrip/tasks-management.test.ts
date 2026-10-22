@@ -632,3 +632,140 @@ describe('Foreground vs Background Task Differentiation', () => {
     }
   });
 });
+
+describe('Background Subagent Lifecycle & Context Seeding', () => {
+  test('supports tasks wait, steer, bounded inspect slicing, and parent context seeding', async () => {
+    const root = mkdtempSync(join(homedir(), '.pi-landstrip-test-'));
+    try {
+      vi.stubEnv('PI_CODING_AGENT_DIR', root);
+      const mockApi = createMockExtensionAPI();
+      const integration = createLandstripIntegration({ registerBashTool: false, cwd: root });
+      const runtime = new SubagentRuntime(mockApi.api, integration);
+      integration.setSubagentRuntime?.(runtime);
+      integration.register(mockApi.api);
+      runtime.register();
+
+      const ctx = createMockExtensionContext(root);
+      (ctx.sessionManager as any).getBranch = () => [
+        {
+          type: 'message',
+          message: {
+            role: 'user',
+            content: 'We need to audit worker auth paths.',
+          },
+        },
+        {
+          type: 'message',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'I found worker-auth-runtime.ts.' }],
+          },
+        },
+      ];
+
+      for (const listener of mockApi.listeners.get('session_start') ?? []) {
+        await listener({}, ctx);
+      }
+
+      const bgTask: SubagentTaskRecord = {
+        version: 1,
+        id: 'bg-lifecycle-1234',
+        kind: 'subagent',
+        agent: 'explore',
+        description: 'Audit worker auth',
+        parentSessionId: 'test-session-123',
+        depth: 1,
+        state: 'running',
+        background: true,
+        toolCalls: 2,
+        startedAt: Date.now() - 1000,
+        output: Array.from({ length: 10 }, (_, i) => `Step ${i + 1}`).join('\n'),
+      };
+      (runtime as any).tasks.set(bgTask.id, bgTask);
+
+      let resolveRun!: (value: string) => void;
+      const runPromise = new Promise<string>((r) => {
+        resolveRun = r;
+      });
+      (runtime as any).runPromises.set(bgTask.id, runPromise);
+
+      const tasksTool = mockApi.tools.get('tasks');
+
+      // Bounded inspect with offset + lines
+      const slicedInspect = await tasksTool.execute(
+        'call-slice',
+        {
+          action: 'inspect',
+          task_id: 'bg-lifecycle',
+          offset: 2,
+          lines: 3,
+        } satisfies TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      expect(slicedInspect.content[0].text).toContain('Step 3\nStep 4\nStep 5');
+      expect(slicedInspect.content[0].text).not.toContain('Step 1');
+      expect(slicedInspect.content[0].text).not.toContain('Step 6');
+
+      // Steer active background subagent
+      const steerRes = await tasksTool.execute(
+        'call-steer',
+        {
+          action: 'steer',
+          task_id: 'bg-lifecycle',
+          message: 'Focus on seccomp EACCES',
+        } satisfies TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      expect(steerRes.content[0].text).toContain('Steered task bg-lifec (@explore)');
+      expect((runtime as any).pendingSteers.get(bgTask.id)).toEqual(['Focus on seccomp EACCES']);
+
+      // Wait with timeout while still running
+      const timeoutWait = await tasksTool.execute(
+        'call-wait-timeout',
+        {
+          action: 'wait',
+          task_id: 'bg-lifecycle',
+          timeout_ms: 20,
+        } satisfies TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      expect(timeoutWait.content[0].text).toContain('Wait: timed out (task still active)');
+
+      // Wait until completion
+      setTimeout(() => {
+        bgTask.state = 'completed';
+        bgTask.output = 'Completed audit.';
+        bgTask.finishedAt = Date.now();
+        resolveRun('Completed audit.');
+      }, 15);
+      const completedWait = await tasksTool.execute(
+        'call-wait-done',
+        {
+          action: 'wait',
+          task_id: 'bg-lifecycle',
+          timeout_ms: 2000,
+        } satisfies TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      expect(completedWait.content[0].text).toContain('State: completed');
+      expect(completedWait.content[0].text).toContain('Completed audit.');
+
+      // Verify parent context projection helper used by include_context
+      const seededPrompt = (runtime as any).withParentContext('Check line 55', ctx);
+      expect(seededPrompt).toContain('<parent_context>');
+      expect(seededPrompt).toContain('[user]: We need to audit worker auth paths.');
+      expect(seededPrompt).toContain('[assistant]: I found worker-auth-runtime.ts.');
+      expect(seededPrompt).toContain('</parent_context>\n\nCheck line 55');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

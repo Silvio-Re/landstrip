@@ -340,16 +340,31 @@ const taskParameters = Type.Object({
   background: Type.Optional(
     Type.Boolean({ description: 'Return immediately and run in background' }),
   ),
+  include_context: Type.Optional(
+    Type.Boolean({
+      description: 'Seed the subagent prompt with a bounded summary of recent parent conversation',
+    }),
+  ),
 });
 
 export const TasksToolSchema = Type.Object({
-  action: Type.Union([Type.Literal('list'), Type.Literal('inspect'), Type.Literal('cancel')], {
-    description:
-      'Task management action: "list" to view task sessions, "inspect" for status/output, or "cancel" to stop an active task',
-  }),
+  action: Type.Union(
+    [
+      Type.Literal('list'),
+      Type.Literal('inspect'),
+      Type.Literal('wait'),
+      Type.Literal('steer'),
+      Type.Literal('cancel'),
+    ],
+    {
+      description:
+        'Task management action: "list" to view task sessions, "inspect" for status/output, "wait" to await completion, "steer" to guide a running subagent, or "cancel" to stop an active task',
+    },
+  ),
   task_id: Type.Optional(
     Type.String({
-      description: 'Task ID or unique prefix (required for "inspect" and "cancel")',
+      description:
+        'Task ID or unique prefix (required for "inspect", "wait", "steer", and "cancel")',
     }),
   ),
   mode: Type.Optional(
@@ -373,12 +388,41 @@ export const TasksToolSchema = Type.Object({
       },
     ),
   ),
+  lines: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 500,
+      description: 'Number of transcript lines to return for "inspect" or "wait" (default 100)',
+    }),
+  ),
+  offset: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      description: '0-indexed starting line offset for "inspect" (omit for tail)',
+    }),
+  ),
+  timeout_ms: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 600000,
+      description: 'Optional timeout in milliseconds for "wait"',
+    }),
+  ),
+  message: Type.Optional(
+    Type.String({
+      description: 'Steering message to send to a running subagent (required for "steer")',
+    }),
+  ),
 });
 export type TasksToolInput = {
-  action: 'list' | 'inspect' | 'cancel';
+  action: 'list' | 'inspect' | 'wait' | 'steer' | 'cancel';
   task_id?: string;
   mode?: 'all' | 'background' | 'foreground';
   state?: TaskState;
+  lines?: number;
+  offset?: number;
+  timeout_ms?: number;
+  message?: string;
 };
 
 interface TaskInput {
@@ -388,6 +432,7 @@ interface TaskInput {
   task_id?: string;
   command?: string;
   background?: boolean;
+  include_context?: boolean;
 }
 
 type TaskState = 'queued' | 'running' | 'completed' | 'error' | 'cancelled' | 'interrupted';
@@ -3170,10 +3215,41 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           0,
         );
       },
-      execute: async (_toolCallId, input, _signal, _onUpdate, callCtx) => {
+      execute: async (_toolCallId, input, signal, _onUpdate, callCtx) => {
         const ctx = boundCtx ?? callCtx;
         if (!ctx) throw new Error('Task context is unavailable');
         const action = input.action;
+        const resolveSingleTask = (actionName: string): TaskRecord => {
+          if (!input.task_id) throw new Error(`task_id is required for ${actionName} action`);
+          const matched = matchingTasksById([...this.tasks.values()], input.task_id);
+          if (matched.length === 0)
+            throw new Error(`No task found matching prefix "${input.task_id}"`);
+          if (matched.length > 1)
+            throw new Error(`Task ID prefix "${input.task_id}" matches ${matched.length} tasks`);
+          return matched[0]!;
+        };
+        const formatInspectResult = (task: TaskRecord, timedOut = false) => {
+          const details = taskDetails(task);
+          const transcript = taskTranscript(task);
+          const maxLines = Math.max(1, Math.min(500, input.lines ?? 100));
+          const sliced =
+            input.offset !== undefined
+              ? transcript.slice(input.offset, input.offset + maxLines)
+              : transcript.slice(-maxLines);
+          const outputText = sliced.join('\n');
+          const modeLabel = details.background ? 'background' : 'foreground';
+          const timeoutNote = timedOut ? '\nWait: timed out (task still active)' : '';
+          const header =
+            task.kind === 'command'
+              ? `$ bash ${task.command ?? task.description}\nMode: ${modeLabel}\nCWD: ${task.cwd}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nExit code: ${details.exitCode ?? 'none'}${timeoutNote}`
+              : `@${task.agent}: ${task.description}\nMode: ${modeLabel}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nTool calls: ${task.toolCalls ?? 0}${timeoutNote}`;
+          return {
+            content: [
+              { type: 'text' as const, text: `${header}\n\nRecent Output:\n${outputText}` },
+            ],
+            details,
+          };
+        };
         if (action === 'list') {
           const modeFilter = input.mode ?? 'all';
           const list = [...this.tasks.values()]
@@ -3205,42 +3281,92 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           };
         }
         if (action === 'inspect') {
-          if (!input.task_id) throw new Error('task_id is required for inspect action');
-          const matched = matchingTasksById([...this.tasks.values()], input.task_id);
-          if (matched.length === 0)
-            throw new Error(`No task found matching prefix "${input.task_id}"`);
-          if (matched.length > 1)
-            throw new Error(`Task ID prefix "${input.task_id}" matches ${matched.length} tasks`);
-          const task = matched[0]!;
-          const details = taskDetails(task);
-          const transcript = taskTranscript(task);
-          const tail = transcript.slice(-100).join('\n');
-          const modeLabel = details.background ? 'background' : 'foreground';
-          const header =
-            task.kind === 'command'
-              ? `$ bash ${task.command ?? task.description}\nMode: ${modeLabel}\nCWD: ${task.cwd}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nExit code: ${details.exitCode ?? 'none'}`
-              : `@${task.agent}: ${task.description}\nMode: ${modeLabel}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nTool calls: ${task.toolCalls ?? 0}`;
-          return {
-            content: [{ type: 'text', text: `${header}\n\nRecent Output:\n${tail}` }],
-            details,
-          };
+          const task = resolveSingleTask('inspect');
+          return formatInspectResult(task);
         }
-        if (action === 'cancel') {
-          if (!input.task_id) throw new Error('task_id is required for cancel action');
-          const matched = matchingTasksById([...this.tasks.values()], input.task_id);
-          if (matched.length === 0)
-            throw new Error(`No task found matching prefix "${input.task_id}"`);
-          if (matched.length > 1)
-            throw new Error(`Task ID prefix "${input.task_id}" matches ${matched.length} tasks`);
-          const count = await this.cancelTasks([matched[0]!.id], ctx);
+        if (action === 'wait') {
+          const task = resolveSingleTask('wait');
+          let timedOut = false;
+          const runPromise = this.runPromises.get(task.id);
+          if (runPromise && (task.state === 'queued' || task.state === 'running')) {
+            const waiters: Array<Promise<void>> = [
+              runPromise.then(
+                () => undefined,
+                () => undefined,
+              ),
+            ];
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            if (input.timeout_ms && input.timeout_ms > 0) {
+              waiters.push(
+                new Promise<void>((resolveWait) => {
+                  timer = setTimeout(() => {
+                    timedOut = true;
+                    resolveWait();
+                  }, input.timeout_ms);
+                }),
+              );
+            }
+            let onAbort: (() => void) | undefined;
+            if (signal) {
+              waiters.push(
+                new Promise<void>((_, rejectWait) => {
+                  if (signal.aborted) {
+                    rejectWait(new Error('Wait aborted'));
+                    return;
+                  }
+                  onAbort = () => rejectWait(new Error('Wait aborted'));
+                  signal.addEventListener('abort', onAbort, { once: true });
+                }),
+              );
+            }
+            try {
+              await Promise.race(waiters);
+            } finally {
+              if (timer !== undefined) clearTimeout(timer);
+              if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+            }
+          }
+          return formatInspectResult(task, timedOut);
+        }
+        if (action === 'steer') {
+          const task = resolveSingleTask('steer');
+          const message = input.message?.trim();
+          if (!message) throw new Error('message is required for steer action');
+          if (task.kind === 'command') throw new Error('Cannot steer a shell command task');
+          if (task.state !== 'running' && task.state !== 'queued') {
+            throw new Error(`Task ${task.id.slice(0, 8)} is no longer active (${task.state})`);
+          }
+          const running = this.running.get(task.id);
+          if (running) {
+            await running.rpc.steer(message);
+          } else if (this.runPromises.has(task.id)) {
+            const pending = this.pendingSteers.get(task.id) ?? [];
+            pending.push(message);
+            this.pendingSteers.set(task.id, pending);
+          } else {
+            throw new Error(`Task ${task.id.slice(0, 8)} is no longer active`);
+          }
           return {
             content: [
               {
                 type: 'text',
-                text: `Cancelled task ${matched[0]!.id.slice(0, 8)} (${count} task cancelled)`,
+                text: `Steered task ${task.id.slice(0, 8)} (@${task.agent})`,
               },
             ],
-            details: { taskId: matched[0]!.id, cancelled: count > 0 },
+            details: taskDetails(task),
+          };
+        }
+        if (action === 'cancel') {
+          const task = resolveSingleTask('cancel');
+          const count = await this.cancelTasks([task.id], ctx);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Cancelled task ${task.id.slice(0, 8)} (${count} task cancelled)`,
+              },
+            ],
+            details: { taskId: task.id, cancelled: count > 0 },
           };
         }
         throw new Error(`Unknown action: ${action}`);
@@ -3290,7 +3416,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     const controller = new AbortController();
     this.controllers.set(taskId, controller);
 
-    void (async () => {
+    const runPromise = (async () => {
       try {
         const result = await this.integration.runSandboxedCommand!(
           params.command,
@@ -3327,6 +3453,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         } catch {}
         task.finishedAt = Date.now();
         this.controllers.delete(taskId);
+        this.runPromises.delete(taskId);
         this.persist(task);
 
         const durationSec = taskDuration(taskDetails(task)) ?? '';
@@ -3367,7 +3494,10 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         this.notifyTaskUpdate();
         this.updateTaskWidget(ctx);
       }
+      return '';
     })();
+    this.runPromises.set(taskId, runPromise);
+
     return {
       content: [
         {
@@ -3629,8 +3759,17 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     if (!input.background && signal?.aborted) controller.abort();
     if (!input.background) signal?.addEventListener('abort', abort, { once: true });
     if (!input.background) this.claimForeground(task.id);
-    const run = this.runTask(task, agent, input.prompt, catalog, ctx, controller.signal, (text) =>
-      update(text, task),
+    const effectivePrompt = input.include_context
+      ? this.withParentContext(input.prompt, ctx)
+      : input.prompt;
+    const run = this.runTask(
+      task,
+      agent,
+      effectivePrompt,
+      catalog,
+      ctx,
+      controller.signal,
+      (text) => update(text, task),
     );
     this.runPromises.set(task.id, run);
     void run
@@ -3659,6 +3798,38 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       this.releaseForeground(task.id);
     }
   }
+
+  private withParentContext(prompt: string, ctx: ExtensionContext): string {
+    const branch = ctx.sessionManager.getBranch?.() ?? [];
+    const turns: string[] = [];
+    for (const entry of branch as ReadonlyArray<unknown>) {
+      if (!isRecord(entry) || entry.type !== 'message' || !isRecord(entry.message)) continue;
+      const role = entry.message.role;
+      if (role !== 'user' && role !== 'assistant') continue;
+      const rawContent = entry.message.content;
+      let text = '';
+      if (typeof rawContent === 'string') {
+        text = rawContent.trim();
+      } else if (Array.isArray(rawContent)) {
+        text = rawContent
+          .filter(
+            (part): part is { type: string; text: string } =>
+              isRecord(part) && part.type === 'text' && typeof part.text === 'string',
+          )
+          .map((part) => part.text.trim())
+          .filter(Boolean)
+          .join('\n');
+      }
+      if (!text) continue;
+      const clipped = text.length > 1000 ? `${text.slice(0, 1000)}…` : text;
+      turns.push(`[${role}]: ${clipped}`);
+    }
+    const recent = turns.slice(-8).join('\n\n');
+    if (!recent) return prompt;
+    const bounded = recent.length > 8192 ? recent.slice(-8192) : recent;
+    return `<parent_context>\n${bounded}\n</parent_context>\n\n${prompt}`;
+  }
+
   private createRecord(
     input: TaskInput,
     ctx: ExtensionContext,
