@@ -5,11 +5,7 @@
 
 use super::state::{self, Account, NetworkMode};
 use super::{ToWideNul, encode_hex, sid_string, win32_error};
-#[cfg(all(target_os = "windows", target_arch = "aarch64", target_env = "gnu"))]
-use anyhow::bail;
-use anyhow::{Context, Result};
-#[cfg(not(all(target_os = "windows", target_arch = "aarch64", target_env = "gnu")))]
-use openssl::rand::rand_bytes;
+use anyhow::{Context, Result, bail};
 use std::io;
 use std::ptr;
 use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
@@ -17,7 +13,6 @@ use windows_sys::Win32::NetworkManagement::NetManagement::{
     NERR_Success, NetUserAdd, NetUserDel, UF_DONT_EXPIRE_PASSWD, UF_NORMAL_ACCOUNT,
     UF_PASSWD_CANT_CHANGE, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
 };
-#[cfg(all(target_os = "windows", target_arch = "aarch64", target_env = "gnu"))]
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
@@ -167,25 +162,17 @@ fn random_password() -> Result<String> {
 }
 
 fn fill_random(buffer: &mut [u8]) -> Result<()> {
-    #[cfg(not(all(target_os = "windows", target_arch = "aarch64", target_env = "gnu")))]
-    {
-        rand_bytes(buffer).context("failed to generate random bytes with OpenSSL")?;
-        Ok(())
+    let length = u32::try_from(buffer.len()).context("random buffer is too long")?;
+    let status = unsafe {
+        BCryptGenRandom(
+            ptr::null_mut(),
+            buffer.as_mut_ptr(),
+            length,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        bail!("BCryptGenRandom failed with NTSTATUS 0x{status:08x}");
     }
-    #[cfg(all(target_os = "windows", target_arch = "aarch64", target_env = "gnu"))]
-    {
-        let length = u32::try_from(buffer.len()).context("random buffer is too long")?;
-        let status = unsafe {
-            BCryptGenRandom(
-                ptr::null_mut(),
-                buffer.as_mut_ptr(),
-                length,
-                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-            )
-        };
-        if status < 0 {
-            bail!("BCryptGenRandom failed with NTSTATUS 0x{status:08x}");
-        }
-        Ok(())
-    }
+    Ok(())
 }

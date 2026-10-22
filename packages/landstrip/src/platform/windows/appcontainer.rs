@@ -8,7 +8,7 @@ mod doctor;
 pub(super) use doctor::{probe_null_device, status};
 
 use super::{
-    NamedMutex, OwnedLocal, SandboxJob, ToWideNul, is_locked_error, join_command_line, own_handle,
+    LocalSid, NamedMutex, SandboxJob, ToWideNul, is_locked_error, join_command_line, own_handle,
     path_access_failed, quote_command_arg, set_path_access, wait_process_exit, win32_error,
     win32_status,
 };
@@ -36,7 +36,7 @@ use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
     NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, ConvertStringSidToSidW, DENY_ACCESS, GRANT_ACCESS, REVOKE_ACCESS,
+    ACCESS_MODE, DENY_ACCESS, GRANT_ACCESS, REVOKE_ACCESS,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -111,7 +111,7 @@ pub(crate) fn execute(
     } else {
         None
     };
-    let grants = grant_policy_access(policy, profile.sid())?;
+    let grants = GrantedAccess::new(policy, profile.sid())?;
 
     let grant_network = policy.network_access.is_unrestricted();
     if !grant_network && !policy.network_access.connect_tcp_ports().is_empty() {
@@ -490,99 +490,77 @@ impl Drop for LoopbackConfig {
     }
 }
 
-fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess> {
-    let read_roots = match &policy.read_access {
-        ReadAccess::AllowRoots(read_roots) => read_roots,
-        ReadAccess::Unrestricted => {
-            return Err(LandstripError::PolicyUnrestrictedRead.into());
+impl GrantedAccess {
+    fn new(policy: &AccessPolicy, sid: PSID) -> Result<Self> {
+        let read_roots = match &policy.read_access {
+            ReadAccess::AllowRoots(read_roots) => read_roots,
+            ReadAccess::Unrestricted => {
+                return Err(LandstripError::PolicyUnrestrictedRead.into());
+            }
+        };
+        let mut granted = Self {
+            sid,
+            paths: Vec::new(),
+        };
+
+        for path in read_roots {
+            granted.grant_root(path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
         }
-    };
-    let mut granted = GrantedAccess {
-        sid,
-        paths: Vec::new(),
-    };
 
-    for path in read_roots {
-        grant_root_access(&mut granted, path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
+        for path in &policy.write_roots {
+            granted.grant_root(
+                path,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+            )?;
+        }
+
+        // DENY ACEs after grants so evaluation order still denies nested holes under
+        // allow roots. Patterns are not expressible as static ACLs on AppContainer;
+        // restricted_user has the same root-only limitation today.
+        for path in &policy.write_denied_roots {
+            granted.deny_subtree(path, FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE)?;
+        }
+        for path in &policy.read_denied_roots {
+            granted.deny_subtree(path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | DELETE)?;
+        }
+
+        Ok(granted)
     }
 
-    for path in &policy.write_roots {
-        grant_root_access(
-            &mut granted,
-            path,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-        )?;
-    }
+    fn grant_root(&mut self, path: &Path, access: u32) -> Result<()> {
+        // Path lookup needs read and execute access on every ancestor. Keep the
+        // ancestor ACEs local to avoid propagating inheritable entries.
+        let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+        for ancestor in path.ancestors().skip(1) {
+            set_appcontainer_path_access(
+                ancestor,
+                self.sid,
+                ancestor_access,
+                GRANT_ACCESS,
+                false,
+                false,
+            )?;
+            self.paths.push(GrantedPath {
+                path: ancestor.to_path_buf(),
+                propagate: false,
+            });
+        }
 
-    // DENY ACEs after grants so evaluation order still denies nested holes under
-    // allow roots. Patterns are not expressible as static ACLs on AppContainer;
-    // restricted_user has the same root-only limitation today.
-    for path in &policy.write_denied_roots {
-        deny_subtree_access(
-            &mut granted,
-            path,
-            FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE,
-        )?;
-    }
-    for path in &policy.read_denied_roots {
-        deny_subtree_access(
-            &mut granted,
-            path,
-            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | DELETE,
-        )?;
-    }
-
-    Ok(granted)
-}
-
-fn grant_root_access(granted: &mut GrantedAccess, path: &Path, access: u32) -> Result<()> {
-    // Path lookup needs read and execute access on every ancestor. Keep the
-    // ancestor ACEs local to avoid propagating inheritable entries.
-    let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-    for ancestor in path.ancestors().skip(1) {
-        set_appcontainer_path_access(
-            ancestor,
-            granted.sid,
-            ancestor_access,
-            GRANT_ACCESS,
-            false,
-            false,
-        )?;
-        granted.paths.push(GrantedPath {
-            path: ancestor.to_path_buf(),
-            propagate: false,
+        set_appcontainer_path_access(path, self.sid, access, GRANT_ACCESS, true, true)?;
+        self.paths.push(GrantedPath {
+            path: path.to_path_buf(),
+            propagate: true,
         });
+        Ok(())
     }
 
-    set_appcontainer_path_access(path, granted.sid, access, GRANT_ACCESS, true, true)?;
-    granted.paths.push(GrantedPath {
-        path: path.to_path_buf(),
-        propagate: true,
-    });
-    Ok(())
-}
-
-const APP_CONTAINER_GROUP_SIDS: [&str; 2] = ["S-1-15-2-1", "S-1-15-2-2"];
-
-struct LocalSid(OwnedLocal);
-
-impl TryFrom<&str> for LocalSid {
-    type Error = anyhow::Error;
-
-    fn try_from(sid: &str) -> Result<Self> {
-        let wide = sid.to_wide_nul();
-        let mut raw = ptr::null_mut();
-        if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &raw mut raw) } == 0 {
-            return Err(io::Error::last_os_error())
-                .with_context(|| format!("convert AppContainer group SID {sid}"));
-        }
-        Ok(Self(unsafe { OwnedLocal::from_raw(raw) }))
-    }
-}
-
-impl LocalSid {
-    fn as_ptr(&self) -> PSID {
-        self.0.as_ptr()
+    fn deny_subtree(&mut self, path: &Path, access: u32) -> Result<()> {
+        set_appcontainer_path_access(path, self.sid, access, DENY_ACCESS, true, true)?;
+        self.paths.push(GrantedPath {
+            path: path.to_path_buf(),
+            propagate: true,
+        });
+        Ok(())
     }
 }
 
@@ -659,10 +637,7 @@ impl LookupRoots {
 
     // ponytail: prepare standard system and profile roots; workspaces outside these need elevation
     pub(crate) fn prepare(&self) -> Result<()> {
-        let sids = APP_CONTAINER_GROUP_SIDS
-            .into_iter()
-            .map(LocalSid::try_from)
-            .collect::<Result<Vec<_>>>()?;
+        let sids = LocalSid::app_container_groups()?;
 
         let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
         for root in &self.0 {
@@ -739,15 +714,6 @@ impl Drop for GrantedAccess {
     }
 }
 
-fn deny_subtree_access(granted: &mut GrantedAccess, path: &Path, access: u32) -> Result<()> {
-    set_appcontainer_path_access(path, granted.sid, access, DENY_ACCESS, true, true)?;
-    granted.paths.push(GrantedPath {
-        path: path.to_path_buf(),
-        propagate: true,
-    });
-    Ok(())
-}
-
 fn set_appcontainer_path_access(
     path: &Path,
     sid: PSID,
@@ -758,23 +724,11 @@ fn set_appcontainer_path_access(
 ) -> Result<()> {
     match set_path_access(path, sid, access, mode, inherit, propagate) {
         Ok(()) => Ok(()),
-        Err(("GetNamedSecurityInfoW", error))
-            if mode == GRANT_ACCESS && is_locked_error(&error) =>
+        Err((api, error))
+            if api != "SetEntriesInAclW" && mode == GRANT_ACCESS && is_locked_error(&error) =>
         {
-            // Skipping an inaccessible grant is fail-closed because AppContainer
-            // SIDs have no access by default.
-            Ok(())
-        }
-        Err(("SetEntriesInAclW", error)) => Err(path_access_failed(
-            Mechanism::Appcontainer,
-            path,
-            mode,
-            "SetEntriesInAclW",
-            &error,
-        )
-        .into()),
-        Err((_, error)) if mode == GRANT_ACCESS && is_locked_error(&error) => {
-            // A descendant skipped during propagation remains inaccessible.
+            // Skipping an inaccessible grant or descendant during propagation is
+            // fail-closed because AppContainer SIDs have no access by default.
             Ok(())
         }
         Err((api, error)) => {

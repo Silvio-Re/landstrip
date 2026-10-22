@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use super::{NamedMutex, OwnedLocal, ToWideNul, own_handle, win32_error};
+use super::{LocalSid, NamedMutex, OwnedLocal, ToWideNul, own_handle, win32_error};
 use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -9,8 +9,8 @@ use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::ptr;
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, SE_FILE_OBJECT,
-    SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, SE_FILE_OBJECT, SetEntriesInAclW,
+    SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -66,18 +66,7 @@ pub(super) fn prepare() -> Result<()> {
         return Ok(());
     }
 
-    let sids = ["S-1-15-2-1", "S-1-15-2-2"]
-        .into_iter()
-        .map(|sid| {
-            let wide = sid.to_wide_nul();
-            let mut raw = ptr::null_mut();
-            if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &raw mut raw) } == 0 {
-                return Err(io::Error::last_os_error())
-                    .with_context(|| format!("convert AppContainer group SID {sid}"));
-            }
-            Ok(unsafe { OwnedLocal::from_raw(raw) })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let sids = LocalSid::app_container_groups()?;
     let entries = sids
         .iter()
         .map(|sid| EXPLICIT_ACCESS_W {
@@ -89,7 +78,7 @@ pub(super) fn prepare() -> Result<()> {
                 MultipleTrusteeOperation: 0,
                 TrusteeForm: TRUSTEE_IS_SID,
                 TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
-                ptstrName: sid.as_ptr(),
+                ptstrName: sid.as_ptr().cast(),
             },
         })
         .collect::<Vec<_>>();

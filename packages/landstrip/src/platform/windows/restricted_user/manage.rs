@@ -88,7 +88,7 @@ fn setup(
     proxy_port_low: u16,
     proxy_port_high: u16,
 ) -> Result<WindowsStatusReport> {
-    if state::load_optional()?.is_some() {
+    if Installation::load_optional()?.is_some() {
         uninstall().context("remove previous restricted-user installation")?;
     }
 
@@ -115,7 +115,7 @@ fn setup(
         runner_path,
         accounts: Vec::with_capacity(restricted_count + usize::from(unrestricted_accounts)),
     };
-    if let Err(error) = state::save(&installation) {
+    if let Err(error) = installation.save() {
         let cleanup = remove_runner(&installation.runner_path);
         return match cleanup {
             Ok(()) => Err(error),
@@ -141,7 +141,7 @@ fn setup(
         )?;
         wfp::install(&installation)?;
         installation.complete = true;
-        state::save(&installation)?;
+        installation.save()?;
         Ok(())
     })();
 
@@ -170,7 +170,7 @@ fn provision_accounts(
         let provisioned = account::provision(&name, network_mode)
             .with_context(|| format!("provision restricted-user account {name}"))?;
         installation.accounts.push(provisioned);
-        if let Err(error) = state::save(installation) {
+        if let Err(error) = installation.save() {
             let provisioned = installation
                 .accounts
                 .pop()
@@ -188,12 +188,14 @@ fn provision_accounts(
 }
 
 fn uninstall() -> Result<WindowsStatusReport> {
-    let Some(mut installation) = state::load_optional()? else {
+    let Some(mut installation) = Installation::load_optional()? else {
         return Ok(appcontainer::status());
     };
 
     installation.complete = false;
-    state::save(&installation).context("mark restricted-user installation unavailable")?;
+    installation
+        .save()
+        .context("mark restricted-user installation unavailable")?;
 
     lease::recover_all(&installation)
         .context("recover restricted-user filesystem grants before uninstall")?;
@@ -208,11 +210,11 @@ fn uninstall() -> Result<WindowsStatusReport> {
 }
 
 pub(crate) fn status() -> Result<WindowsStatusReport> {
-    let Some(installation) = state::load_optional()? else {
+    let Some(installation) = Installation::load_optional()? else {
         return Ok(appcontainer::status());
     };
 
-    let (accounts_healthy, runner_healthy) = installation_health(&installation);
+    let (accounts_healthy, runner_healthy) = installation.health();
     let healthy = installation.complete && accounts_healthy && runner_healthy;
     Ok(WindowsStatusReport {
         active: SandboxImplementation::RestrictedUser,
@@ -244,22 +246,14 @@ pub(crate) fn status() -> Result<WindowsStatusReport> {
 }
 
 pub(in crate::platform::windows) fn active_implementation() -> Result<&'static str> {
-    let Some(installation) = state::load_optional()? else {
+    let Some(installation) = Installation::load_optional()? else {
         return Ok("appContainer");
     };
-    let (accounts_healthy, runner_healthy) = installation_health(&installation);
+    let (accounts_healthy, runner_healthy) = installation.health();
     if !installation.complete || !accounts_healthy || !runner_healthy {
         bail!("restricted-user installation is unhealthy");
     }
     Ok("restrictedUser")
-}
-
-fn installation_health(installation: &Installation) -> (bool, bool) {
-    let accounts_healthy = installation.accounts.iter().all(|provisioned| {
-        account::lookup_sid(&provisioned.name)
-            .is_ok_and(|sid| sid.eq_ignore_ascii_case(&provisioned.sid))
-    });
-    (accounts_healthy, installation.runner_path.is_file())
 }
 
 fn install_runner() -> Result<PathBuf> {

@@ -11,7 +11,7 @@ pub(crate) use restricted_user::{manage, run_worker, status};
 
 use crate::error::{Error, Mechanism};
 use crate::policy::AccessPolicy;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::mem;
@@ -26,9 +26,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::{
     ACCESS_MODE, ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, REVOKE_ACCESS,
-    SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-    TRUSTEE_W,
+    ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+    REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetTokenInformation, InitializeSecurityDescriptor,
@@ -443,6 +443,38 @@ impl Drop for OwnedLocal {
                 LocalFree(self.0);
             }
         }
+    }
+}
+
+const APP_CONTAINER_GROUP_SIDS: [&str; 2] = ["S-1-15-2-1", "S-1-15-2-2"];
+
+pub(crate) struct LocalSid(OwnedLocal);
+
+impl TryFrom<&str> for LocalSid {
+    type Error = io::Error;
+
+    fn try_from(sid: &str) -> io::Result<Self> {
+        let wide = sid.to_wide_nul();
+        let mut raw = ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &raw mut raw) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(unsafe { OwnedLocal::from_raw(raw) }))
+    }
+}
+
+impl LocalSid {
+    pub(crate) fn as_ptr(&self) -> PSID {
+        self.0.as_ptr()
+    }
+
+    pub(crate) fn app_container_groups() -> Result<Vec<Self>> {
+        APP_CONTAINER_GROUP_SIDS
+            .into_iter()
+            .map(|sid| {
+                Self::try_from(sid).with_context(|| format!("convert AppContainer group SID {sid}"))
+            })
+            .collect()
     }
 }
 

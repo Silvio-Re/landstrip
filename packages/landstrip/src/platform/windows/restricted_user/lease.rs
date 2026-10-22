@@ -9,8 +9,8 @@ use super::state::{self, Account, Installation, NetworkMode};
 use crate::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -60,37 +60,7 @@ impl<'a> Lease<'a> {
             account_sid: self.account.sid.clone(),
             grants: grants.clone(),
         };
-        let directory = self
-            .journal_path
-            .parent()
-            .context("restricted-user journal path has no parent")?;
-        fs::create_dir_all(directory)
-            .with_context(|| format!("create lease journal directory {}", directory.display()))?;
-        state::protect_path(directory)?;
-        let temporary = self
-            .journal_path
-            .with_extension(format!("tmp-{}", std::process::id()));
-        let bytes = serde_json::to_vec_pretty(&journal)?;
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&temporary)
-                .with_context(|| format!("create lease journal {}", temporary.display()))?;
-            file.write_all(&bytes)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            drop(file);
-            state::protect_path(&temporary)?;
-
-            state::replace_file(&temporary, &self.journal_path)?;
-            state::protect_path(&self.journal_path)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        state::write_protected_json(&self.journal_path, &journal, "lease journal")
     }
 
     pub(super) fn clear_journal(&self) -> Result<()> {
@@ -102,10 +72,7 @@ impl<'a> Lease<'a> {
     }
 
     fn try_account(installation: &Installation, account: &'a Account) -> Result<Option<Self>> {
-        let state_path = state::state_path()?;
-        let journal_path = state_path
-            .parent()
-            .context("restricted-user state path has no parent")?
+        let journal_path = state::state_dir()?
             .join("leases")
             .join(format!("{}.json", account.name));
         let name = format!(

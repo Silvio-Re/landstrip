@@ -3,18 +3,14 @@
 
 //! Temporary filesystem grants for a leased sandbox account.
 
-use super::{
-    OwnedLocal, ToWideNul, is_locked_error, is_missing_error, path_access_failed, set_path_access,
-};
+use super::{LocalSid, is_locked_error, is_missing_error, path_access_failed, set_path_access};
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::io;
 use std::path::{Path, PathBuf};
-use std::ptr;
 use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, ConvertStringSidToSidW, DENY_ACCESS, GRANT_ACCESS, REVOKE_ACCESS,
+    ACCESS_MODE, DENY_ACCESS, GRANT_ACCESS, REVOKE_ACCESS,
 };
 use windows_sys::Win32::Security::PSID;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -49,40 +45,32 @@ impl GrantPlan {
             entries: Vec::new(),
         };
         for path in read_roots {
-            plan.add_root(path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, GRANT_ACCESS);
+            plan.add_grant(path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, true);
         }
         for path in &policy.write_roots {
-            plan.add_root(
+            plan.add_grant(
                 path,
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-                GRANT_ACCESS,
+                true,
             );
         }
         // Placed after grant entries so the resulting DACL has DENY before
         // GRANT in access-evaluation order.
         for path in &policy.write_denied_roots {
-            plan.add_subtree_deny(
-                path,
-                FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE,
-                DENY_ACCESS,
-            );
+            plan.add_subtree_deny(path, FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE);
         }
         for path in &policy.read_denied_roots {
-            plan.add_subtree_deny(
-                path,
-                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | DELETE,
-                DENY_ACCESS,
-            );
+            plan.add_subtree_deny(path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | DELETE);
         }
-        plan.add_local(request_path, FILE_GENERIC_READ, GRANT_ACCESS);
+        plan.add_grant(request_path, FILE_GENERIC_READ, false);
         Ok(plan)
     }
 
-    fn add_root(&mut self, path: &Path, access: u32, access_mode: ACCESS_MODE) {
+    fn add_grant(&mut self, path: &Path, access: u32, inherit_and_propagate: bool) {
         let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
         for ancestor in path.ancestors().skip(1) {
             self.entries.push(GrantEntry {
-                access_mode,
+                access_mode: GRANT_ACCESS,
                 path: ancestor.to_path_buf(),
                 access: ancestor_access,
                 inherit: false,
@@ -90,53 +78,34 @@ impl GrantPlan {
             });
         }
         self.entries.push(GrantEntry {
-            access_mode,
+            access_mode: GRANT_ACCESS,
+            path: path.to_path_buf(),
+            access,
+            inherit: inherit_and_propagate,
+            propagate: inherit_and_propagate,
+        });
+    }
+
+    fn add_subtree_deny(&mut self, path: &Path, access: u32) {
+        self.entries.push(GrantEntry {
+            access_mode: DENY_ACCESS,
             path: path.to_path_buf(),
             access,
             inherit: true,
             propagate: true,
-        });
-    }
-
-    fn add_subtree_deny(&mut self, path: &Path, access: u32, access_mode: ACCESS_MODE) {
-        self.entries.push(GrantEntry {
-            access_mode,
-            path: path.to_path_buf(),
-            access,
-            inherit: true,
-            propagate: true,
-        });
-    }
-
-    fn add_local(&mut self, path: &Path, access: u32, access_mode: ACCESS_MODE) {
-        let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-        for ancestor in path.ancestors().skip(1) {
-            self.entries.push(GrantEntry {
-                access_mode,
-                path: ancestor.to_path_buf(),
-                access: ancestor_access,
-                inherit: false,
-                propagate: false,
-            });
-        }
-        self.entries.push(GrantEntry {
-            access_mode,
-            path: path.to_path_buf(),
-            access,
-            inherit: false,
-            propagate: false,
         });
     }
 
     pub(super) fn apply(&self, sid: &str) -> Result<Self> {
-        let sid = OwnedSid::parse(sid)?;
+        let sid = LocalSid::try_from(sid)
+            .map_err(|source| LandstripError::sandbox_setup(Mechanism::Windowsuser, source))?;
         let mut applied = Self {
             entries: Vec::with_capacity(self.entries.len()),
         };
         for entry in &self.entries {
             match set_restricted_path_access(
                 &entry.path,
-                sid.as_psid(),
+                sid.as_ptr(),
                 entry.access,
                 entry.access_mode,
                 entry.inherit,
@@ -149,7 +118,7 @@ impl GrantPlan {
                     for applied_entry in applied.entries.iter().rev() {
                         let _ = set_restricted_path_access(
                             &applied_entry.path,
-                            sid.as_psid(),
+                            sid.as_ptr(),
                             0,
                             REVOKE_ACCESS,
                             false,
@@ -165,12 +134,13 @@ impl GrantPlan {
     }
 
     pub(super) fn revoke(&self, sid: &str) -> Result<()> {
-        let sid = OwnedSid::parse(sid)?;
+        let sid = LocalSid::try_from(sid)
+            .map_err(|source| LandstripError::sandbox_setup(Mechanism::Windowsuser, source))?;
         let mut first_error = None;
         for entry in self.entries.iter().rev() {
             let error = set_restricted_path_access(
                 &entry.path,
-                sid.as_psid(),
+                sid.as_ptr(),
                 0,
                 REVOKE_ACCESS,
                 false,
@@ -189,27 +159,6 @@ impl GrantPlan {
     }
 }
 
-struct OwnedSid(OwnedLocal);
-
-impl OwnedSid {
-    fn parse(value: &str) -> Result<Self> {
-        let value = value.to_wide_nul();
-        let mut sid = ptr::null_mut();
-        if unsafe { ConvertStringSidToSidW(value.as_ptr(), &raw mut sid) } == 0 {
-            return Err(LandstripError::sandbox_setup(
-                Mechanism::Windowsuser,
-                io::Error::last_os_error(),
-            )
-            .into());
-        }
-        Ok(Self(unsafe { OwnedLocal::from_raw(sid) }))
-    }
-
-    fn as_psid(&self) -> PSID {
-        self.0.as_ptr()
-    }
-}
-
 fn set_restricted_path_access(
     path: &Path,
     sid: PSID,
@@ -221,30 +170,22 @@ fn set_restricted_path_access(
 ) -> Result<bool> {
     match set_path_access(path, sid, access, mode, inherit, propagate) {
         Ok(()) => Ok(true),
-        Err(("GetNamedSecurityInfoW", error))
-            if (ignore_missing && is_missing_error(&error))
-                || (mode == GRANT_ACCESS && is_locked_error(&error)) =>
+        Err((api, error))
+            if api != "SetEntriesInAclW" && ignore_missing && is_missing_error(&error) =>
         {
             Ok(false)
         }
-        Err(("SetEntriesInAclW", error)) => Err(path_access_failed(
-            Mechanism::Windowsuser,
-            path,
-            mode,
-            "SetEntriesInAclW",
-            &error,
-        )
-        .into()),
+        // A failed non-propagating grant did not alter descendants and leaves
+        // the target inaccessible. Propagating failures may be partial, so they
+        // remain hard errors and the full journal is retained for recovery.
+        Err((api, error))
+            if (api == "GetNamedSecurityInfoW" || !propagate)
+                && mode == GRANT_ACCESS
+                && is_locked_error(&error) =>
+        {
+            Ok(false)
+        }
         Err((api, error)) => {
-            if ignore_missing && is_missing_error(&error) {
-                return Ok(false);
-            }
-            // A failed non-propagating grant did not alter descendants and leaves
-            // the target inaccessible. Propagating failures may be partial, so they
-            // remain hard errors and the full journal is retained for recovery.
-            if mode == GRANT_ACCESS && !propagate && is_locked_error(&error) {
-                return Ok(false);
-            }
             Err(path_access_failed(Mechanism::Windowsuser, path, mode, api, &error).into())
         }
     }

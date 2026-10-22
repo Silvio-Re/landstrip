@@ -3,10 +3,13 @@
 
 //! Persistent installation state and DPAPI-protected account credentials.
 
+use super::account;
 use super::{
     OwnedLocal, OwnedSecurityDescriptor, ToWideNul, current_process_token, decode_hex, encode_hex,
     sid_string, token_user, win32_error,
 };
+use crate::error::{Error as LandstripError, Mechanism};
+use crate::policy::AccessPolicy;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -79,16 +82,105 @@ impl Drop for SecretWide {
     }
 }
 
-pub(super) fn state_path() -> Result<PathBuf> {
+impl Installation {
+    pub(super) fn load() -> Result<Self> {
+        let path = state_path()?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("restricted-user installation state {}", path.display()))?;
+        let installation: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("restricted-user installation state {}", path.display()))?;
+        if installation.version != INSTALLATION_VERSION {
+            bail!(
+                "restricted-user installation version {} is unsupported; expected {}",
+                installation.version,
+                INSTALLATION_VERSION
+            );
+        }
+        Ok(installation)
+    }
+
+    pub(super) fn load_optional() -> Result<Option<Self>> {
+        match Self::load() {
+            Ok(installation) => Ok(Some(installation)),
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|source| source.kind() == io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn load_ready() -> Result<Self> {
+        let installation = Self::load()
+            .map_err(|source| LandstripError::sandbox_setup(Mechanism::Windowsuser, source))?;
+        if !installation.complete {
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                "restricted-user installation is incomplete",
+            )
+            .into());
+        }
+        Ok(installation)
+    }
+
+    pub(super) fn save(&self) -> Result<()> {
+        let path = state_path()?;
+        write_protected_json(&path, self, "restricted-user state")
+    }
+
+    pub(super) fn health(&self) -> (bool, bool) {
+        let accounts_healthy = self.accounts.iter().all(|provisioned| {
+            account::lookup_sid(&provisioned.name)
+                .is_ok_and(|sid| sid.eq_ignore_ascii_case(&provisioned.sid))
+        });
+        (accounts_healthy, self.runner_path.is_file())
+    }
+
+    pub(super) fn validate_restricted_network(&self, policy: &AccessPolicy) -> Result<()> {
+        if policy.allow_windows_loopback {
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                "windows.allowLoopback is not supported by restricted-user isolation",
+            )
+            .into());
+        }
+        if policy.network_access.allows_local_binding() {
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                "allowLocalBinding is not supported by restricted-user isolation",
+            )
+            .into());
+        }
+        if policy
+            .network_access
+            .connect_tcp_ports()
+            .iter()
+            .any(|port| *port < self.proxy_port_low || *port > self.proxy_port_high)
+        {
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                "restricted-user proxy port is outside the installed WFP allow range",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn state_dir() -> Result<PathBuf> {
     let base = env::var_os("ProgramData").context("Windows ProgramData is unavailable")?;
-    Ok(PathBuf::from(base).join(STATE_DIRECTORY).join(STATE_FILE))
+    Ok(PathBuf::from(base).join(STATE_DIRECTORY))
+}
+
+fn state_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join(STATE_FILE))
 }
 
 pub(super) fn initialize_runtime_directories() -> Result<()> {
-    let path = state_path()?;
-    let directory = path
-        .parent()
-        .context("restricted-user state path has no parent")?;
+    let directory = state_dir()?;
     for name in ["leases", "runs"] {
         let runtime_directory = directory.join(name);
         fs::create_dir_all(&runtime_directory).with_context(|| {
@@ -102,66 +194,31 @@ pub(super) fn initialize_runtime_directories() -> Result<()> {
     Ok(())
 }
 
-pub(super) fn load() -> Result<Installation> {
-    let path = state_path()?;
-    let bytes = fs::read(&path)
-        .with_context(|| format!("restricted-user installation state {}", path.display()))?;
-    let installation: Installation = serde_json::from_slice(&bytes)
-        .with_context(|| format!("restricted-user installation state {}", path.display()))?;
-    if installation.version != INSTALLATION_VERSION {
-        bail!(
-            "restricted-user installation version {} is unsupported; expected {}",
-            installation.version,
-            INSTALLATION_VERSION
-        );
-    }
-    Ok(installation)
-}
-
-pub(super) fn load_optional() -> Result<Option<Installation>> {
-    match load() {
-        Ok(installation) => Ok(Some(installation)),
-        Err(error)
-            if error
-                .downcast_ref::<io::Error>()
-                .is_some_and(|source| source.kind() == io::ErrorKind::NotFound) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-pub(super) fn save(installation: &Installation) -> Result<()> {
-    let path = state_path()?;
+pub(super) fn write_protected_json(path: &Path, value: &impl Serialize, label: &str) -> Result<()> {
     let directory = path
         .parent()
-        .context("restricted-user state path has no parent")?;
-    fs::create_dir_all(directory).with_context(|| {
-        format!(
-            "create restricted-user state directory {}",
-            directory.display()
-        )
-    })?;
+        .with_context(|| format!("{label} path has no parent"))?;
+    fs::create_dir_all(directory)
+        .with_context(|| format!("create {label} directory {}", directory.display()))?;
     protect_path(directory)?;
 
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let bytes = serde_json::to_vec_pretty(installation)?;
+    let bytes = serde_json::to_vec_pretty(value)?;
     let result = (|| {
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(&temporary)
-            .with_context(|| format!("create restricted-user state {}", temporary.display()))?;
+            .with_context(|| format!("create {label} {}", temporary.display()))?;
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
         drop(file);
         protect_path(&temporary)?;
 
-        replace_file(&temporary, &path)?;
-        protect_path(&path)
+        replace_file(&temporary, path)?;
+        protect_path(path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -169,7 +226,7 @@ pub(super) fn save(installation: &Installation) -> Result<()> {
     result
 }
 
-pub(super) fn replace_file(temporary: &Path, path: &Path) -> Result<()> {
+fn replace_file(temporary: &Path, path: &Path) -> Result<()> {
     let temporary_wide = temporary.to_wide_nul();
     let path_wide = path.to_wide_nul();
     if unsafe {
@@ -187,8 +244,9 @@ pub(super) fn replace_file(temporary: &Path, path: &Path) -> Result<()> {
 }
 
 pub(super) fn remove() -> Result<()> {
-    let path = state_path()?;
-    if let Some(directory) = path.parent() {
+    let directory = state_dir()?;
+    let path = directory.join(STATE_FILE);
+    {
         for name in ["leases", "runs"] {
             let runtime_directory = directory.join(name);
             match fs::remove_dir_all(&runtime_directory) {
@@ -212,9 +270,7 @@ pub(super) fn remove() -> Result<()> {
         Err(error) => return Err(error).context("remove restricted-user installation state"),
     }
 
-    if let Some(directory) = path.parent() {
-        let _ = fs::remove_dir(directory);
-    }
+    let _ = fs::remove_dir(&directory);
     Ok(())
 }
 
@@ -277,13 +333,15 @@ pub(super) fn unprotect_password(protected: &str) -> Result<SecretWide> {
     let size = output.cbData as usize;
     let output = unsafe { OwnedLocal::from_raw(output.pbData) };
     let mut clear = unsafe { std::slice::from_raw_parts(output.as_ptr(), size).to_vec() };
-    let password = String::from_utf8(clear.clone()).context("sandbox password is not UTF-8")?;
+    let wide = std::str::from_utf8(&clear)
+        .context("sandbox password is not UTF-8")
+        .map(|password| {
+            let mut wide = OsStr::new(password).encode_wide().collect::<Vec<_>>();
+            wide.push(0);
+            SecretWide(wide)
+        });
     clear.zeroize();
-    let mut wide = OsStr::new(&password).encode_wide().collect::<Vec<_>>();
-    wide.push(0);
-    let mut password = password;
-    password.zeroize();
-    Ok(SecretWide(wide))
+    wide
 }
 
 pub(super) fn protect_path(path: &Path) -> Result<()> {
