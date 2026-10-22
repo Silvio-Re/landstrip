@@ -35,8 +35,6 @@ import {
   matchesKey,
   Input,
   type TUI,
-  type SelectItem,
-  SelectList,
   type SettingItem,
   SettingsList,
   Text,
@@ -80,16 +78,12 @@ import {
 import {
   clearAgentDisabledForScope,
   clearMaxSubagentsConfigForScope,
-  clearToolFilesystemPolicyConfigForScope,
   isProjectTrusted,
   loadAgentDisabledOverrides,
   loadMaxSubagentsSettings,
-  loadToolFilesystemPolicySettings,
   MAX_SUBAGENTS,
   setAgentDisabledForScope,
   setMaxSubagentsConfigForScope,
-  setToolFilesystemPolicyConfigForScope,
-  type ToolFilesystemPolicy,
 } from './config.ts';
 import type { LandstripIntegration, LandstripRpcWorkerLaunch } from './index.ts';
 import { type ExtensionUiRequest, type ExtensionUiResult, RpcProcess } from './rpc-process.ts';
@@ -1525,7 +1519,6 @@ export class SubagentRuntime implements CommandSubagentRuntime {
   private primaryRules: PermissionRules | undefined;
   private primaryConfigurationError = false;
   private maxSubagents = 0;
-  private toolFilesystemPolicy: ToolFilesystemPolicy = 'host';
   private primaryAgentSwitching = false;
   private shuttingDown = false;
   private activeSessionId: string | undefined;
@@ -1640,7 +1633,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       }
 
       const filesystem = filesystemToolAccesses(event.toolName, input, ctx.cwd);
-      if (this.toolFilesystemPolicy === 'sandbox' && filesystem) {
+      if (filesystem && typeof this.integration.authorizeFilesystemToolAccess === 'function') {
         if (!filesystem.valid) {
           return { block: true, reason: `Filesystem path unavailable for ${event.toolName}` };
         }
@@ -1751,7 +1744,6 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     refreshDeletableAgents();
     let overview = this.integration.sandboxCallbacks?.overview?.(ctx.cwd, projectTrusted);
     let maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
-    let policySettings = loadToolFilesystemPolicySettings(ctx.cwd, projectTrusted);
     let settingsList: SettingsList | undefined;
     let saving = false;
     let confirmingSandboxDisable = false;
@@ -1906,13 +1898,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           'maxSubagents',
           settingValue(maxSubagentsSettings.project, maxSubagentsSettings.global),
         );
-        settingsList?.updateValue(
-          'toolFilesystemPolicy',
-          settingValue(policySettings.project, policySettings.global),
-        );
       };
 
-      const saveSetting = (id: string, value: string): void => {
+      const saveSetting = (_id: string, value: string): void => {
         if (!projectTrusted) {
           ctx.ui.notify('Project settings require a trusted project', 'warning');
           syncSettingsList();
@@ -1920,32 +1908,23 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         }
         let save: Promise<void>;
         let notifyMessage: string;
-        if (id === 'maxSubagents') {
-          if (value === INHERIT || value === '') {
-            save = clearMaxSubagentsConfigForScope(ctx.cwd, 'project');
-            notifyMessage = 'Project maxSubagents inherits Global';
-          } else {
-            const parsed = Number(value);
-            if (
-              !/^\d+$/.test(value) ||
-              !Number.isSafeInteger(parsed) ||
-              parsed < 0 ||
-              parsed > MAX_SUBAGENTS
-            ) {
-              ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
-              syncSettingsList();
-              return;
-            }
-            save = setMaxSubagentsConfigForScope(ctx.cwd, parsed, 'project');
-            notifyMessage = `Project maxSubagents = ${parsed}`;
-          }
-        } else if (value === INHERIT) {
-          save = clearToolFilesystemPolicyConfigForScope(ctx.cwd, 'project');
-          notifyMessage = 'Project toolFilesystemPolicy inherits Global';
+        if (value === INHERIT || value === '') {
+          save = clearMaxSubagentsConfigForScope(ctx.cwd, 'project');
+          notifyMessage = 'Project maxSubagents inherits global setting';
         } else {
-          const policy: ToolFilesystemPolicy = value === 'host' ? 'host' : 'sandbox';
-          save = setToolFilesystemPolicyConfigForScope(ctx.cwd, policy, 'project');
-          notifyMessage = `Project toolFilesystemPolicy = ${policy}`;
+          const parsed = Number(value);
+          if (
+            !/^\d+$/.test(value) ||
+            !Number.isSafeInteger(parsed) ||
+            parsed < 0 ||
+            parsed > MAX_SUBAGENTS
+          ) {
+            ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
+            syncSettingsList();
+            return;
+          }
+          save = setMaxSubagentsConfigForScope(ctx.cwd, parsed, 'project');
+          notifyMessage = `Project maxSubagents = ${parsed}`;
         }
 
         saving = true;
@@ -1953,9 +1932,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         void save
           .then(() => {
             maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
-            policySettings = loadToolFilesystemPolicySettings(ctx.cwd, projectTrusted);
             this.setMaxSubagents(maxSubagentsSettings.project ?? maxSubagentsSettings.global);
-            this.toolFilesystemPolicy = policySettings.project ?? policySettings.global;
             ctx.ui.notify(notifyMessage, 'info');
           })
           .catch((error: unknown) =>
@@ -1973,7 +1950,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           id: 'maxSubagents',
           label: 'Maximum Subagents',
           currentValue: settingValue(maxSubagentsSettings.project, maxSubagentsSettings.global),
-          description: 'Concurrent subagent tasks. Enter to edit, empty to inherit Global.',
+          description: 'Concurrent subagent tasks. Enter to edit, empty to inherit global setting.',
           submenu: (_currentValue, doneEditing) => {
             const input = new Input();
             input.focused = true;
@@ -1984,40 +1961,6 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             input.onSubmit = (value) => doneEditing(value.trim() || INHERIT);
             input.onEscape = () => doneEditing(undefined);
             return input;
-          },
-        },
-        {
-          id: 'toolFilesystemPolicy',
-          label: 'Filesystem Tool Policy',
-          currentValue: settingValue(policySettings.project, policySettings.global),
-          description: 'How file tools resolve paths. Enter to choose.',
-          submenu: (_currentValue, doneEditing) => {
-            const options: SelectItem[] = [
-              {
-                value: INHERIT,
-                label: 'inherit',
-                description: `Use Global (${policySettings.global})`,
-              },
-              { value: 'host', label: 'host', description: 'Resolve paths on the host' },
-              {
-                value: 'sandbox',
-                label: 'sandbox',
-                description: 'Resolve paths inside the sandbox',
-              },
-            ];
-            const list = new SelectList(options, options.length, {
-              selectedPrefix: (text) => theme.fg('accent', text),
-              selectedText: (text) => theme.fg('accent', text),
-              description: (text) => theme.fg('dim', text),
-              scrollInfo: (text) => theme.fg('dim', text),
-              noMatch: (text) => theme.fg('dim', text),
-            });
-            list.setSelectedIndex(
-              options.findIndex((option) => option.value === (policySettings.project ?? INHERIT)),
-            );
-            list.onSelect = (item) => doneEditing(item.value);
-            list.onCancel = () => doneEditing(undefined);
-            return list;
           },
         },
       ];
@@ -4746,7 +4689,6 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     this.primaryConfigurationError = false;
     const catalog = this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
     this.maxSubagents = catalog.maxSubagents;
-    this.toolFilesystemPolicy = catalog.toolFilesystemPolicy;
     this.semaphore = new Semaphore(this.maxSubagents);
     if (catalog.diagnostics.length > 0) {
       this.invalidatePrimaryAgent(catalog, ctx);
@@ -4832,7 +4774,6 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     if (!(await this.applyPrimaryAgentRuntime(agent, ctx))) return false;
     this.primaryAgent = agent;
     this.primaryRules = mergePermissionRules(catalog.permissions, agent.permissions);
-    this.toolFilesystemPolicy = catalog.toolFilesystemPolicy;
     this.primaryConfigurationError = false;
     this.broker.reset();
     this.pi.registerTool(this.createTaskTool(undefined, this.primaryRules, ctx));

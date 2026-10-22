@@ -1243,8 +1243,26 @@ function createLandstripIntegrationWithPrompts(
       ).values(),
     ];
 
+    if (getNoSandboxFlag()) return { allowed: true, prompted: false };
+
+    const blockedAccesses = (config: SandboxConfig): FilesystemToolAccess[] => {
+      const enforceReads = enforcesShellReadPolicy(config.shell.readAccess);
+      return normalized.filter((access) =>
+        access.operation === 'read'
+          ? enforceReads &&
+            !readAllowed(
+              access.path,
+              getEffectiveAllowRead(config, ctx.cwd),
+              getEffectiveDenyRead(config, ctx.cwd),
+              ctx.cwd,
+            )
+          : shouldPromptForWrite(access.path, getEffectiveAllowWrite(config), ctx.cwd),
+      );
+    };
+
     const current = (): FilesystemToolAuthorization | undefined => {
       const config = loadConfig(ctx.cwd);
+      if (!config.enabled) return { allowed: true, prompted: false };
       for (const access of normalized) {
         if (
           matchesPattern(
@@ -1263,17 +1281,7 @@ function createLandstripIntegrationWithPrompts(
         }
       }
 
-      const blocked = normalized.filter((access) =>
-        access.operation === 'read'
-          ? !readAllowed(
-              access.path,
-              getEffectiveAllowRead(config, ctx.cwd),
-              getEffectiveDenyRead(config, ctx.cwd),
-              ctx.cwd,
-            )
-          : shouldPromptForWrite(access.path, getEffectiveAllowWrite(config), ctx.cwd),
-      );
-      return blocked.length === 0 ? { allowed: true, prompted: false } : undefined;
+      return blockedAccesses(config).length === 0 ? { allowed: true, prompted: false } : undefined;
     };
 
     const existing = current();
@@ -1285,17 +1293,7 @@ function createLandstripIntegrationWithPrompts(
     return permissionPrompts.resolve(
       current,
       async (promptSignal) => {
-        const config = loadConfig(ctx.cwd);
-        const blocked = normalized.filter((access) =>
-          access.operation === 'read'
-            ? !readAllowed(
-                access.path,
-                getEffectiveAllowRead(config, ctx.cwd),
-                getEffectiveDenyRead(config, ctx.cwd),
-                ctx.cwd,
-              )
-            : shouldPromptForWrite(access.path, getEffectiveAllowWrite(config), ctx.cwd),
-        );
+        const blocked = blockedAccesses(loadConfig(ctx.cwd));
         const paths = blocked.map(({ operation, path }) => `${operation}: ${path}`).join('\n');
         const note = options.authorizationNote ? `\n\n${options.authorizationNote}` : '';
         const choice = await showPermissionPrompt(

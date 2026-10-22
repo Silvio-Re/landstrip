@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -764,6 +764,97 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
       expect(seededPrompt).toContain('[user]: We need to audit worker auth paths.');
       expect(seededPrompt).toContain('[assistant]: I found worker-auth-runtime.ts.');
       expect(seededPrompt).toContain('</parent_context>\n\nCheck line 55');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('primary file tools follow sandbox.json readAccess and write policy directly', async () => {
+    const root = mkdtempSync(join(homedir(), '.pi-landstrip-test-'));
+    try {
+      vi.stubEnv('PI_CODING_AGENT_DIR', root);
+      writeFileSync(
+        join(root, 'sandbox.json'),
+        JSON.stringify({
+          enabled: true,
+          shell: { readAccess: 'host' },
+          filesystem: {
+            allowRead: [root],
+            denyRead: [join(root, 'soft-secret.txt')],
+            denyReadAlways: [join(root, 'hard-secret.txt')],
+            allowWrite: [join(root, 'allowed')],
+            denyWrite: [join(root, 'allowed', 'readonly.txt')],
+            denyWriteAlways: [join(root, 'allowed', 'immutable.txt')],
+          },
+        }),
+      );
+
+      const projectDir = join(root, 'project');
+      mkdirSync(projectDir, { recursive: true });
+      const mockApi = createMockExtensionAPI();
+      const integration = createLandstripIntegration({ registerBashTool: false, cwd: projectDir });
+      const runtime = new SubagentRuntime(mockApi.api, integration);
+      runtime.register();
+
+      const ctx = createMockExtensionContext(projectDir);
+      for (const handler of mockApi.listeners.get('session_start') ?? []) {
+        await handler({}, ctx);
+      }
+
+      const callTool = async (toolName: string, input: Record<string, unknown>) => {
+        for (const handler of mockApi.listeners.get('tool_call') ?? []) {
+          const result = await handler({ toolName, input }, ctx);
+          if (result) return result;
+        }
+        return undefined;
+      };
+
+      expect(await callTool('read', { path: join(root, 'hard-secret.txt') })).toEqual({
+        block: true,
+        reason: `Read denied by sandbox policy: ${join(root, 'hard-secret.txt')}`,
+      });
+
+      if (process.platform !== 'win32') {
+        expect(await callTool('read', { path: join(root, 'soft-secret.txt') })).toBeUndefined();
+      }
+
+      expect(await callTool('write', { path: join(root, 'allowed', 'ok.txt') })).toBeUndefined();
+      expect(await callTool('write', { path: join(root, 'allowed', 'readonly.txt') })).toEqual({
+        block: true,
+        reason: `Write denied by sandbox policy: ${join(root, 'allowed', 'readonly.txt')}`,
+      });
+      expect(await callTool('edit', { path: join(root, 'allowed', 'immutable.txt') })).toEqual({
+        block: true,
+        reason: `Write denied by sandbox policy: ${join(root, 'allowed', 'immutable.txt')}`,
+      });
+      expect(await callTool('write', { path: join(root, 'outside.txt') })).toEqual({
+        block: true,
+        reason: 'Filesystem access requires approval',
+      });
+
+      writeFileSync(
+        join(root, 'sandbox.json'),
+        JSON.stringify({
+          enabled: true,
+          shell: { readAccess: 'policy' },
+          filesystem: {
+            allowRead: [root],
+            denyRead: [join(root, 'soft-secret.txt')],
+            denyReadAlways: [join(root, 'hard-secret.txt')],
+            allowWrite: [join(root, 'allowed')],
+            denyWrite: [],
+            denyWriteAlways: [],
+          },
+        }),
+      );
+      expect(await callTool('read', { path: join(root, 'soft-secret.txt') })).toEqual({
+        block: true,
+        reason: 'Filesystem access requires approval',
+      });
+
+      writeFileSync(join(root, 'sandbox.json'), JSON.stringify({ enabled: false }));
+      expect(await callTool('read', { path: join(root, 'hard-secret.txt') })).toBeUndefined();
+      expect(await callTool('write', { path: join(root, 'outside.txt') })).toBeUndefined();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

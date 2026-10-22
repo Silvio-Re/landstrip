@@ -15,8 +15,8 @@ unsandboxed execution.
 ## Permissions and configuration
 
 With sandboxing enabled, Bash (`bash`, `!`, `!!`) and workers are OS-isolated.
-Primary file tools remain in trusted Pi; `toolFilesystemPolicy: "sandbox"`
-adds policy checks, not isolation. Tool approval never bypasses hard denials.
+Primary file tools run in trusted Pi and preflight paths against the sandbox
+filesystem policy. Tool approval never bypasses hard denials.
 
 Configuration: bundled [`sandbox.json`](sandbox.json) → `~/.pi/agent/sandbox.json`
 → trusted-project `.pi/sandbox.json`. Arrays combine; later scalars win.
@@ -52,7 +52,6 @@ Configure `~/.pi/agent/landstrip.json`, trusted-project `.pi/landstrip.json`, or
 ```json
 {
   "maxSubagents": 2,
-  "toolFilesystemPolicy": "sandbox",
   "permission": { "task": { "*": "deny", "review": "allow" } }
 }
 ```

@@ -8,11 +8,7 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import { type AutocompleteItem, fuzzyFilter } from '@earendil-works/pi-tui';
 import type { AgentCatalog } from './agents.ts';
-import {
-  isProjectTrusted,
-  loadMaxSubagentsSettings,
-  loadToolFilesystemPolicySettings,
-} from './config.ts';
+import { isProjectTrusted, loadMaxSubagentsSettings } from './config.ts';
 import type { LandstripIntegration } from './index.ts';
 
 export interface CommandSubagentRuntime {
@@ -233,16 +229,12 @@ const sandboxSubcommand: Subcommand = {
 
 const settingsSubcommand: Subcommand = {
   name: 'settings',
-  summary: 'Manage concurrency and filesystem tool policies',
+  summary: 'Manage subagent concurrency settings',
   pane: (argv) => (argv.rest ? undefined : 'settings'),
   run: (_argv, { ctx }) => {
     const projectTrusted = isProjectTrusted(ctx);
     const maxSubagents = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
-    const policy = loadToolFilesystemPolicySettings(ctx.cwd, projectTrusted);
-    ctx.ui.notify(
-      `Settings: maxSubagents=${maxSubagents.project ?? maxSubagents.global} · toolFilesystemPolicy=${policy.project ?? policy.global}`,
-      'info',
-    );
+    ctx.ui.notify(`Settings: maxSubagents=${maxSubagents.project ?? maxSubagents.global}`, 'info');
   },
 };
 

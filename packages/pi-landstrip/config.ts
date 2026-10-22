@@ -18,7 +18,6 @@ import { expandFileReferences, formatError, isRecord } from './util.ts';
 
 const BUILT_IN_LANDSTRIP_CONFIG = {
   maxSubagents: 0,
-  toolFilesystemPolicy: 'host',
   agent: {
     build: {
       description: 'Implement and test requested changes',
@@ -99,7 +98,6 @@ export function isProjectTrusted(ctx: ExtensionContext): boolean {
 export const MAX_SUBAGENTS = 16;
 
 export type AgentSource = 'built-in' | 'global' | 'local';
-export type ToolFilesystemPolicy = 'host' | 'sandbox';
 export type LandstripConfigKind = 'dedicated' | 'settings';
 
 export interface LandstripConfigTarget {
@@ -111,13 +109,11 @@ export interface LandstripConfigFile {
   maxSubagents?: number;
   agent?: ConfigObject;
   permission?: unknown;
-  toolFilesystemPolicy?: ToolFilesystemPolicy;
 }
 
 export interface LandstripConfig extends LandstripConfigFile {
   maxSubagents: number;
   agent: ConfigObject;
-  toolFilesystemPolicy: ToolFilesystemPolicy;
   agentSources: ReadonlyMap<string, AgentSource>;
   agentPaths: ReadonlyMap<string, string>;
 }
@@ -127,16 +123,11 @@ export interface MaxSubagentsSettings {
   readonly project?: number;
 }
 
-export interface ToolFilesystemPolicySettings {
-  readonly global: ToolFilesystemPolicy;
-  readonly project?: ToolFilesystemPolicy;
-}
-
 interface LandstripConfigSource extends LandstripConfigTarget {
   readonly config: LandstripConfigFile;
 }
 
-const LANDSTRIP_KEYS = ['maxSubagents', 'agent', 'permission', 'toolFilesystemPolicy'] as const;
+const LANDSTRIP_KEYS = ['maxSubagents', 'agent', 'permission'] as const;
 const JSON_FORMAT = { formattingOptions: { insertSpaces: true, tabSize: 2, eol: '\n' } };
 
 function ensureFinalNewline(content: string): string {
@@ -201,12 +192,6 @@ function parseLandstripConfig(
     config.agent = value.agent;
   }
   if ('permission' in value) config.permission = value.permission;
-  if ('toolFilesystemPolicy' in value) {
-    if (value.toolFilesystemPolicy !== 'host' && value.toolFilesystemPolicy !== 'sandbox') {
-      throw new Error(`${path}: ${field('toolFilesystemPolicy')} must be host or sandbox`);
-    }
-    config.toolFilesystemPolicy = value.toolFilesystemPolicy;
-  }
   return config;
 }
 
@@ -363,38 +348,6 @@ export async function clearMaxSubagentsConfigForScope(
   await writeMaxSubagentsConfigForScope(cwd, undefined, scope, agentDir);
 }
 
-async function writeToolFilesystemPolicyConfigForScope(
-  cwd: string,
-  policy: ToolFilesystemPolicy | undefined,
-  scope: 'global' | 'project',
-  agentDir: string,
-): Promise<void> {
-  await updateLandstripConfigForScope(cwd, scope, agentDir, (landstrip) => {
-    if (policy === undefined) delete landstrip.toolFilesystemPolicy;
-    else landstrip.toolFilesystemPolicy = policy;
-  });
-}
-
-export async function setToolFilesystemPolicyConfigForScope(
-  cwd: string,
-  policy: ToolFilesystemPolicy,
-  scope: 'global' | 'project',
-  agentDir = getAgentDir(),
-): Promise<void> {
-  if (policy !== 'host' && policy !== 'sandbox') {
-    throw new Error('toolFilesystemPolicy must be host or sandbox');
-  }
-  await writeToolFilesystemPolicyConfigForScope(cwd, policy, scope, agentDir);
-}
-
-export async function clearToolFilesystemPolicyConfigForScope(
-  cwd: string,
-  scope: 'global' | 'project',
-  agentDir = getAgentDir(),
-): Promise<void> {
-  await writeToolFilesystemPolicyConfigForScope(cwd, undefined, scope, agentDir);
-}
-
 export async function setAgentDisabledForScope(
   cwd: string,
   name: string,
@@ -485,7 +438,6 @@ export function loadLandstripConfig(
   let config = mergeValue(builtInConfig, globalConfig) as LandstripConfigFile;
   if (projectConfig) config = mergeValue(config, projectConfig) as LandstripConfigFile;
   const maxSubagents = config.maxSubagents ?? 0;
-  const toolFilesystemPolicy = config.toolFilesystemPolicy ?? 'host';
   if (!Number.isInteger(maxSubagents) || maxSubagents < 0 || maxSubagents > MAX_SUBAGENTS) {
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
   }
@@ -494,7 +446,6 @@ export function loadLandstripConfig(
     ...config,
     maxSubagents,
     agent: config.agent,
-    toolFilesystemPolicy,
     agentSources,
     agentPaths,
   };
@@ -514,21 +465,6 @@ export function loadMaxSubagentsSettings(
     (!Number.isInteger(project) || project < 0 || project > MAX_SUBAGENTS)
   ) {
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
-  }
-  return { global, project };
-}
-
-export function loadToolFilesystemPolicySettings(
-  cwd: string,
-  includeProject = true,
-  agentDir = getAgentDir(),
-): ToolFilesystemPolicySettings {
-  const global = loadLandstripConfig(cwd, false, agentDir).toolFilesystemPolicy;
-  if (!includeProject) return { global };
-
-  const project = readLandstripConfigSource(cwd, 'project', agentDir).config.toolFilesystemPolicy;
-  if (project !== undefined && project !== 'host' && project !== 'sandbox') {
-    throw new Error('toolFilesystemPolicy must be host or sandbox');
   }
   return { global, project };
 }

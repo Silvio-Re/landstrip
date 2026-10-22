@@ -5,12 +5,7 @@ import { join } from 'node:path';
 import { minimatch } from 'minimatch';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 
-import {
-  loadLandstripConfig,
-  type AgentSource,
-  type ConfigObject,
-  type ToolFilesystemPolicy,
-} from './config.ts';
+import { loadLandstripConfig, type AgentSource, type ConfigObject } from './config.ts';
 import { loadPiMarkdownAgents } from './opencode-agents.ts';
 import { expandHomePath, formatError, isAgentColor, isRecord } from './util.ts';
 
@@ -53,7 +48,6 @@ export interface AgentCatalog {
   readonly permissions: PermissionRules;
   readonly diagnostics: readonly string[];
   readonly maxSubagents: number;
-  readonly toolFilesystemPolicy: ToolFilesystemPolicy;
 }
 
 const AGENT_FIELDS = new Set([
@@ -179,7 +173,6 @@ export function loadAgentCatalog(
 ): AgentCatalog {
   const diagnostics: string[] = [];
   let maxSubagents = 0;
-  let toolFilesystemPolicy: ToolFilesystemPolicy = 'host';
   let configuredAgents: ConfigObject = {};
   let configuredPermission: unknown;
   let agentSources = new Map<string, AgentSource>();
@@ -187,7 +180,6 @@ export function loadAgentCatalog(
   try {
     const config = loadLandstripConfig(cwd, includeProject, piAgentDir);
     maxSubagents = config.maxSubagents;
-    toolFilesystemPolicy = config.toolFilesystemPolicy;
     configuredAgents = config.agent;
     configuredPermission = config.permission;
     agentSources = new Map(config.agentSources);
@@ -268,7 +260,7 @@ export function loadAgentCatalog(
   } catch (error) {
     diagnostics.push(formatError(error));
   }
-  return { agents: normalized, permissions, diagnostics, maxSubagents, toolFilesystemPolicy };
+  return { agents: normalized, permissions, diagnostics, maxSubagents };
 }
 
 function permissionMatches(pattern: string, permission: string): boolean {
