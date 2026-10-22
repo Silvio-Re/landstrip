@@ -231,21 +231,34 @@ sandboxTest.for(
           const { code, stdout, stderr } = await workerOutput(launch, workerTimeout);
           expect({ code, stderr }).toMatchObject({ code: 0 });
           if (process.platform === 'linux') {
-            // Hard-denied writes are reported even when the worker exits successfully.
+            // Hard-denied accesses are reported even when the worker exits successfully.
             const traps = stderr.trim().split('\n').map(parseTrapLine);
             expect(traps).toEqual(
-              [authPath, `${authPath}.lock`].map((path) =>
+              [
+                ['read', authPath],
+                ['write', authPath],
+                ['write', `${authPath}.lock`],
+              ].map(([operation, path]) =>
                 expect.objectContaining({
                   kind: 'filesystem',
                   code: 'FILESYSTEM_DENIED',
                   state: 'info',
                   query_id: '0',
-                  operation: 'write',
+                  operation,
                   path,
                   errno: 'EACCES',
                   reason: 'deny_match',
                 }),
               ),
+            );
+            expect(f.ctx.ui.notify).toHaveBeenCalledTimes(2);
+            expect(f.ctx.ui.notify).toHaveBeenCalledWith(
+              expect.stringMatching(/^landstrip: filesystem write denied /),
+              'error',
+            );
+            expect(f.ctx.ui.notify).not.toHaveBeenCalledWith(
+              expect.stringContaining('filesystem read denied'),
+              'error',
             );
           } else {
             expect(stderr).toBe('');

@@ -1630,7 +1630,18 @@ function createLandstripIntegrationWithPrompts(
         const trap = parseTrapLine(line);
         if (!trap) continue;
         if (!isQueryTrap(trap)) {
-          reportTrapError(`Worker sandbox reported: ${formatLandstripTraps([trap])}`);
+          if (
+            isFilesystemTrap(trap) &&
+            trap.operation === 'read' &&
+            matchesPattern(
+              normalizeBlockedPath(trap.path, cwd),
+              allowances.protectedPaths ?? [],
+              cwd,
+            )
+          ) {
+            continue;
+          }
+          reportTrapError(formatLandstripTraps([trap]));
           continue;
         }
         handleQuery(trap);
