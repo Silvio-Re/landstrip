@@ -145,17 +145,43 @@ impl TargetProcess {
         Self::new(Pid::from_raw(pid.cast_signed()))
     }
 
+    pub(super) fn proc_path(&self, entry: &str) -> PathBuf {
+        Path::new("/proc").join(self.pid.to_string()).join(entry)
+    }
+
     pub(super) fn context(&self) -> ProcessContext {
         let pid = self.pid.as_raw().cast_unsigned();
         ProcessContext {
             pid,
-            exe: fs::read_link(format!("/proc/{pid}/exe"))
+            exe: fs::read_link(self.proc_path("exe"))
                 .ok()
                 .map(|path| path.to_string_lossy().into_owned()),
-            cwd: fs::read_link(format!("/proc/{pid}/cwd"))
+            cwd: fs::read_link(self.proc_path("cwd"))
                 .ok()
                 .map(|path| path.to_string_lossy().into_owned()),
         }
+    }
+
+    pub(super) fn read_exact(&self, addr: usize, buf: &mut [u8]) -> SysResult<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if addr == 0 {
+            return Err(BrokerError::BadAddress);
+        }
+        let len = buf.len();
+        let mut local = [IoSliceMut::new(buf)];
+        let target = [RemoteIoVec { base: addr, len }];
+        if process_vm_readv(self.pid, &mut local, &target)? != len {
+            return Err(BrokerError::BadAddress);
+        }
+        Ok(())
+    }
+
+    pub(super) fn read_vec(&self, addr: usize, len: usize) -> SysResult<Vec<u8>> {
+        let mut buf = vec![0_u8; len];
+        self.read_exact(addr, &mut buf)?;
+        Ok(buf)
     }
 
     pub(super) fn read_string(&self, addr: usize, max_len: usize) -> SysResult<Vec<u8>> {
@@ -209,18 +235,7 @@ impl TargetProcess {
         }
 
         let addr = usize::try_from(ptr).map_err(|_| BrokerError::BadAddress)?;
-        if addr == 0 {
-            return Err(BrokerError::BadAddress);
-        }
-
-        let mut buf = vec![0_u8; len];
-        let mut local = [IoSliceMut::new(&mut buf)];
-        let target = [RemoteIoVec { base: addr, len }];
-        let n = process_vm_readv(self.pid, &mut local, &target)?;
-        if n != len {
-            return Err(BrokerError::BadAddress);
-        }
-        Ok(buf)
+        self.read_vec(addr, len)
     }
 
     pub(super) fn read_times(&self, ptr: u64) -> SysResult<Option<[libc::timespec; 2]>> {
@@ -236,12 +251,7 @@ impl TargetProcess {
         // SAFETY: times is a live, suitably aligned array of two POD timespecs that
         // we expose as its raw byte span for the copy from the child.
         let bytes = unsafe { std::slice::from_raw_parts_mut(times.as_mut_ptr().cast::<u8>(), len) };
-        let mut local = [IoSliceMut::new(bytes)];
-        let target = [RemoteIoVec { base: addr, len }];
-        let n = process_vm_readv(self.pid, &mut local, &target)?;
-        if n < len {
-            return Err(BrokerError::BadAddress);
-        }
+        self.read_exact(addr, bytes)?;
         Ok(Some(times))
     }
 
@@ -263,40 +273,24 @@ impl TargetProcess {
         CString::new(buf).map_err(|_| BrokerError::BadAddress)
     }
 
-    pub(super) fn read_target(&self, ptr: u64) -> SysResult<Option<CString>> {
+    pub(super) fn read_target(&self, ptr: u64) -> SysResult<CString> {
         let addr = usize::try_from(ptr).map_err(|_| BrokerError::BadAddress)?;
         if addr == 0 {
-            return Ok(None);
+            return Err(BrokerError::BadAddress);
         }
         let buf = self.read_string(addr, libc::PATH_MAX as usize)?;
-        CString::new(buf)
-            .map(Some)
-            .map_err(|_| BrokerError::InvalidAddress)
+        CString::new(buf).map_err(|_| BrokerError::InvalidAddress)
     }
 
     pub(super) fn read_sockaddr(&self, target_addr: usize, addr_len: usize) -> SysResult<Vec<u8>> {
         if addr_len < mem::size_of::<libc::sa_family_t>() {
             return Err(BrokerError::InvalidAddress);
         }
-
-        let mut addr = vec![0_u8; addr_len];
-        let mut local = [IoSliceMut::new(&mut addr)];
-        let target = [RemoteIoVec {
-            base: target_addr,
-            len: addr_len,
-        }];
-        if process_vm_readv(self.pid, &mut local, &target)? != addr_len {
-            return Err(BrokerError::BadAddress);
-        }
-
-        Ok(addr)
+        self.read_vec(target_addr, addr_len)
     }
 
     pub(super) fn thread_group_leader(&self) -> SysResult<Pid> {
-        let status_path = Path::new("/proc")
-            .join(self.pid.as_raw().to_string())
-            .join("status");
-        let status = fs::read_to_string(status_path)?;
+        let status = fs::read_to_string(self.proc_path("status"))?;
         let value = status
             .lines()
             .find_map(|line| line.strip_prefix("Tgid:"))
@@ -350,7 +344,7 @@ impl TargetProcess {
 
     pub(super) fn filesystem(&self) -> SysResult<TargetFilesystem<'_>> {
         let root = super::grant::open_path(
-            &Path::new("/proc").join(self.pid.to_string()).join("root"),
+            &self.proc_path("root"),
             libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )?;
         let root_label = super::grant::open_fd_path(root.as_fd())?;
@@ -363,9 +357,8 @@ impl TargetProcess {
 
     pub(super) fn open_dirfd(&self, dirfd: RawFd) -> SysResult<OwnedFd> {
         if dirfd == libc::AT_FDCWD {
-            let cwd = Path::new("/proc").join(self.pid.to_string()).join("cwd");
             return super::grant::open_path(
-                &cwd,
+                &self.proc_path("cwd"),
                 libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
             );
         }
@@ -392,7 +385,7 @@ impl TargetFilesystem<'_> {
     }
 
     fn proc_alias(&self, name: &[u8]) -> SysResult<Vec<u8>> {
-        let status = fs::read_to_string(format!("/proc/{}/status", self.process.pid))?;
+        let status = fs::read_to_string(self.process.proc_path("status"))?;
         let id = |field: &str| -> SysResult<&str> {
             let value = status
                 .lines()
@@ -473,15 +466,10 @@ impl TargetFilesystem<'_> {
                 return match component {
                     b"root" => Ok(Some(self.root.try_clone()?)),
                     b"cwd" => Ok(Some(self.process.open_dirfd(libc::AT_FDCWD)?)),
-                    b"exe" => {
-                        let path = Path::new("/proc")
-                            .join(self.process.pid.to_string())
-                            .join("exe");
-                        Ok(Some(super::grant::open_path(
-                            &path,
-                            libc::O_PATH | libc::O_CLOEXEC,
-                        )?))
-                    }
+                    b"exe" => Ok(Some(super::grant::open_path(
+                        &self.process.proc_path("exe"),
+                        libc::O_PATH | libc::O_CLOEXEC,
+                    )?)),
                     _ => Ok(None),
                 };
             }

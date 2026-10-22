@@ -4,9 +4,10 @@
 use super::super::signals::ForwardSignals;
 use super::error::{BrokerError, SysResult};
 use super::fs::{MUTATION_SYSCALLS, handle_mutation, handle_openat, legacy_syscall};
-use super::grant::{Grant, MutationGrant, OpenGrant, SocketGrant};
+use super::grant::Grant;
 use super::network::{handle_bind, handle_connect, handle_sendmmsg, handle_sendmsg, handle_sendto};
 use super::notify::{NotificationChannel, NotificationResponse, NotificationResult, QueryDecision};
+use super::process::TargetProcess;
 use crate::error::Error as LandstripError;
 use crate::policy::{AccessPolicy, DenialReason};
 use crate::trap::{FilesystemDenial, NetworkOperation, ProcessContext, Trap, TrapOperation};
@@ -22,7 +23,6 @@ use std::fs;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 
 const POLL_MS: u16 = 100;
 const CONTROL_BUFFER_MAX: usize = 64 * 1024;
@@ -101,9 +101,7 @@ impl<'a> Denials<'a> {
 
 pub(super) enum HandleResult {
     Respond(libc::seccomp_notif_resp),
-    AddFd(OpenGrant),
-    RunMutation(MutationGrant),
-    RunSocket(SocketGrant),
+    Apply(Grant),
     Pending(QueryDecision),
 }
 
@@ -172,16 +170,13 @@ impl NotificationContext<'_> {
         };
 
         match result {
-            Ok(NotificationResult::Socket(grant)) => HandleResult::RunSocket(grant),
             Ok(NotificationResult::Continue) => {
                 HandleResult::Respond(NotificationResponse::continue_syscall(request.id))
             }
-            Ok(NotificationResult::Open(grant)) => HandleResult::AddFd(grant),
-            Ok(NotificationResult::Mutation(grant)) => HandleResult::RunMutation(grant),
+            Ok(NotificationResult::Grant(grant)) => HandleResult::Apply(grant),
             Ok(NotificationResult::Query(decision)) => HandleResult::Pending(decision),
             Err(error) => {
-                let errno = error.errno();
-                HandleResult::Respond(NotificationResponse::error(request.id, -errno.abs()))
+                HandleResult::Respond(NotificationResponse::error(request.id, error.errno()))
             }
         }
     }
@@ -193,11 +188,11 @@ pub(super) struct NamespaceId {
     inode: u64,
 }
 
-impl TryFrom<&Path> for NamespaceId {
+impl TryFrom<&TargetProcess> for NamespaceId {
     type Error = io::Error;
 
-    fn try_from(path: &Path) -> io::Result<Self> {
-        let metadata = fs::metadata(path)?;
+    fn try_from(process: &TargetProcess) -> io::Result<Self> {
+        let metadata = fs::metadata(process.proc_path("ns/mnt"))?;
         Ok(Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -207,8 +202,7 @@ impl TryFrom<&Path> for NamespaceId {
 
 impl NamespaceId {
     pub(super) fn verify(self, pid: u32) -> SysResult<()> {
-        let path = Path::new("/proc").join(pid.to_string()).join("ns/mnt");
-        let actual = Self::try_from(path.as_path())?;
+        let actual = Self::try_from(&TargetProcess::from_raw(pid))?;
         if actual != self {
             return Err(BrokerError::PolicyDenied);
         }
@@ -415,7 +409,7 @@ impl Supervisor<'_> {
                         ctx.query_enabled = false;
                         notify.respond(NotificationResponse::error(
                             request.id,
-                            -LandstripError::DENIAL_ERRNO,
+                            LandstripError::DENIAL_ERRNO,
                         ))?;
                     } else {
                         pending_queries.insert(
@@ -427,14 +421,8 @@ impl Supervisor<'_> {
                         );
                     }
                 }
-                HandleResult::AddFd(grant) => {
+                HandleResult::Apply(grant) => {
                     grant.apply(self.policy, notify, request.id);
-                }
-                HandleResult::RunMutation(grant) => {
-                    grant.apply(notify, request.id);
-                }
-                HandleResult::RunSocket(grant) => {
-                    grant.apply(notify, request.id);
                 }
             }
         }
@@ -453,10 +441,7 @@ fn receive_handled_notification(
     }
     let handle_result = match ctx.mount_namespace.verify(request.pid) {
         Ok(()) => ctx.handle(&request, denials, next_query_id),
-        Err(error) => HandleResult::Respond(NotificationResponse::error(
-            request.id,
-            -error.errno().abs(),
-        )),
+        Err(error) => HandleResult::Respond(NotificationResponse::error(request.id, error.errno())),
     };
     if !notify.is_id_valid(request.id)? {
         return Ok(None);
@@ -568,7 +553,7 @@ fn process_control_responses(
                 ControlAction::Deny => {
                     let _ = notify.respond(NotificationResponse::error(
                         id,
-                        -LandstripError::DENIAL_ERRNO,
+                        LandstripError::DENIAL_ERRNO,
                     ));
                 }
             }
@@ -586,7 +571,7 @@ fn deny_all_pending(
         if notify.is_id_valid(id).unwrap_or(false) {
             let _ = notify.respond(NotificationResponse::error(
                 id,
-                -LandstripError::DENIAL_ERRNO,
+                LandstripError::DENIAL_ERRNO,
             ));
         }
     }

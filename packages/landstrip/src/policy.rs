@@ -323,16 +323,6 @@ impl NetworkAccess {
             } => matches!(bind, IpBindAccess::Localhost) || unix_socket_access.needs_broker(),
         }
     }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn needs_network_broker(&self) -> bool {
-        match self {
-            Self::Unrestricted { unix_socket_access } => unix_socket_access.needs_broker(),
-            Self::Restricted {
-                connect_tcp_ports, ..
-            } => self.needs_bind_broker() || !connect_tcp_ports.is_empty(),
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Serialize)]

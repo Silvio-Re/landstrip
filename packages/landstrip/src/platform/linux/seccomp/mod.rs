@@ -27,13 +27,13 @@ mod supervise;
 pub(crate) use notify::ensure_notification_supported;
 pub(crate) use supervise::NotificationSyscalls;
 
-use super::filter::{build_errno_filter, build_io_uring_deny, build_notify_filter, load_filters};
+use super::filter::FilterSet;
 use super::landlock::enforce_access_policy;
 use super::namespace::Launch;
 use super::signals::ForwardSignals;
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::platform::unix::close_inherited_fds;
-use crate::policy::{AccessPolicy, UnixSocketAccess};
+use crate::policy::AccessPolicy;
 use crate::trap::Trap;
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
@@ -178,9 +178,8 @@ fn get_notify_fd<'a>(
             };
             let notify = subreaper.retain_listener(notify);
             // Pin namespace identity before acknowledging: the tool may exit immediately.
-            let path = Path::new("/proc").join(sender.to_string()).join("ns/mnt");
-            let namespace =
-                NamespaceId::try_from(path.as_path()).map_err(LandstripError::supervise)?;
+            let namespace = NamespaceId::try_from(&TargetProcess::new(Pid::from_raw(sender)))
+                .map_err(LandstripError::supervise)?;
             socket
                 .write_all(&[0_u8])
                 .map_err(LandstripError::supervise)?;
@@ -225,52 +224,34 @@ pub(super) fn run_broker(
     trap_fd: Option<&TrapFd>,
     inherited_fds: &[RawFd],
 ) -> Result<i32> {
-    let needs_network = policy.network_access.needs_network_broker();
-    let notify_bind = needs_network && policy.network_access.needs_bind_broker();
-    let notify_connect = (needs_network && policy.network_access.needs_network_broker())
-        || needs_filesystem
-        || matches!(
-            policy.network_access.unix_socket_access(),
-            UnixSocketAccess::Unrestricted
-        );
-    let notify_filesystem = needs_filesystem;
-    let unix_sockets = policy.network_access.unix_socket_access().into();
     ensure_notification_supported()?;
 
     let syscalls = NotificationSyscalls::new();
     let restricted = !policy.network_access.is_unrestricted();
     let allow_local_binding = policy.network_access.allows_local_binding();
     let handoff_by_pidfd = restricted && allow_local_binding;
-    let errno = build_errno_filter(&syscalls, restricted, allow_local_binding, unix_sockets)?;
-    let io_uring = Some(build_io_uring_deny(&syscalls)?);
 
-    let mut notify_syscalls: Vec<i64> = Vec::new();
-    if notify_bind {
+    let mut notify_syscalls = Vec::new();
+    if policy.network_access.needs_bind_broker() {
         notify_syscalls.push(syscalls.bind);
     }
-    if notify_connect {
-        notify_syscalls.push(syscalls.connect);
-    }
+    notify_syscalls.push(syscalls.connect);
     if restricted && allow_local_binding {
         notify_syscalls.push(syscalls.sendto);
         notify_syscalls.push(syscalls.sendmsg);
         notify_syscalls.push(syscalls.sendmmsg);
     }
-    if notify_filesystem {
+    if needs_filesystem {
         notify_syscalls.extend(syscalls.filesystem_syscalls());
     }
     notify_syscalls.extend(
         MUTATION_SYSCALLS
             .iter()
-            .filter(|spec| notify_filesystem || !spec.landlock_backed)
+            .filter(|spec| needs_filesystem || !spec.landlock_backed)
             .filter_map(|spec| spec.nr),
     );
-    let notify = if notify_syscalls.is_empty() {
-        None
-    } else {
-        Some(build_notify_filter(&notify_syscalls)?)
-    };
-
+    let filters = FilterSet::new(policy, &syscalls, &notify_syscalls)?;
+    let notify_filesystem = needs_filesystem;
     let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::supervise)?;
     setsockopt(&parent, sockopt::PassCred, &true).map_err(LandstripError::from)?;
     // File uses read/write; UnixStream's sendto would block on our own notify filter.
@@ -301,7 +282,7 @@ pub(super) fn run_broker(
                 enforce_access_policy(policy, false)?;
 
                 {
-                    let notify = load_filters(errno.as_ref(), io_uring.as_ref(), notify.as_ref())?;
+                    let notify = filters.install()?;
                     if handoff_by_pidfd {
                         send_listener(&mut child_sock, notify.as_fd())?;
                     } else {
@@ -324,10 +305,7 @@ pub(super) fn run_broker(
             })();
 
             if let Err(error) = result {
-                let trap = error
-                    .chain()
-                    .find_map(|e| e.downcast_ref::<LandstripError>())
-                    .map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from);
+                let trap = Trap::from(&error);
                 if handed_off || send_trap(&mut child_sock, &trap).is_err() {
                     trap.emit_with_fd(trap_fd);
                 }

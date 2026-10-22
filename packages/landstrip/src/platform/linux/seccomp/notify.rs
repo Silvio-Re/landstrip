@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use super::grant::{Grant, MutationGrant, OpenGrant, SocketGrant};
+use super::grant::Grant;
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::trap::Trap;
 use anyhow::Result;
@@ -66,11 +66,9 @@ impl NotificationResponse {
 }
 
 pub(super) enum NotificationResult {
-    Socket(SocketGrant),
     Continue,
+    Grant(Grant),
     Query(QueryDecision),
-    Open(OpenGrant),
-    Mutation(MutationGrant),
 }
 
 pub(super) struct QueryDecision {
@@ -80,6 +78,10 @@ pub(super) struct QueryDecision {
 }
 
 impl NotificationResult {
+    pub(super) fn grant(grant: impl Into<Grant>) -> Self {
+        Self::Grant(grant.into())
+    }
+
     pub(super) fn query(query_id: u64, trap: Trap, grant: Option<Grant>) -> Self {
         Self::Query(QueryDecision {
             query_id,

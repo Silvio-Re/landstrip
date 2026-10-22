@@ -10,12 +10,9 @@ use crate::paths::PathCoverage;
 use crate::policy::{AccessPolicy, UnixSocketAccess};
 use crate::trap::{NetworkOperation, Trap};
 use nix::sys::stat::fstat;
-use nix::sys::uio::{RemoteIoVec, process_vm_readv};
-use nix::unistd::Pid;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::IoSliceMut;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -40,8 +37,11 @@ pub(super) struct SocketInfo {
     pub(super) proto: i32,
 }
 
-impl SocketInfo {
-    pub(super) fn read(fd: RawFd) -> SysResult<Self> {
+impl TryFrom<BorrowedFd<'_>> for SocketInfo {
+    type Error = BrokerError;
+
+    fn try_from(fd: BorrowedFd<'_>) -> SysResult<Self> {
+        let fd = fd.as_raw_fd();
         let get_opt = |name: i32| -> std::io::Result<i32> {
             let mut value: i32 = 0;
             let mut len =
@@ -73,7 +73,9 @@ impl SocketInfo {
             proto: get_opt(libc::SO_PROTOCOL)?,
         })
     }
+}
 
+impl SocketInfo {
     pub(super) fn kind(&self) -> SocketKind {
         if matches!(self.domain, libc::AF_INET | libc::AF_INET6)
             && self.ty == libc::SOCK_STREAM
@@ -145,12 +147,12 @@ pub(super) fn handle_bind(
     query_enabled: bool,
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
-    let socket = target_socket(request)?;
+    let socket = TargetSocket::try_from(request)?;
 
     match socket.info.kind() {
         SocketKind::Tcp | SocketKind::Udp => {
             if policy.network_access.is_unrestricted() {
-                return Ok(NotificationResult::Socket(SocketGrant::new(
+                return Ok(NotificationResult::grant(SocketGrant::new(
                     socket,
                     libc::bind,
                 )));
@@ -195,17 +197,17 @@ pub(super) fn handle_bind(
                 return Err(BrokerError::PolicyDenied);
             }
 
-            Ok(NotificationResult::Socket(SocketGrant::new(
+            Ok(NotificationResult::grant(SocketGrant::new(
                 socket,
                 libc::bind,
             )))
         }
         SocketKind::Unix => handle_unix_bind(policy, request.pid, socket),
         SocketKind::NotSupported if policy.network_access.is_unrestricted() => Ok(
-            NotificationResult::Socket(SocketGrant::new(socket, libc::bind)),
+            NotificationResult::grant(SocketGrant::new(socket, libc::bind)),
         ),
         SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
-        SocketKind::Other => Ok(NotificationResult::Socket(SocketGrant::new(
+        SocketKind::Other => Ok(NotificationResult::grant(SocketGrant::new(
             socket,
             libc::bind,
         ))),
@@ -219,7 +221,7 @@ pub(super) fn handle_connect(
     query_enabled: bool,
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
-    let socket = target_socket(request)?;
+    let socket = TargetSocket::try_from(request)?;
 
     match socket.info.kind() {
         SocketKind::Tcp => {
@@ -252,7 +254,7 @@ pub(super) fn handle_connect(
                 return Err(BrokerError::PolicyDenied);
             }
 
-            Ok(NotificationResult::Socket(SocketGrant::new(
+            Ok(NotificationResult::grant(SocketGrant::new(
                 socket,
                 libc::connect,
             )))
@@ -262,7 +264,7 @@ pub(super) fn handle_connect(
                 return Ok(NotificationResult::Continue);
             }
             if sockaddr_family(&socket.addr)? == libc::AF_UNSPEC {
-                return Ok(NotificationResult::Socket(SocketGrant::new(
+                return Ok(NotificationResult::grant(SocketGrant::new(
                     socket,
                     libc::connect,
                 )));
@@ -287,7 +289,7 @@ pub(super) fn handle_connect(
                 return Err(BrokerError::PolicyDenied);
             }
 
-            Ok(NotificationResult::Socket(SocketGrant::new(
+            Ok(NotificationResult::grant(SocketGrant::new(
                 socket,
                 libc::connect,
             )))
@@ -302,23 +304,21 @@ pub(super) fn handle_connect(
 }
 
 fn check_target_datagram_addr(
-    pid: Pid,
+    target: &TargetProcess,
     fd: RawFd,
     target_addr: usize,
     addr_len: usize,
-    request_pid: u32,
     denials: &mut Denials<'_>,
 ) -> SysResult<NotificationResult> {
-    if target_addr == 0 || addr_len == 0 {
+    if target_addr == 0 {
         return Ok(NotificationResult::Continue);
     }
     if addr_len > mem::size_of::<libc::sockaddr_storage>() {
         return Err(BrokerError::InvalidAddress);
     }
-    let target = TargetProcess::new(pid);
     let addr = target.read_sockaddr(target_addr, addr_len)?;
     let sock = target.duplicate_fd(fd)?;
-    let info = SocketInfo::read(sock.as_raw_fd())?;
+    let info = SocketInfo::try_from(sock.as_fd())?;
     match info.kind() {
         SocketKind::Tcp | SocketKind::Udp => {
             let endpoint = ip_endpoint(&addr, info.domain)?;
@@ -328,7 +328,7 @@ fn check_target_datagram_addr(
                 denials.record(Denial::Network(
                     NetworkOperation::Connect,
                     endpoint.addr.to_string(),
-                    TargetProcess::from_raw(request_pid).context(),
+                    target.context(),
                 ));
                 Err(BrokerError::PolicyDenied)
             }
@@ -346,8 +346,8 @@ pub(super) fn handle_sendto(
     let addr_len =
         usize::try_from(request.data.args[5]).map_err(|_| BrokerError::InvalidAddress)?;
     let fd = RawFd::try_from(request.data.args[0]).map_err(|_| BrokerError::BadFileDescriptor)?;
-    let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
-    check_target_datagram_addr(pid, fd, target_addr, addr_len, request.pid, denials)
+    let target = TargetProcess::from_raw(request.pid);
+    check_target_datagram_addr(&target, fd, target_addr, addr_len, denials)
 }
 
 pub(super) fn handle_sendmsg(
@@ -355,30 +355,19 @@ pub(super) fn handle_sendmsg(
     denials: &mut Denials<'_>,
 ) -> SysResult<NotificationResult> {
     let target_msg = usize::try_from(request.data.args[1]).map_err(|_| BrokerError::BadAddress)?;
-    if target_msg == 0 {
-        return Err(BrokerError::BadAddress);
-    }
-    let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
+    let target = TargetProcess::from_raw(request.pid);
     let mut msghdr = mem::MaybeUninit::<libc::msghdr>::uninit();
     let len = mem::size_of::<libc::msghdr>();
-    let mut local = [IoSliceMut::new(unsafe {
-        std::slice::from_raw_parts_mut(msghdr.as_mut_ptr().cast::<u8>(), len)
-    })];
-    let target = [RemoteIoVec {
-        base: target_msg,
-        len,
-    }];
-    if process_vm_readv(pid, &mut local, &target)? != len {
-        return Err(BrokerError::BadAddress);
-    }
+    // SAFETY: msghdr is suitably aligned writable storage of size `len`.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(msghdr.as_mut_ptr().cast::<u8>(), len) };
+    target.read_exact(target_msg, bytes)?;
     let msghdr = unsafe { msghdr.assume_init() };
     let fd = RawFd::try_from(request.data.args[0]).map_err(|_| BrokerError::BadFileDescriptor)?;
     check_target_datagram_addr(
-        pid,
+        &target,
         fd,
         msghdr.msg_name as usize,
         usize::try_from(msghdr.msg_namelen).unwrap_or(0),
-        request.pid,
         denials,
     )
 }
@@ -394,28 +383,21 @@ pub(super) fn handle_sendmmsg(
         return Ok(NotificationResult::Continue);
     }
     let vlen = vlen.min(1024);
-    let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
+    let target = TargetProcess::from_raw(request.pid);
     let mut mmsgvec = vec![mem::MaybeUninit::<libc::mmsghdr>::uninit(); vlen];
     let total_len = vlen * mem::size_of::<libc::mmsghdr>();
-    let mut local = [IoSliceMut::new(unsafe {
-        std::slice::from_raw_parts_mut(mmsgvec.as_mut_ptr().cast::<u8>(), total_len)
-    })];
-    let target = [RemoteIoVec {
-        base: target_msgvec,
-        len: total_len,
-    }];
-    if process_vm_readv(pid, &mut local, &target)? != total_len {
-        return Err(BrokerError::BadAddress);
-    }
+    // SAFETY: mmsgvec has `vlen` elements (`total_len` bytes) of writable storage.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(mmsgvec.as_mut_ptr().cast::<u8>(), total_len) };
+    target.read_exact(target_msgvec, bytes)?;
     let fd = RawFd::try_from(request.data.args[0]).map_err(|_| BrokerError::BadFileDescriptor)?;
     for mmsg in mmsgvec {
         let mmsg = unsafe { mmsg.assume_init() };
         let result = check_target_datagram_addr(
-            pid,
+            &target,
             fd,
             mmsg.msg_hdr.msg_name as usize,
             usize::try_from(mmsg.msg_hdr.msg_namelen).unwrap_or(0),
-            request.pid,
             denials,
         )?;
         if !matches!(result, NotificationResult::Continue) {
@@ -458,7 +440,7 @@ fn handle_unix_connect(
         &PathBuf::from(format!("/proc/self/fd/{}", object.as_raw_fd())),
     )?;
 
-    Ok(NotificationResult::Socket(SocketGrant {
+    Ok(NotificationResult::grant(SocketGrant {
         sock: socket.sock,
         addr,
         call: libc::connect,
@@ -476,7 +458,7 @@ fn handle_unix_bind(
             policy.network_access.unix_socket_access(),
             UnixSocketAccess::Unrestricted
         ) {
-            Ok(NotificationResult::Socket(SocketGrant::new(
+            Ok(NotificationResult::grant(SocketGrant::new(
                 socket,
                 libc::bind,
             )))
@@ -507,7 +489,7 @@ fn handle_unix_bind(
         Path::new(OsStr::from_bytes(broker_path.as_bytes())),
     )?;
 
-    Ok(NotificationResult::Socket(SocketGrant {
+    Ok(NotificationResult::grant(SocketGrant {
         sock: socket.sock,
         addr: socket.addr,
         call: libc::bind,
@@ -638,21 +620,26 @@ fn ip_endpoint(addr: &[u8], domain: i32) -> SysResult<IpEndpoint> {
     }
 }
 
-fn target_socket(request: &libc::seccomp_notif) -> SysResult<TargetSocket> {
-    let fd = RawFd::try_from(request.data.args[0]).map_err(|_| BrokerError::BadFileDescriptor)?;
-    let target_addr = usize::try_from(request.data.args[1]).map_err(|_| BrokerError::BadAddress)?;
-    let addr_len =
-        usize::try_from(request.data.args[2]).map_err(|_| BrokerError::InvalidAddress)?;
-    let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
+impl TryFrom<&libc::seccomp_notif> for TargetSocket {
+    type Error = BrokerError;
 
-    if addr_len > mem::size_of::<libc::sockaddr_storage>() {
-        return Err(BrokerError::InvalidAddress);
+    fn try_from(request: &libc::seccomp_notif) -> SysResult<Self> {
+        let fd =
+            RawFd::try_from(request.data.args[0]).map_err(|_| BrokerError::BadFileDescriptor)?;
+        let target_addr =
+            usize::try_from(request.data.args[1]).map_err(|_| BrokerError::BadAddress)?;
+        let addr_len =
+            usize::try_from(request.data.args[2]).map_err(|_| BrokerError::InvalidAddress)?;
+
+        if addr_len > mem::size_of::<libc::sockaddr_storage>() {
+            return Err(BrokerError::InvalidAddress);
+        }
+
+        let target = TargetProcess::from_raw(request.pid);
+        let addr = target.read_sockaddr(target_addr, addr_len)?;
+        let sock = target.duplicate_fd(fd)?;
+        let info = SocketInfo::try_from(sock.as_fd())?;
+
+        Ok(Self { sock, addr, info })
     }
-
-    let target = TargetProcess::new(pid);
-    let addr = target.read_sockaddr(target_addr, addr_len)?;
-    let sock = target.duplicate_fd(fd)?;
-    let info = SocketInfo::read(sock.as_raw_fd())?;
-
-    Ok(TargetSocket { sock, addr, info })
 }

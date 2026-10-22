@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::error::{BrokerError, SysResult};
+use super::fs::SYS_FCHMODAT2;
 use super::network::{SocketAddrCall, TargetSocket};
 use super::notify::{NotificationChannel, NotificationResponse};
 use super::process::{ResolvedPath, label_under_root};
@@ -17,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 pub(super) const OPEN_HOW_SIZE: usize = 24;
-const SYS_FCHMODAT2: i64 = 452;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -64,6 +64,24 @@ impl Grant {
     }
 }
 
+impl From<OpenGrant> for Grant {
+    fn from(grant: OpenGrant) -> Self {
+        Self::Open(grant)
+    }
+}
+
+impl From<MutationGrant> for Grant {
+    fn from(grant: MutationGrant) -> Self {
+        Self::Mutation(Ok(grant))
+    }
+}
+
+impl From<SocketGrant> for Grant {
+    fn from(grant: SocketGrant) -> Self {
+        Self::Socket(grant)
+    }
+}
+
 pub(super) struct SocketGrant {
     pub(super) sock: OwnedFd,
     pub(super) addr: Vec<u8>,
@@ -84,7 +102,7 @@ impl SocketGrant {
     pub(super) fn apply(&self, notify: NotificationChannel<'_>, id: u64) {
         let rc = match broker_addr_call(self.sock.as_raw_fd(), &self.addr, self.call) {
             Ok(value) => NotificationResponse::success(id, value),
-            Err(error) => NotificationResponse::error(id, -error.errno().abs()),
+            Err(error) => NotificationResponse::error(id, error.errno()),
         };
         let _ = notify.respond(rc);
     }
@@ -180,14 +198,10 @@ impl OpenGrant {
                 if self.flags & libc::O_PATH != 0 {
                     return handle.try_clone().map_err(BrokerError::from);
                 }
-                let proc_path = CString::new(format!("/proc/self/fd/{}", handle.as_raw_fd()))?;
                 let flags = (self.flags
                     & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_TRUNC))
                     | libc::O_CLOEXEC;
-                let fd = unsafe { libc::open(proc_path.as_ptr(), flags) };
-                let fd = Errno::result(fd)?;
-                let fd = RawFd::try_from(fd).map_err(|_| BrokerError::syscall(libc::EMFILE))?;
-                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+                reopen_fd(handle.as_fd(), flags)
             }
             OpenKind::Create {
                 anchor,
@@ -261,8 +275,7 @@ impl OpenGrant {
                     if self.flags & libc::O_ACCMODE == libc::O_RDONLY {
                         // Linux also permits O_RDONLY|O_TRUNC; do not give the
                         // target a writable descriptor just to truncate it.
-                        let path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
-                        let writable = open_path(&path, libc::O_WRONLY | libc::O_CLOEXEC)?;
+                        let writable = reopen_fd(fd.as_fd(), libc::O_WRONLY | libc::O_CLOEXEC)?;
                         self.check_policy(policy, writable.as_fd())?;
                         let rc = unsafe { libc::ftruncate(writable.as_raw_fd(), 0) };
                         Errno::result(rc)?;
@@ -277,7 +290,7 @@ impl OpenGrant {
         let opened = match opened {
             Ok(fd) => fd,
             Err(err) => {
-                let _ = notify.respond(NotificationResponse::error(id, -err.errno().abs()));
+                let _ = notify.respond(NotificationResponse::error(id, err.errno()));
                 return;
             }
         };
@@ -298,7 +311,7 @@ impl OpenGrant {
         if notify.add_fd(&addfd).is_err() {
             let _ = notify.respond(NotificationResponse::error(
                 id,
-                -LandstripError::DENIAL_ERRNO,
+                LandstripError::DENIAL_ERRNO,
             ));
         }
     }
@@ -383,8 +396,7 @@ impl MutationGrant {
                 })?;
             }
             Self::Truncate { target, length } => {
-                let path = PathBuf::from(format!("/proc/self/fd/{}", target.as_raw_fd()));
-                let writable = open_path(&path, libc::O_WRONLY | libc::O_CLOEXEC)?;
+                let writable = reopen_fd(target.as_fd(), libc::O_WRONLY | libc::O_CLOEXEC)?;
                 Errno::result(unsafe { libc::ftruncate(writable.as_raw_fd(), *length) })?;
             }
             Self::Rename { from, to, flags } => {
@@ -438,7 +450,7 @@ impl MutationGrant {
     pub(super) fn apply(&self, notify: NotificationChannel<'_>, id: u64) {
         let rc = match self.run() {
             Ok(()) => NotificationResponse::success(id, 0),
-            Err(err) => NotificationResponse::error(id, -err.errno().abs()),
+            Err(err) => NotificationResponse::error(id, err.errno()),
         };
         let _ = notify.respond(rc);
     }
@@ -652,6 +664,13 @@ pub(super) fn open_path(path: &Path, flags: i32) -> SysResult<OwnedFd> {
     let fd = Errno::result(fd)?;
     let fd = RawFd::try_from(fd).map_err(|_| BrokerError::syscall(libc::EMFILE))?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn reopen_fd(fd: BorrowedFd<'_>, flags: i32) -> SysResult<OwnedFd> {
+    open_path(
+        &Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string()),
+        flags,
+    )
 }
 
 pub(super) fn open_fd_path(fd: BorrowedFd<'_>) -> SysResult<PathBuf> {

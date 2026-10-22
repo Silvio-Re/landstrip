@@ -10,7 +10,7 @@
 
 use super::seccomp::NotificationSyscalls;
 use crate::error::{Error as LandstripError, Mechanism};
-use crate::policy::UnixSocketAccess;
+use crate::policy::{AccessPolicy, UnixSocketAccess};
 use anyhow::Result;
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
@@ -128,7 +128,52 @@ impl FilterBuilder {
     }
 }
 
-pub(super) fn build_errno_filter(
+pub(super) struct FilterSet {
+    errno: Option<BpfProgram>,
+    eperm: BpfProgram,
+    enosys: BpfProgram,
+    notify: BpfProgram,
+}
+
+impl FilterSet {
+    pub(super) fn new(
+        policy: &AccessPolicy,
+        syscalls: &NotificationSyscalls,
+        notify_syscalls: &[i64],
+    ) -> Result<Self> {
+        let restricted = !policy.network_access.is_unrestricted();
+        let allow_local_binding = policy.network_access.allows_local_binding();
+        let unix_sockets = policy.network_access.unix_socket_access().into();
+        let errno = build_errno_filter(syscalls, restricted, allow_local_binding, unix_sockets)?;
+        let eperm = build_io_uring_deny(syscalls)?;
+        let mut clone3_builder = FilterBuilder::new();
+        clone3_builder.add_unconditional(libc::SYS_clone3);
+        let enosys_code =
+            u32::try_from(libc::ENOSYS).map_err(|_| LandstripError::IntegerTooLarge)?;
+        let enosys = clone3_builder.build(SeccompAction::Errno(enosys_code))?;
+        let notify = build_notify_filter(notify_syscalls)?;
+
+        Ok(Self {
+            errno,
+            eperm,
+            enosys,
+            notify,
+        })
+    }
+
+    pub(super) fn install(&self) -> Result<OwnedFd> {
+        if let Some(errno) = &self.errno {
+            load_program(errno, 0)?;
+        }
+        load_program(&self.eperm, 0)?;
+        load_program(&self.enosys, 0)?;
+        load_program(&self.notify, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)?.ok_or_else(|| {
+            LandstripError::sandbox_setup(Mechanism::Seccomp, "listener missing").into()
+        })
+    }
+}
+
+fn build_errno_filter(
     syscalls: &NotificationSyscalls,
     needs_network: bool,
     allow_local_binding: bool,
@@ -152,7 +197,7 @@ pub(super) fn build_errno_filter(
 /// brokered syscalls. Legacy timestamp syscalls also bypass Landlock and the
 /// pathname broker. Deny these entry points with `EPERM` in a separate program
 /// because seccompiler binds one action per filter.
-pub(super) fn build_io_uring_deny(syscalls: &NotificationSyscalls) -> Result<BpfProgram> {
+fn build_io_uring_deny(syscalls: &NotificationSyscalls) -> Result<BpfProgram> {
     let mut builder = FilterBuilder::new();
     builder.add_unconditional(syscalls.io_uring_setup);
     builder.add_unconditional(syscalls.io_uring_enter);
@@ -204,31 +249,7 @@ pub(super) fn build_io_uring_deny(syscalls: &NotificationSyscalls) -> Result<Bpf
     builder.build(SeccompAction::Errno(eperm))
 }
 
-pub(super) fn load_filters(
-    errno: Option<&BpfProgram>,
-    io_uring: Option<&BpfProgram>,
-    notify: Option<&BpfProgram>,
-) -> Result<OwnedFd> {
-    if let Some(errno) = errno {
-        load_program(errno, 0)?;
-    }
-    if let Some(io_uring) = io_uring {
-        load_program(io_uring, 0)?;
-    }
-    let mut builder = FilterBuilder::new();
-    builder.add_unconditional(libc::SYS_clone3);
-    let enosys = u32::try_from(libc::ENOSYS).map_err(|_| LandstripError::IntegerTooLarge)?;
-    load_program(&builder.build(SeccompAction::Errno(enosys))?, 0)?;
-    let notify = notify.ok_or_else(|| {
-        LandstripError::sandbox_setup(Mechanism::Seccomp, "notify filter missing")
-    })?;
-
-    let listener = load_program(notify, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)?
-        .ok_or_else(|| LandstripError::sandbox_setup(Mechanism::Seccomp, "listener missing"))?;
-    Ok(listener)
-}
-
-pub(super) fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
+fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
     let mut program = BpfProgram::with_capacity(syscalls.len() * 2 + 7);
     let load = u16::try_from(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS)
         .map_err(|_| LandstripError::IntegerTooLarge)?;

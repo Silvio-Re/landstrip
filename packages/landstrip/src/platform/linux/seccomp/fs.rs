@@ -12,11 +12,10 @@ use super::supervise::{Denial, Denials};
 use crate::paths::normalize_path_lexically;
 use crate::policy::{AccessPolicy, DenialReason};
 use crate::trap::{FilesystemDenial, Trap, TrapOperation};
-use std::io::IoSliceMut;
 use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-const SYS_FCHMODAT2: i64 = 452;
+pub(super) const SYS_FCHMODAT2: i64 = 452;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(super) mod legacy_syscall {
@@ -405,20 +404,7 @@ impl Open {
         if size > page_size {
             return Err(BrokerError::SystemCall { errno: libc::E2BIG });
         }
-        if addr == 0 {
-            return Err(BrokerError::BadAddress);
-        }
-
-        let mut buf = vec![0_u8; size];
-        let mut local = [IoSliceMut::new(&mut buf)];
-        let target = [nix::sys::uio::RemoteIoVec {
-            base: addr,
-            len: size,
-        }];
-        let copied = nix::sys::uio::process_vm_readv(process.pid, &mut local, &target)?;
-        if copied != size {
-            return Err(BrokerError::BadAddress);
-        }
+        let buf = process.read_vec(addr, size)?;
         if buf[OPEN_HOW_SIZE..].iter().any(|byte| *byte != 0) {
             return Err(BrokerError::SystemCall { errno: libc::E2BIG });
         }
@@ -533,40 +519,44 @@ struct OpenRequest {
     syscall: &'static str,
 }
 
-fn read_open_request(request: &libc::seccomp_notif) -> SysResult<OpenRequest> {
-    let nr = i64::from(request.data.nr);
-    let openat2 = nr == libc::SYS_openat2;
-    let legacy_open = matches!(legacy_syscall::OPEN, Some(open) if open == nr);
-    let dirfd = if legacy_open {
-        libc::AT_FDCWD
-    } else {
-        request.data.args[0].to_i32()
-    };
-    let path_arg = usize::from(!legacy_open);
-    let path_ptr =
-        usize::try_from(request.data.args[path_arg]).map_err(|_| BrokerError::BadAddress)?;
-    let process = TargetProcess::from_raw(request.pid);
-    let open = if openat2 {
-        Open::from_how(request, &process)?
-    } else {
-        Open::from_args(request, legacy_open)?
-    };
-    let syscall = if openat2 {
-        "openat2"
-    } else if legacy_open {
-        "open"
-    } else {
-        "openat"
-    };
-    Ok(OpenRequest {
-        dirfd,
-        path: process.read_nonempty_path(path_ptr)?,
-        flags: open.flags,
-        mode: open.mode,
-        resolve: open.resolve,
-        syscall,
-        process,
-    })
+impl TryFrom<&libc::seccomp_notif> for OpenRequest {
+    type Error = BrokerError;
+
+    fn try_from(request: &libc::seccomp_notif) -> SysResult<Self> {
+        let nr = i64::from(request.data.nr);
+        let openat2 = nr == libc::SYS_openat2;
+        let legacy_open = matches!(legacy_syscall::OPEN, Some(open) if open == nr);
+        let dirfd = if legacy_open {
+            libc::AT_FDCWD
+        } else {
+            request.data.args[0].to_i32()
+        };
+        let path_arg = usize::from(!legacy_open);
+        let path_ptr =
+            usize::try_from(request.data.args[path_arg]).map_err(|_| BrokerError::BadAddress)?;
+        let process = TargetProcess::from_raw(request.pid);
+        let open = if openat2 {
+            Open::from_how(request, &process)?
+        } else {
+            Open::from_args(request, legacy_open)?
+        };
+        let syscall = if openat2 {
+            "openat2"
+        } else if legacy_open {
+            "open"
+        } else {
+            "openat"
+        };
+        Ok(Self {
+            dirfd,
+            path: process.read_nonempty_path(path_ptr)?,
+            flags: open.flags,
+            mode: open.mode,
+            resolve: open.resolve,
+            syscall,
+            process,
+        })
+    }
 }
 
 fn resolve_open_target(
@@ -606,7 +596,7 @@ pub(super) fn handle_openat(
         mode,
         resolve,
         syscall,
-    } = read_open_request(request)?;
+    } = OpenRequest::try_from(request)?;
 
     let (raw, resolved, open_grant) = resolve_open_target(
         &process,
@@ -687,7 +677,7 @@ pub(super) fn handle_openat(
     if flags & libc::O_PATH != 0 {
         return Ok(NotificationResult::Continue);
     }
-    Ok(NotificationResult::Open(open_grant.ok_or(
+    Ok(NotificationResult::grant(open_grant.ok_or(
         BrokerError::SystemCall {
             errno: libc::ENOENT,
         },
@@ -855,11 +845,7 @@ pub(super) fn handle_mutation(
         .or_else(|| reparent_read_denial(policy, spec, &paths));
 
     let Some((index, reason, operation)) = denial else {
-        return match grant? {
-            Some(Grant::Mutation(grant)) => Ok(NotificationResult::Mutation(grant?)),
-            Some(Grant::Open(grant)) => Ok(NotificationResult::Open(grant)),
-            Some(Grant::Socket(_)) | None => Err(BrokerError::SystemCall { errno: libc::EIO }),
-        };
+        return Ok(NotificationResult::grant(grant?));
     };
     let (target, path) = &paths[index];
     let resolved = target.label.clone();
@@ -895,7 +881,7 @@ pub(super) fn handle_mutation(
             },
             Some(qid),
         ),
-        grant,
+        Some(grant),
     ))
 }
 
@@ -913,10 +899,7 @@ fn mutation_target_fd(
         return process.duplicate_fd(child_fd);
     }
 
-    let cwd = Path::new("/proc")
-        .join(process.pid.as_raw().to_string())
-        .join("cwd");
-    open_path(&cwd, libc::O_PATH | libc::O_CLOEXEC)
+    open_path(&process.proc_path("cwd"), libc::O_PATH | libc::O_CLOEXEC)
 }
 
 fn handle_fd_mutation(
@@ -980,7 +963,7 @@ fn handle_fd_mutation(
     let operation = MutationGrant::Fd { target, mutation };
 
     let Some(reason) = reason else {
-        return Ok(NotificationResult::Mutation(operation));
+        return Ok(NotificationResult::grant(operation));
     };
 
     let denial = FilesystemDenial {
@@ -1002,7 +985,7 @@ fn handle_fd_mutation(
     Ok(NotificationResult::query(
         qid,
         Trap::filesystem(denial, Some(qid)),
-        Some(Grant::Mutation(Ok(operation))),
+        Some(Grant::from(operation)),
     ))
 }
 
@@ -1012,7 +995,7 @@ impl MutationSyscall {
         request: &libc::seccomp_notif,
         process: &TargetProcess,
         paths: &mut [(ResolvedPath, PathBuf)],
-    ) -> SysResult<Option<Grant>> {
+    ) -> SysResult<Grant> {
         let mut paths = paths.iter_mut();
         let (resolved, _) = paths.next().ok_or(BrokerError::InvalidAddress)?;
         let at = resolved
@@ -1035,7 +1018,7 @@ impl MutationSyscall {
                     args[1].to_u32(),
                     0,
                 )
-                .map(|grant| Some(Grant::Open(grant)));
+                .map(Grant::Open);
             }
             MutationSyscall::Mkdirat => Ok(MutationGrant::Mkdir {
                 at,
@@ -1088,9 +1071,7 @@ impl MutationSyscall {
                 })
             }
             MutationSyscall::Symlinkat | MutationSyscall::Symlink => {
-                let Some(target) = process.read_target(args[0])? else {
-                    return Ok(None);
-                };
+                let target = process.read_target(args[0])?;
                 Ok(MutationGrant::Symlink { at, target })
             }
             MutationSyscall::Truncate => at.into_target().map(|target| MutationGrant::Truncate {
@@ -1112,7 +1093,7 @@ impl MutationSyscall {
             }
         };
 
-        Ok(Some(Grant::Mutation(operation)))
+        Ok(Grant::Mutation(operation))
     }
 
     fn path_mutation(self, process: &TargetProcess, args: &[u64; 6]) -> SysResult<PathMutation> {
