@@ -228,11 +228,7 @@ fn render_pattern_filter(pattern: &str, carveouts: &[PathBuf]) -> String {
     let matching_carveouts: Vec<&Path> = carveouts
         .iter()
         .map(PathBuf::as_path)
-        .filter(|carveout| {
-            carveout
-                .ancestors()
-                .any(|ancestor| glob.matches_path(ancestor))
-        })
+        .filter(|carveout| glob.matches_tree(carveout))
         .collect();
     if matching_carveouts.is_empty() {
         return filter;

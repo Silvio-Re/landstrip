@@ -100,13 +100,11 @@ impl AccessPolicy {
             || self.is_read_denied_always(path)
             || self.read_denied_patterns.iter().any(|pattern| {
                 let glob = GlobPattern::new(pattern);
-                path.ancestors().any(|ancestor| glob.matches_path(ancestor))
-                    && !self.read_carveouts.iter().any(|carveout| {
-                        path.is_under(carveout)
-                            && carveout
-                                .ancestors()
-                                .any(|ancestor| glob.matches_path(ancestor))
-                    })
+                glob.matches_tree(path)
+                    && !self
+                        .read_carveouts
+                        .iter()
+                        .any(|carveout| path.is_under(carveout) && glob.matches_tree(carveout))
             })
     }
 
@@ -370,47 +368,36 @@ impl Settings {
         if !filesystem.deny_write_always.is_empty() {
             return Err(Error::PolicyDenyWriteAlwaysUnsupported.into());
         }
-        let home_dir = dirs::home_dir();
-        let home = home_dir.as_deref();
-        let policy_base = if policy_base.is_absolute() {
-            policy_base.to_path_buf()
-        } else {
-            env::current_dir()?.join(policy_base)
-        };
-        let policy_base = normalize_path_lexically(&policy_base);
+        let resolver = PolicyResolver::new(policy_base)?;
 
-        let mut write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
+        let mut write_allow = resolver.resolve_paths(&filesystem.allow_write)?;
         // Missing Windows allow roots cannot receive ACL entries. Dropping them is
         // fail-closed because sandbox SIDs receive no access to those paths.
         #[cfg(target_os = "windows")]
         retain_windows_allow_roots(&mut write_allow);
-        let mut resolved_write_deny =
-            resolve_deny_paths(&filesystem.deny_write, &policy_base, home)?;
-        let mut write_denied_links =
-            collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
-        let resolved_write_always =
-            resolve_deny_paths(&filesystem.deny_write_always, &policy_base, home)?;
+        let mut resolved_write_deny = resolver.resolve_deny_paths(&filesystem.deny_write)?;
+        let mut write_denied_links = resolver.collect_symlink_ancestors(&filesystem.deny_write)?;
+        let resolved_write_always = resolver.resolve_deny_paths(&filesystem.deny_write_always)?;
+        let write_always_links =
+            resolver.collect_symlink_ancestors(&filesystem.deny_write_always)?;
         resolved_write_deny.merge_always(&resolved_write_always, &mut write_allow);
         let write_deny = resolved_write_deny.concrete;
         let write_denied_patterns = resolved_write_deny.patterns;
-        let write_denied_always_roots = resolved_write_always.concrete;
+        let mut write_denied_always_roots = resolved_write_always.concrete;
+        write_denied_always_roots.extend(write_always_links.iter().cloned());
+        write_denied_always_roots.normalize_roots();
         let write_denied_always_patterns = resolved_write_always.patterns;
-        write_denied_links.extend(collect_symlink_ancestors(
-            &filesystem.deny_write_always,
-            &policy_base,
-            home,
-        )?);
+        write_denied_links.extend(write_always_links);
         write_denied_links.sort_unstable();
         write_denied_links.dedup();
 
-        let mut read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
+        let mut read_allow = resolver.resolve_paths(&filesystem.allow_read)?;
         #[cfg(target_os = "windows")]
         retain_windows_allow_roots(&mut read_allow);
-        let mut resolved_read_deny = resolve_deny_paths(&filesystem.deny_read, &policy_base, home)?;
+        let mut resolved_read_deny = resolver.resolve_deny_paths(&filesystem.deny_read)?;
         let mut read_denied_roots =
             effective_denied_roots(&resolved_read_deny.concrete, &read_allow);
-        let resolved_read_always =
-            resolve_deny_paths(&filesystem.deny_read_always, &policy_base, home)?;
+        let resolved_read_always = resolver.resolve_deny_paths(&filesystem.deny_read_always)?;
         let read_carveouts = resolved_read_deny.carveouts(&resolved_read_always, &read_allow);
         resolved_read_deny.merge_always(&resolved_read_always, &mut read_allow);
         let read_deny = resolved_read_deny.concrete;
@@ -451,8 +438,8 @@ impl Settings {
             read_denied_always_roots: read_denied_always_roots.into_boxed_slice(),
             read_denied_always_patterns: read_denied_always_patterns.into_boxed_slice(),
             read_symlinks,
-            network_access: lower_network_policy(network, &policy_base, home)?,
-            macos: lower_darwin_policy(&self.macos)?,
+            network_access: resolver.lower_network_policy(network)?,
+            macos: self.macos.normalize()?,
             app_container_mode: windows.app_container_mode,
             allow_windows_loopback: windows.allow_loopback,
         };
@@ -644,146 +631,206 @@ fn lower_restricted_read_access(
     })
 }
 
-fn lower_network_policy(
-    network: &SandboxNetwork,
-    policy_base: &Path,
-    home: Option<&Path>,
-) -> Result<NetworkAccess> {
-    let unix_socket_paths = resolve_paths(&network.allow_unix_sockets, policy_base, home)?;
-    let unix_socket_access = if network.allow_all_unix_sockets {
-        UnixSocketAccess::Unrestricted
-    } else if unix_socket_paths.is_empty() {
-        UnixSocketAccess::Denied
-    } else {
-        UnixSocketAccess::AllowPaths(unix_socket_paths)
-    };
-
-    if network.allow_network {
-        return Ok(NetworkAccess::Unrestricted { unix_socket_access });
-    }
-
-    let mut connect_tcp_ports = Vec::new();
-    for port in [network.http_proxy_port, network.socks_proxy_port]
-        .into_iter()
-        .flatten()
-    {
-        if port == 0 {
-            return Err(Error::PolicyInvalidPort.into());
+impl SandboxDarwin {
+    fn normalize(&self) -> Result<Self> {
+        let mut allow_mach_lookup = Vec::with_capacity(self.allow_mach_lookup.len());
+        for service in &self.allow_mach_lookup {
+            if service.strip_suffix('*').unwrap_or(service).is_empty() {
+                return Err(Error::PolicyInvalidMachLookup.into());
+            }
+            allow_mach_lookup.push(service.clone());
         }
-        connect_tcp_ports.push(port);
-    }
-    connect_tcp_ports.sort_unstable();
-    connect_tcp_ports.dedup();
+        allow_mach_lookup.sort_unstable();
+        allow_mach_lookup.dedup();
 
-    let bind = if network.allow_local_binding {
-        IpBindAccess::Localhost
-    } else {
-        IpBindAccess::Deny
-    };
-    Ok(NetworkAccess::Restricted {
-        connect_tcp_ports,
-        bind,
-        unix_socket_access,
-    })
+        if let Some(tag) = &self.log_tag
+            && (tag.is_empty()
+                || tag
+                    .bytes()
+                    .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'"' || byte == b'\\'))
+        {
+            return Err(Error::PolicyInvalidLogTag.into());
+        }
+
+        Ok(Self {
+            allow_trustd: self.allow_trustd,
+            allow_mach_lookup,
+            allow_apple_events: self.allow_apple_events,
+            allow_pty: self.allow_pty,
+            log_tag: self.log_tag.clone(),
+        })
+    }
 }
 
-fn lower_darwin_policy(macos: &SandboxDarwin) -> Result<SandboxDarwin> {
-    let mut allow_mach_lookup = Vec::with_capacity(macos.allow_mach_lookup.len());
-    for service in &macos.allow_mach_lookup {
-        if service.strip_suffix('*').unwrap_or(service).is_empty() {
-            return Err(Error::PolicyInvalidMachLookup.into());
-        }
-        allow_mach_lookup.push(service.clone());
-    }
-    allow_mach_lookup.sort_unstable();
-    allow_mach_lookup.dedup();
-
-    if let Some(tag) = &macos.log_tag
-        && (tag.is_empty()
-            || tag
-                .bytes()
-                .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'"' || byte == b'\\'))
-    {
-        return Err(Error::PolicyInvalidLogTag.into());
-    }
-
-    Ok(SandboxDarwin {
-        allow_trustd: macos.allow_trustd,
-        allow_mach_lookup,
-        allow_apple_events: macos.allow_apple_events,
-        allow_pty: macos.allow_pty,
-        log_tag: macos.log_tag.clone(),
-    })
+struct PolicyResolver {
+    base: PathBuf,
+    home: Option<PathBuf>,
 }
 
-fn resolve_paths(
-    paths: &[PathSelector],
-    policy_base: &Path,
-    home: Option<&Path>,
-) -> Result<Vec<PathBuf>> {
-    let mut resolved = Vec::new();
-    for selector in paths {
-        let path = resolve_sandbox_path(selector.as_str(), policy_base, home)?;
-        let path_str = path.to_string_lossy();
-        if !selector.is_literal() && GlobPattern::is_glob_str(&path_str) {
-            let matches = GlobPattern::new(&path_str).expand()?;
-            if matches!(selector, PathSelector::Bare(_))
-                && matches.is_empty()
-                && fs::symlink_metadata(&path).is_ok()
-            {
-                push_path_variants(&mut resolved, &path);
+impl PolicyResolver {
+    fn new(policy_base: &Path) -> Result<Self> {
+        let base = if policy_base.is_absolute() {
+            policy_base.to_path_buf()
+        } else {
+            env::current_dir()?.join(policy_base)
+        };
+        Ok(Self {
+            base: normalize_path_lexically(&base),
+            home: dirs::home_dir(),
+        })
+    }
+
+    fn resolve_sandbox_path(&self, path: &str) -> Result<PathBuf> {
+        if path.is_empty() {
+            return Err(Error::PolicyEmptyPath.into());
+        }
+
+        let raw = Path::new(path);
+        let resolved = if raw.has_root() {
+            raw.to_path_buf()
+        } else if path == "~" {
+            self.home
+                .as_deref()
+                .map(Path::to_path_buf)
+                .ok_or(Error::PolicyHomeUnavailable)?
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            self.home
+                .as_deref()
+                .map(|home| home.join(rest))
+                .ok_or(Error::PolicyHomeUnavailable)?
+        } else {
+            self.base.join(raw)
+        };
+
+        Ok(normalize_path_lexically(&resolved))
+    }
+
+    fn resolve_paths(&self, paths: &[PathSelector]) -> Result<Vec<PathBuf>> {
+        let mut resolved = Vec::new();
+        for selector in paths {
+            let path = self.resolve_sandbox_path(selector.as_str())?;
+            let path_str = path.to_string_lossy();
+            if !selector.is_literal() && GlobPattern::is_glob_str(&path_str) {
+                let matches = GlobPattern::new(&path_str).expand()?;
+                if matches!(selector, PathSelector::Bare(_))
+                    && matches.is_empty()
+                    && fs::symlink_metadata(&path).is_ok()
+                {
+                    push_path_variants(&mut resolved, &path);
+                } else {
+                    for candidate in &matches {
+                        push_path_variants(&mut resolved, candidate);
+                    }
+                }
             } else {
-                for candidate in &matches {
-                    push_path_variants(&mut resolved, candidate);
+                push_path_variants(&mut resolved, &path);
+            }
+        }
+
+        resolved.normalize_roots();
+
+        Ok(resolved)
+    }
+
+    fn resolve_deny_paths(&self, paths: &[PathSelector]) -> Result<ResolvedDenyPaths> {
+        let mut concrete: Vec<PathBuf> = Vec::new();
+        let mut patterns: Vec<String> = Vec::new();
+
+        for selector in paths {
+            let resolved = self.resolve_sandbox_path(selector.as_str())?;
+            let resolved_str = resolved.to_string_lossy();
+            if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
+                for candidate in GlobPattern::new(&resolved_str).expand()? {
+                    push_path_variants(&mut concrete, &candidate);
+                }
+                patterns.push(resolved_str.clone().into_owned());
+                let base = GlobPattern::new(&resolved_str).base();
+                let canonical = normalize_path_lexically(&canonicalize_existing_prefix(&base));
+                let base_str = base.to_string_lossy();
+                let canonical_str = canonical.to_string_lossy();
+                if canonical_str != base_str
+                    && let Some(suffix) = resolved_str.strip_prefix(base_str.as_ref())
+                {
+                    let mut canonical_pattern = canonical_str.into_owned();
+                    canonical_pattern.push_str(suffix);
+                    patterns.push(canonical_pattern);
+                }
+            } else {
+                push_path_variants(&mut concrete, &resolved);
+            }
+        }
+
+        concrete.normalize_roots();
+        patterns.sort_unstable();
+        patterns.dedup();
+
+        Ok(ResolvedDenyPaths { concrete, patterns })
+    }
+
+    fn collect_symlink_ancestors(&self, paths: &[PathSelector]) -> Result<Vec<PathBuf>> {
+        let mut links = Vec::new();
+        for selector in paths {
+            let resolved = self.resolve_sandbox_path(selector.as_str())?;
+            let resolved_str = resolved.to_string_lossy();
+            let check_path = if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
+                GlobPattern::new(&resolved_str).base()
+            } else {
+                resolved
+            };
+            let mut current = PathBuf::new();
+            for component in check_path.components() {
+                current.push(component);
+                match fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        links.push(normalize_path_lexically(&current));
+                    }
+                    _ => {}
                 }
             }
-        } else {
-            push_path_variants(&mut resolved, &path);
         }
+        links.sort_unstable();
+        links.dedup();
+        Ok(links)
     }
 
-    resolved.normalize_roots();
-
-    Ok(resolved)
-}
-
-fn resolve_deny_paths(
-    paths: &[PathSelector],
-    policy_base: &Path,
-    home: Option<&Path>,
-) -> Result<ResolvedDenyPaths> {
-    let mut concrete: Vec<PathBuf> = Vec::new();
-    let mut patterns: Vec<String> = Vec::new();
-
-    for selector in paths {
-        let resolved = resolve_sandbox_path(selector.as_str(), policy_base, home)?;
-        let resolved_str = resolved.to_string_lossy();
-        if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
-            for candidate in GlobPattern::new(&resolved_str).expand()? {
-                push_path_variants(&mut concrete, &candidate);
-            }
-            patterns.push(resolved_str.clone().into_owned());
-            let base = GlobPattern::new(&resolved_str).base();
-            let canonical = normalize_path_lexically(&canonicalize_existing_prefix(&base));
-            let base_str = base.to_string_lossy();
-            let canonical_str = canonical.to_string_lossy();
-            if canonical_str != base_str
-                && let Some(suffix) = resolved_str.strip_prefix(base_str.as_ref())
-            {
-                let mut canonical_pattern = canonical_str.into_owned();
-                canonical_pattern.push_str(suffix);
-                patterns.push(canonical_pattern);
-            }
+    fn lower_network_policy(&self, network: &SandboxNetwork) -> Result<NetworkAccess> {
+        let unix_socket_paths = self.resolve_paths(&network.allow_unix_sockets)?;
+        let unix_socket_access = if network.allow_all_unix_sockets {
+            UnixSocketAccess::Unrestricted
+        } else if unix_socket_paths.is_empty() {
+            UnixSocketAccess::Denied
         } else {
-            push_path_variants(&mut concrete, &resolved);
+            UnixSocketAccess::AllowPaths(unix_socket_paths)
+        };
+
+        if network.allow_network {
+            return Ok(NetworkAccess::Unrestricted { unix_socket_access });
         }
+
+        let mut connect_tcp_ports = Vec::new();
+        for port in [network.http_proxy_port, network.socks_proxy_port]
+            .into_iter()
+            .flatten()
+        {
+            if port == 0 {
+                return Err(Error::PolicyInvalidPort.into());
+            }
+            connect_tcp_ports.push(port);
+        }
+        connect_tcp_ports.sort_unstable();
+        connect_tcp_ports.dedup();
+
+        let bind = if network.allow_local_binding {
+            IpBindAccess::Localhost
+        } else {
+            IpBindAccess::Deny
+        };
+        Ok(NetworkAccess::Restricted {
+            connect_tcp_ports,
+            bind,
+            unix_socket_access,
+        })
     }
-
-    concrete.normalize_roots();
-    patterns.sort_unstable();
-    patterns.dedup();
-
-    Ok(ResolvedDenyPaths { concrete, patterns })
 }
 
 fn matches_denied(roots: &[PathBuf], patterns: &[String], path: &Path) -> bool {
@@ -799,10 +846,9 @@ fn has_denied_under(roots: &[PathBuf], patterns: &[String], dir: &Path) -> bool 
 }
 
 fn matches_any_pattern(path: &Path, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| {
-        let glob = GlobPattern::new(pattern);
-        path.ancestors().any(|ancestor| glob.matches_path(ancestor))
-    })
+    patterns
+        .iter()
+        .any(|pattern| GlobPattern::new(pattern).matches_tree(path))
 }
 
 const MAX_TRAVERSAL_DEPTH: u32 = 40;
@@ -903,36 +949,6 @@ fn effective_denied_roots(read_deny: &[PathBuf], read_allow: &[PathBuf]) -> Vec<
         .collect()
 }
 
-fn collect_symlink_ancestors(
-    paths: &[PathSelector],
-    policy_base: &Path,
-    home: Option<&Path>,
-) -> Result<Vec<PathBuf>> {
-    let mut links = Vec::new();
-    for selector in paths {
-        let resolved = resolve_sandbox_path(selector.as_str(), policy_base, home)?;
-        let resolved_str = resolved.to_string_lossy();
-        let check_path = if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
-            GlobPattern::new(&resolved_str).base()
-        } else {
-            resolved
-        };
-        let mut current = PathBuf::new();
-        for component in check_path.components() {
-            current.push(component);
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    links.push(normalize_path_lexically(&current));
-                }
-                _ => {}
-            }
-        }
-    }
-    links.sort_unstable();
-    links.dedup();
-    Ok(links)
-}
-
 #[cfg(target_os = "macos")]
 fn push_path_variants(paths: &mut Vec<PathBuf>, path: &Path) {
     paths.push(normalize_path_lexically(path));
@@ -944,27 +960,6 @@ fn push_path_variants(paths: &mut Vec<PathBuf>, path: &Path) {
 #[cfg(not(target_os = "macos"))]
 fn push_path_variants(paths: &mut Vec<PathBuf>, path: &Path) {
     paths.push(normalize_path(path));
-}
-
-fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<PathBuf> {
-    if path.is_empty() {
-        return Err(Error::PolicyEmptyPath.into());
-    }
-
-    let raw = Path::new(path);
-    let resolved = if raw.has_root() {
-        raw.to_path_buf()
-    } else if path == "~" {
-        home.map(Path::to_path_buf)
-            .ok_or(Error::PolicyHomeUnavailable)?
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        home.map(|home| home.join(rest))
-            .ok_or(Error::PolicyHomeUnavailable)?
-    } else {
-        base.join(raw)
-    };
-
-    Ok(normalize_path_lexically(&resolved))
 }
 
 pub(crate) struct GlobPattern<'a> {
@@ -1012,6 +1007,10 @@ impl<'a> GlobPattern<'a> {
         self.matches_at(pattern_bytes, path_bytes.as_bytes(), 0, 0, &mut memo)
     }
 
+    pub(crate) fn matches_tree(&self, path: &Path) -> bool {
+        path.ancestors().any(|ancestor| self.matches_path(ancestor))
+    }
+
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn matches_under(&self, root: &Path) -> bool {
         let base = self.base();
@@ -1046,13 +1045,8 @@ impl<'a> GlobPattern<'a> {
         }
 
         let candidate = normalize_path_lexically(path);
-        let candidate_text = candidate.to_string_lossy();
-        let pattern_bytes = self.pattern.as_bytes();
-        let candidate_bytes = candidate_text.as_bytes();
-        let mut memo = vec![None; (pattern_bytes.len() + 1) * (candidate_bytes.len() + 1)];
-
-        if self.matches_at(pattern_bytes, candidate_bytes, 0, 0, &mut memo) {
-            matches.push(candidate.clone());
+        if self.matches_path(&candidate) {
+            matches.push(candidate);
         }
 
         let metadata = match fs::symlink_metadata(path) {
