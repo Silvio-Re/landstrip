@@ -593,7 +593,6 @@ pub(crate) fn execute(
 }
 
 pub(crate) fn validate(policy: &AccessPolicy) -> Result<()> {
-    policy.validate()?;
     if restricted_user::is_installed()? {
         restricted_user::active_implementation()?;
         restricted_user::validate(policy)?;

@@ -50,8 +50,8 @@ pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> anyhow::Result<
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn validate(policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
-    policy.validate()?;
+#[allow(clippy::unnecessary_wraps, reason = "uniform platform validate API")]
+pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
     Ok(())
 }
 
