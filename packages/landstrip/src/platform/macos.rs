@@ -30,8 +30,7 @@ pub(crate) fn execute(
     trap_fd: Option<&TrapFd>,
     inherited_fds: &[std::os::fd::RawFd],
 ) -> Result<i32> {
-    let profile = render_profile(policy).map_err(Error::seatbelt)?;
-    apply_profile(&profile)?;
+    SeatbeltProfile::try_from(policy)?.apply()?;
     close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd).as_slice(), inherited_fds)
         .map_err(Error::seatbelt)?;
     let mut command = Command::new(tool);
@@ -50,432 +49,473 @@ pub(crate) fn doctor() -> Result<()> {
     Ok(())
 }
 
-fn apply_profile(profile: &str) -> Result<()> {
-    let profile = CString::new(profile).map_err(|source| {
-        Error::seatbelt(format!(
-            "profile: interior nul at offset {}",
-            source.nul_position()
-        ))
-    })?;
-    let mut errorbuf = ptr::null_mut();
+struct SeatbeltProfile(CString);
 
-    // SAFETY: profile is a live NULL-terminated C string and errorbuf points to writable
-    // storage through a raw out pointer.
-    let rc = unsafe { ffi::sandbox_init(profile.as_ptr(), SBPL_PROFILE_FLAGS, &raw mut errorbuf) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(Error::seatbelt(take_sandbox_error(errorbuf)).into())
+impl TryFrom<&AccessPolicy> for SeatbeltProfile {
+    type Error = Error;
+
+    fn try_from(policy: &AccessPolicy) -> std::result::Result<Self, Self::Error> {
+        let rendered = ProfileBuilder::render(policy).map_err(Error::seatbelt)?;
+        CString::new(rendered).map(Self).map_err(|source| {
+            Error::seatbelt(format!(
+                "profile: interior nul at offset {}",
+                source.nul_position()
+            ))
+        })
     }
 }
 
-fn render_profile(policy: &AccessPolicy) -> std::result::Result<String, fmt::Error> {
-    let mut sb = String::new();
-    let message = policy
-        .macos
-        .log_tag
-        .as_ref()
-        .map_or_else(String::new, |tag| format!(" (with message \"{tag}\")"));
-    writeln!(sb, "(version 1)")?;
-    writeln!(sb, "(deny default{message})")?;
+impl SeatbeltProfile {
+    fn apply(&self) -> Result<()> {
+        let mut errorbuf = ptr::null_mut();
 
-    render_process_rules(&mut sb)?;
-    render_mach_rules(&mut sb, &policy.macos)?;
-    render_write_rules(&mut sb, policy, &message)?;
-    render_read_rules(&mut sb, policy, &message)?;
-    render_network_rules(&mut sb, &policy.network_access, &message)?;
-    Ok(sb)
-}
-
-fn render_process_rules(sb: &mut String) -> fmt::Result {
-    writeln!(sb, "(allow process-exec)")?;
-    // Seatbelt blocks the setuid system ps binary unless it executes outside the sandbox.
-    writeln!(
-        sb,
-        "(allow process-exec (path \"/bin/ps\") (with no-sandbox))",
-    )?;
-    writeln!(sb, "(allow process-fork)")?;
-    writeln!(sb, "(allow process-info* (target same-sandbox))")?;
-    writeln!(sb, "(allow signal (target same-sandbox))")?;
-    writeln!(sb, "(allow sysctl-read)")
-}
-
-/// Default Mach services, matching the Anthropic sandbox-runtime (srt) base
-/// profile plus `SecurityServer` for Keychain access.
-fn render_mach_rules(sb: &mut String, macos: &SandboxDarwin) -> fmt::Result {
-    writeln!(sb, "(allow mach-lookup")?;
-    writeln!(sb, "  (global-name \"com.apple.SecurityServer\")")?;
-    if macos.allow_trustd {
-        writeln!(sb, "  (global-name \"com.apple.trustd.agent\")")?;
-    }
-    if macos.allow_apple_events {
-        writeln!(sb, "  (global-name \"com.apple.coreservices.appleevents\")")?;
-        writeln!(
-            sb,
-            "  (global-name \"com.apple.CoreServices.coreservicesd\")"
-        )?;
-        writeln!(
-            sb,
-            "  (global-name \"com.apple.coreservices.quarantine-resolver\")"
-        )?;
-    }
-    for service in &macos.allow_mach_lookup {
-        if let Some(prefix) = service.strip_suffix('*') {
-            let escaped = escape_sbpl_literal(prefix);
-            writeln!(sb, "  (global-name-prefix \"{escaped}\")")?;
+        // SAFETY: profile is a live NULL-terminated C string and errorbuf points to writable
+        // storage through a raw out pointer.
+        let rc =
+            unsafe { ffi::sandbox_init(self.0.as_ptr(), SBPL_PROFILE_FLAGS, &raw mut errorbuf) };
+        if rc == 0 {
+            Ok(())
         } else {
-            let escaped = escape_sbpl_literal(service);
-            writeln!(sb, "  (global-name \"{escaped}\")")?;
+            Err(Error::seatbelt(take_sandbox_error(errorbuf)).into())
         }
     }
-    writeln!(sb, "  (global-name \"com.apple.audio.systemsoundserver\")")?;
-    writeln!(sb, "  (global-name \"com.apple.bsd.dirhelper\")")?;
-    writeln!(
-        sb,
-        "  (global-name \"com.apple.coreservices.launchservicesd\")"
-    )?;
-    writeln!(
-        sb,
-        "  (global-name \"com.apple.distributed_notifications@Uv3\")"
-    )?;
-    writeln!(sb, "  (global-name \"com.apple.FontObjectsServer\")")?;
-    writeln!(sb, "  (global-name \"com.apple.fonts\")")?;
-    writeln!(sb, "  (global-name \"com.apple.logd\")")?;
-    writeln!(sb, "  (global-name \"com.apple.lsd.mapdb\")")?;
-    writeln!(sb, "  (global-name \"com.apple.PowerManagement.control\")")?;
-    writeln!(sb, "  (global-name \"com.apple.securityd.xpc\")")?;
-    // apple/container CLI talks to its daemons over XPC.
-    writeln!(sb, "  (global-name-prefix \"com.apple.container.\")")?;
-    writeln!(sb, "  (global-name \"com.apple.system.logger\")")?;
-    writeln!(
-        sb,
-        "  (global-name \"com.apple.system.notification_center\")"
-    )?;
-    writeln!(
-        sb,
-        "  (global-name \"com.apple.system.opendirectoryd.libinfo\")"
-    )?;
-    writeln!(
-        sb,
-        "  (global-name \"com.apple.system.opendirectoryd.membership\")"
-    )?;
-    writeln!(sb, ")")?;
-    if macos.allow_apple_events {
-        writeln!(sb, "(allow appleevent-send)")?;
-        writeln!(sb, "(allow lsopen)")?;
-    }
-    writeln!(
-        sb,
-        "(allow system-socket (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))"
-    )?;
-    writeln!(sb, "(allow system-socket (socket-domain AF_ROUTE))")
 }
 
-fn glob_to_sbpl_regex(pattern: &str) -> String {
-    let mut regex = String::from("^");
-    let mut rest = pattern;
+struct ProfileBuilder {
+    sb: String,
+    message: String,
+}
 
-    while !rest.is_empty() {
-        if let Some(tail) = rest.strip_prefix("**/") {
-            regex.push_str("(.*/)?");
-            rest = tail;
-        } else if let Some(tail) = rest.strip_prefix("**") {
-            regex.push_str(".*");
-            rest = tail;
-        } else if let Some(tail) = rest.strip_prefix('*') {
-            regex.push_str("[^/]*");
-            rest = tail;
-        } else if let Some(tail) = rest.strip_prefix('?') {
-            regex.push_str("[^/]");
-            rest = tail;
-        } else if rest.starts_with('[') {
-            if let Some(offset) = rest[1..].find(']') {
-                let end = 1 + offset;
-                regex.push_str(&rest[..=end]);
-                rest = &rest[end + 1..];
+impl ProfileBuilder {
+    fn render(policy: &AccessPolicy) -> std::result::Result<String, fmt::Error> {
+        let message = policy
+            .macos
+            .log_tag
+            .as_ref()
+            .map_or_else(String::new, |tag| format!(" (with message \"{tag}\")"));
+        let mut builder = Self {
+            sb: String::new(),
+            message,
+        };
+        writeln!(builder.sb, "(version 1)")?;
+        writeln!(builder.sb, "(deny default{})", builder.message)?;
+
+        builder.process_rules()?;
+        builder.mach_rules(&policy.macos)?;
+        builder.write_rules(policy)?;
+        builder.read_rules(policy)?;
+        builder.network_rules(&policy.network_access)?;
+        Ok(builder.sb)
+    }
+
+    fn process_rules(&mut self) -> fmt::Result {
+        writeln!(self.sb, "(allow process-exec)")?;
+        // Seatbelt blocks the setuid system ps binary unless it executes outside the sandbox.
+        writeln!(
+            self.sb,
+            "(allow process-exec (path \"/bin/ps\") (with no-sandbox))",
+        )?;
+        writeln!(self.sb, "(allow process-fork)")?;
+        writeln!(self.sb, "(allow process-info* (target same-sandbox))")?;
+        writeln!(self.sb, "(allow signal (target same-sandbox))")?;
+        writeln!(self.sb, "(allow sysctl-read)")
+    }
+
+    /// Default Mach services, matching the Anthropic sandbox-runtime (srt) base
+    /// profile plus `SecurityServer` for Keychain access.
+    fn mach_rules(&mut self, macos: &SandboxDarwin) -> fmt::Result {
+        writeln!(self.sb, "(allow mach-lookup")?;
+        writeln!(self.sb, "  (global-name \"com.apple.SecurityServer\")")?;
+        if macos.allow_trustd {
+            writeln!(self.sb, "  (global-name \"com.apple.trustd.agent\")")?;
+        }
+        if macos.allow_apple_events {
+            writeln!(
+                self.sb,
+                "  (global-name \"com.apple.coreservices.appleevents\")"
+            )?;
+            writeln!(
+                self.sb,
+                "  (global-name \"com.apple.CoreServices.coreservicesd\")"
+            )?;
+            writeln!(
+                self.sb,
+                "  (global-name \"com.apple.coreservices.quarantine-resolver\")"
+            )?;
+        }
+        for service in &macos.allow_mach_lookup {
+            if let Some(prefix) = service.strip_suffix('*') {
+                let escaped = escape_sbpl_literal(prefix);
+                writeln!(self.sb, "  (global-name-prefix \"{escaped}\")")?;
             } else {
-                regex.push_str("\\[");
-                rest = &rest[1..];
+                let escaped = escape_sbpl_literal(service);
+                writeln!(self.sb, "  (global-name \"{escaped}\")")?;
             }
-        } else {
-            let mut chars = rest.chars();
-            let Some(ch) = chars.next() else {
-                break;
-            };
-            match ch {
-                '.' | '(' | ')' | '{' | '}' | '+' | '|' | '^' | '$' | '\\' => {
-                    regex.push('\\');
-                    regex.push(ch);
-                }
-                _ => regex.push(ch),
-            }
-            rest = chars.as_str();
         }
-    }
-
-    if !pattern.ends_with('/') {
-        regex.push_str("(/.*)?");
-    }
-    regex.push('$');
-    regex
-}
-
-fn render_pattern_filter(pattern: &str, carveouts: &[PathBuf]) -> String {
-    let regex = glob_to_sbpl_regex(pattern);
-    let escaped = escape_sbpl_regex_literal(&regex);
-    let glob = GlobPattern::new(pattern);
-    let filter = format!("(regex #\"{escaped}\")");
-    let matching_carveouts: Vec<&Path> = carveouts
-        .iter()
-        .map(PathBuf::as_path)
-        .filter(|carveout| glob.matches_tree(carveout))
-        .collect();
-    if matching_carveouts.is_empty() {
-        return filter;
-    }
-
-    let mut wrapped = format!("(require-all {filter}");
-    for carveout in matching_carveouts {
-        let escaped_carveout = escape_sbpl_literal(&carveout.to_string_lossy());
-        let _ = write!(wrapped, " (require-not (subpath \"{escaped_carveout}\"))");
-    }
-    wrapped.push(')');
-    wrapped
-}
-
-fn render_write_rules(sb: &mut String, policy: &AccessPolicy, message: &str) -> fmt::Result {
-    for root in &policy.write_roots {
-        let escaped = escape_sbpl_literal(&root.to_string_lossy());
-        writeln!(sb, "(allow file-write* (subpath \"{escaped}\"))")?;
-    }
-    if policy.macos.allow_pty {
-        writeln!(sb, "(allow pseudo-tty)")?;
         writeln!(
-            sb,
-            "(allow file-ioctl file-write* (literal \"/dev/ptmx\") (regex #\"^/dev/ttys\"))"
+            self.sb,
+            "  (global-name \"com.apple.audio.systemsoundserver\")"
         )?;
-    }
-    // Deny rules follow the allow rules so SBPL's last-match-wins precedence
-    // subtracts the denied subtrees from the granted write roots.
-    for root in &policy.write_denied_roots {
-        let escaped = escape_sbpl_literal(&root.to_string_lossy());
-        writeln!(sb, "(deny file-write* (subpath \"{escaped}\"){message})")?;
+        writeln!(self.sb, "  (global-name \"com.apple.bsd.dirhelper\")")?;
+        writeln!(
+            self.sb,
+            "  (global-name \"com.apple.coreservices.launchservicesd\")"
+        )?;
+        writeln!(
+            self.sb,
+            "  (global-name \"com.apple.distributed_notifications@Uv3\")"
+        )?;
+        writeln!(self.sb, "  (global-name \"com.apple.FontObjectsServer\")")?;
+        writeln!(self.sb, "  (global-name \"com.apple.fonts\")")?;
+        writeln!(self.sb, "  (global-name \"com.apple.logd\")")?;
+        writeln!(self.sb, "  (global-name \"com.apple.lsd.mapdb\")")?;
+        writeln!(
+            self.sb,
+            "  (global-name \"com.apple.PowerManagement.control\")"
+        )?;
+        writeln!(self.sb, "  (global-name \"com.apple.securityd.xpc\")")?;
+        // apple/container CLI talks to its daemons over XPC.
+        writeln!(self.sb, "  (global-name-prefix \"com.apple.container.\")")?;
+        writeln!(self.sb, "  (global-name \"com.apple.system.logger\")")?;
+        writeln!(
+            self.sb,
+            "  (global-name \"com.apple.system.notification_center\")"
+        )?;
+        writeln!(
+            self.sb,
+            "  (global-name \"com.apple.system.opendirectoryd.libinfo\")"
+        )?;
+        writeln!(
+            self.sb,
+            "  (global-name \"com.apple.system.opendirectoryd.membership\")"
+        )?;
+        writeln!(self.sb, ")")?;
+        if macos.allow_apple_events {
+            writeln!(self.sb, "(allow appleevent-send)")?;
+            writeln!(self.sb, "(allow lsopen)")?;
+        }
+        writeln!(
+            self.sb,
+            "(allow system-socket (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))"
+        )?;
+        writeln!(self.sb, "(allow system-socket (socket-domain AF_ROUTE))")
     }
 
-    // Regex rules are evaluated at syscall time, so unlike expand_glob_path
-    // they also cover paths created after sandbox_init.
-    for pattern in &policy.write_denied_patterns {
-        let regex = glob_to_sbpl_regex(pattern);
+    fn glob_to_sbpl_regex(pattern: &str) -> String {
+        let mut regex = String::from("^");
+        let mut rest = pattern;
+
+        while !rest.is_empty() {
+            if let Some(tail) = rest.strip_prefix("**/") {
+                regex.push_str("(.*/)?");
+                rest = tail;
+            } else if let Some(tail) = rest.strip_prefix("**") {
+                regex.push_str(".*");
+                rest = tail;
+            } else if let Some(tail) = rest.strip_prefix('*') {
+                regex.push_str("[^/]*");
+                rest = tail;
+            } else if let Some(tail) = rest.strip_prefix('?') {
+                regex.push_str("[^/]");
+                rest = tail;
+            } else if rest.starts_with('[') {
+                if let Some(offset) = rest[1..].find(']') {
+                    let end = 1 + offset;
+                    regex.push_str(&rest[..=end]);
+                    rest = &rest[end + 1..];
+                } else {
+                    regex.push_str("\\[");
+                    rest = &rest[1..];
+                }
+            } else {
+                let mut chars = rest.chars();
+                let Some(ch) = chars.next() else {
+                    break;
+                };
+                match ch {
+                    '.' | '(' | ')' | '{' | '}' | '+' | '|' | '^' | '$' | '\\' => {
+                        regex.push('\\');
+                        regex.push(ch);
+                    }
+                    _ => regex.push(ch),
+                }
+                rest = chars.as_str();
+            }
+        }
+
+        if !pattern.ends_with('/') {
+            regex.push_str("(/.*)?");
+        }
+        regex.push('$');
+        regex
+    }
+
+    fn render_pattern_filter(pattern: &str, carveouts: &[PathBuf]) -> String {
+        let regex = Self::glob_to_sbpl_regex(pattern);
         let escaped = escape_sbpl_regex_literal(&regex);
-        writeln!(sb, "(deny file-write* (regex #\"{escaped}\"){message})")?;
+        let glob = GlobPattern::new(pattern);
+        let filter = format!("(regex #\"{escaped}\")");
+        let matching_carveouts: Vec<&Path> = carveouts
+            .iter()
+            .map(PathBuf::as_path)
+            .filter(|carveout| glob.matches_tree(carveout))
+            .collect();
+        if matching_carveouts.is_empty() {
+            return filter;
+        }
+
+        let mut wrapped = format!("(require-all {filter}");
+        for carveout in matching_carveouts {
+            let escaped_carveout = escape_sbpl_literal(&carveout.to_string_lossy());
+            let _ = write!(wrapped, " (require-not (subpath \"{escaped_carveout}\"))");
+        }
+        wrapped.push(')');
+        wrapped
     }
 
-    if !policy.write_roots.is_empty() {
+    fn write_rules(&mut self, policy: &AccessPolicy) -> fmt::Result {
+        let message = &self.message;
+        for root in &policy.write_roots {
+            let escaped = escape_sbpl_literal(&root.to_string_lossy());
+            writeln!(self.sb, "(allow file-write* (subpath \"{escaped}\"))")?;
+        }
+        if policy.macos.allow_pty {
+            writeln!(self.sb, "(allow pseudo-tty)")?;
+            writeln!(
+                self.sb,
+                "(allow file-ioctl file-write* (literal \"/dev/ptmx\") (regex #\"^/dev/ttys\"))"
+            )?;
+        }
+        // Deny rules follow the allow rules so SBPL's last-match-wins precedence
+        // subtracts the denied subtrees from the granted write roots.
+        for root in &policy.write_denied_roots {
+            let escaped = escape_sbpl_literal(&root.to_string_lossy());
+            writeln!(
+                self.sb,
+                "(deny file-write* (subpath \"{escaped}\"){message})"
+            )?;
+        }
+
+        // Regex rules are evaluated at syscall time, so unlike expand_glob_path
+        // they also cover paths created after sandbox_init.
+        for pattern in &policy.write_denied_patterns {
+            let regex = Self::glob_to_sbpl_regex(pattern);
+            let escaped = escape_sbpl_regex_literal(&regex);
+            writeln!(
+                self.sb,
+                "(deny file-write* (regex #\"{escaped}\"){message})"
+            )?;
+        }
+
+        if !policy.write_roots.is_empty() {
+            for root in &policy.read_denied_roots {
+                let escaped = escape_sbpl_literal(&root.to_string_lossy());
+                writeln!(
+                    self.sb,
+                    "(deny file-write-unlink (subpath \"{escaped}\"){message})"
+                )?;
+            }
+            for pattern in &policy.read_denied_patterns {
+                let filter = Self::render_pattern_filter(pattern, &policy.read_carveouts);
+                writeln!(self.sb, "(deny file-write-unlink {filter}{message})")?;
+            }
+
+            let mut ancestors: Vec<PathBuf> = Vec::new();
+            for root in policy
+                .write_denied_roots
+                .iter()
+                .chain(policy.read_denied_roots.iter())
+            {
+                for ancestor in root.ancestors().skip(1) {
+                    if ancestor != Path::new("/") && ancestor.is_under_any(&policy.write_roots) {
+                        ancestors.push(ancestor.to_path_buf());
+                    }
+                }
+            }
+            for pattern in policy
+                .write_denied_patterns
+                .iter()
+                .chain(policy.read_denied_patterns.iter())
+            {
+                let base = GlobPattern::new(pattern).base();
+                for ancestor in base.ancestors() {
+                    if ancestor != Path::new("/") && ancestor.is_under_any(&policy.write_roots) {
+                        ancestors.push(ancestor.to_path_buf());
+                    }
+                }
+            }
+            ancestors.sort_unstable();
+            ancestors.dedup();
+            for ancestor in &ancestors {
+                let escaped = escape_sbpl_literal(&ancestor.to_string_lossy());
+                writeln!(
+                    self.sb,
+                    "(deny file-write-unlink (literal \"{escaped}\"){message})"
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_rules(&mut self, policy: &AccessPolicy) -> fmt::Result {
+        match &policy.read_access {
+            ReadAccess::Unrestricted => self.sb.push_str("(allow file-read*)\n"),
+            ReadAccess::AllowRoots(roots) => {
+                writeln!(self.sb, "(deny file-read*{})", self.message)?;
+                writeln!(self.sb, "(allow file-read* (literal \"/\"))")?;
+                for root in roots {
+                    let escaped = escape_sbpl_literal(&root.to_string_lossy());
+                    writeln!(self.sb, "(allow file-read* (subpath \"{escaped}\"))")?;
+                }
+                if policy.macos.allow_pty {
+                    writeln!(
+                        self.sb,
+                        "(allow file-read* (literal \"/dev/ptmx\") (regex #\"^/dev/ttys\"))"
+                    )?;
+                }
+                self.parent_dir_rules(roots)?;
+                self.symlink_metadata_rules(&policy.read_symlinks)?;
+            }
+        }
+        // Deny rules follow the allow rules so SBPL's last-match-wins
+        // precedence subtracts the denied subtrees from the read grants.
         for root in &policy.read_denied_roots {
             let escaped = escape_sbpl_literal(&root.to_string_lossy());
             writeln!(
-                sb,
-                "(deny file-write-unlink (subpath \"{escaped}\"){message})"
+                self.sb,
+                "(deny file-read* (subpath \"{escaped}\"){})",
+                self.message
             )?;
         }
         for pattern in &policy.read_denied_patterns {
-            let filter = render_pattern_filter(pattern, &policy.read_carveouts);
-            writeln!(sb, "(deny file-write-unlink {filter}{message})")?;
+            let filter = Self::render_pattern_filter(pattern, &policy.read_carveouts);
+            writeln!(self.sb, "(deny file-read* {filter}{})", self.message)?;
         }
 
-        let mut ancestors: Vec<PathBuf> = Vec::new();
-        for root in policy
-            .write_denied_roots
+        Ok(())
+    }
+
+    fn parent_dir_rules(&mut self, roots: &[PathBuf]) -> fmt::Result {
+        let mut ancestors: Vec<PathBuf> = roots
             .iter()
-            .chain(policy.read_denied_roots.iter())
-        {
-            for ancestor in root.ancestors().skip(1) {
-                if ancestor != Path::new("/") && ancestor.is_under_any(&policy.write_roots) {
-                    ancestors.push(ancestor.to_path_buf());
-                }
-            }
-        }
-        for pattern in policy
-            .write_denied_patterns
-            .iter()
-            .chain(policy.read_denied_patterns.iter())
-        {
-            let base = GlobPattern::new(pattern).base();
-            for ancestor in base.ancestors() {
-                if ancestor != Path::new("/") && ancestor.is_under_any(&policy.write_roots) {
-                    ancestors.push(ancestor.to_path_buf());
-                }
-            }
-        }
+            .flat_map(|root| root.ancestors().skip(1))
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .collect();
         ancestors.sort_unstable();
         ancestors.dedup();
         for ancestor in &ancestors {
             let escaped = escape_sbpl_literal(&ancestor.to_string_lossy());
+            writeln!(self.sb, "(allow file-read* (literal \"{escaped}\"))")?;
+        }
+        Ok(())
+    }
+
+    /// Allow `readlink` on the lexical symlink inodes the read scan skipped.
+    ///
+    /// Mirrors Apple's system.sb: `readlink` only permits resolution; the target
+    /// is still gated by the existing allow/deny rules, so this grants no new read
+    /// access.
+    fn symlink_metadata_rules(&mut self, symlinks: &[PathBuf]) -> fmt::Result {
+        if symlinks.is_empty() {
+            return Ok(());
+        }
+        self.sb.push_str("(allow file-read-metadata");
+        for sym in symlinks {
+            let escaped = escape_sbpl_literal(&sym.to_string_lossy());
+            write!(self.sb, "\n  (literal \"{escaped}\")")?;
+        }
+        self.sb.push_str(")\n");
+        Ok(())
+    }
+
+    fn network_rules(&mut self, network: &NetworkAccess) -> fmt::Result {
+        if network.is_unrestricted() {
+            self.sb.push_str("(allow network*)\n");
+            if !matches!(network.unix_socket_access(), UnixSocketAccess::Unrestricted) {
+                writeln!(
+                    self.sb,
+                    "(deny network-outbound (remote unix-socket){})",
+                    self.message
+                )?;
+                writeln!(
+                    self.sb,
+                    "(deny network-bind (local unix-socket){})",
+                    self.message
+                )?;
+            }
+            if let UnixSocketAccess::AllowPaths(paths) = network.unix_socket_access() {
+                self.unix_socket_path_rules(paths)?;
+            }
+            return Ok(());
+        }
+
+        // AF_UNIX socket creation stays allowed regardless of the socket policy.
+        self.sb
+            .push_str("(allow system-socket (socket-domain AF_UNIX))\n");
+
+        // Seatbelt accepts only `*` or `localhost` as the host token in an IP
+        // endpoint filter. `localhost` permits IPv4 and IPv6 loopback connections,
+        // matching the macOS Anthropic Sandbox Runtime behavior. On some hosts it
+        // also matches addresses assigned to other local interfaces; Seatbelt
+        // cannot express a stricter loopback-only rule.
+        writeln!(self.sb, "(deny network-outbound{})", self.message)?;
+        for port in network.connect_tcp_ports() {
             writeln!(
-                sb,
-                "(deny file-write-unlink (literal \"{escaped}\"){message})"
+                self.sb,
+                "(allow network-outbound (remote tcp \"localhost:{port}\"))"
             )?;
         }
-    }
 
-    Ok(())
-}
-
-fn render_read_rules(sb: &mut String, policy: &AccessPolicy, message: &str) -> fmt::Result {
-    match &policy.read_access {
-        ReadAccess::Unrestricted => sb.push_str("(allow file-read*)\n"),
-        ReadAccess::AllowRoots(roots) => {
-            writeln!(sb, "(deny file-read*{message})")?;
-            writeln!(sb, "(allow file-read* (literal \"/\"))")?;
-            for root in roots {
-                let escaped = escape_sbpl_literal(&root.to_string_lossy());
-                writeln!(sb, "(allow file-read* (subpath \"{escaped}\"))")?;
-            }
-            if policy.macos.allow_pty {
+        if network.allows_local_binding() {
+            // allowLocalBinding also grants host-local UDP on Seatbelt. Match the
+            // destination for outbound traffic: a local/source filter would allow
+            // remote egress from a locally bound socket.
+            for protocol in ["tcp", "udp"] {
                 writeln!(
-                    sb,
-                    "(allow file-read* (literal \"/dev/ptmx\") (regex #\"^/dev/ttys\"))"
-                )?;
-            }
-            render_parent_dir_rules(sb, roots)?;
-
-            render_symlink_metadata_rules(sb, &policy.read_symlinks)?;
-        }
-    }
-    // Deny rules follow the allow rules so SBPL's last-match-wins
-    // precedence subtracts the denied subtrees from the read grants.
-    for root in &policy.read_denied_roots {
-        let escaped = escape_sbpl_literal(&root.to_string_lossy());
-        writeln!(sb, "(deny file-read* (subpath \"{escaped}\"){message})")?;
-    }
-    for pattern in &policy.read_denied_patterns {
-        let filter = render_pattern_filter(pattern, &policy.read_carveouts);
-        writeln!(sb, "(deny file-read* {filter}{message})")?;
-    }
-
-    Ok(())
-}
-
-fn render_parent_dir_rules(sb: &mut String, roots: &[PathBuf]) -> fmt::Result {
-    let mut ancestors: Vec<PathBuf> = Vec::new();
-    for root in roots {
-        let mut current = root.as_path();
-        while let Some(parent) = current.parent() {
-            if parent.as_os_str().is_empty() {
-                break;
-            }
-            ancestors.push(parent.to_path_buf());
-            current = parent;
-        }
-    }
-    ancestors.sort_unstable();
-    ancestors.dedup();
-    for ancestor in &ancestors {
-        let escaped = escape_sbpl_literal(&ancestor.to_string_lossy());
-        writeln!(sb, "(allow file-read* (literal \"{escaped}\"))")?;
-    }
-    Ok(())
-}
-
-/// Allow `readlink` on the lexical symlink inodes the read scan skipped.
-///
-/// Mirrors Apple's system.sb: `readlink` only permits resolution; the target
-/// is still gated by the existing allow/deny rules, so this grants no new read
-/// access.
-fn render_symlink_metadata_rules(sb: &mut String, symlinks: &[PathBuf]) -> fmt::Result {
-    if symlinks.is_empty() {
-        return Ok(());
-    }
-    sb.push_str("(allow file-read-metadata");
-    for sym in symlinks {
-        let escaped = escape_sbpl_literal(&sym.to_string_lossy());
-        write!(sb, "\n  (literal \"{escaped}\")")?;
-    }
-    sb.push_str(")\n");
-    Ok(())
-}
-
-fn render_network_rules(sb: &mut String, network: &NetworkAccess, message: &str) -> fmt::Result {
-    if network.is_unrestricted() {
-        sb.push_str("(allow network*)\n");
-        if !matches!(network.unix_socket_access(), UnixSocketAccess::Unrestricted) {
-            writeln!(sb, "(deny network-outbound (remote unix-socket){message})")?;
-            writeln!(sb, "(deny network-bind (local unix-socket){message})")?;
-        }
-        if let UnixSocketAccess::AllowPaths(paths) = network.unix_socket_access() {
-            for path in paths {
-                let escaped = escape_sbpl_literal(&path.to_string_lossy());
-                writeln!(
-                    sb,
-                    "(allow network-outbound (remote unix-socket (subpath \"{escaped}\")))"
+                    self.sb,
+                    "(allow network-outbound (remote {protocol} \"localhost:*\"))"
                 )?;
                 writeln!(
-                    sb,
-                    "(allow network-bind (local unix-socket (subpath \"{escaped}\")))"
+                    self.sb,
+                    "(allow network-bind (local {protocol} \"localhost:*\"))"
+                )?;
+                writeln!(
+                    self.sb,
+                    "(allow network-inbound (local {protocol} \"localhost:*\"))"
                 )?;
             }
         }
-        return Ok(());
+
+        match network.unix_socket_access() {
+            UnixSocketAccess::Unrestricted => {
+                self.sb
+                    .push_str("(allow network-outbound (remote unix-socket))\n");
+                self.sb
+                    .push_str("(allow network-bind (local unix-socket))\n");
+            }
+            UnixSocketAccess::AllowPaths(paths) => self.unix_socket_path_rules(paths)?,
+            UnixSocketAccess::Denied => {}
+        }
+
+        Ok(())
     }
 
-    // AF_UNIX socket creation stays allowed regardless of the socket policy.
-    sb.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
-
-    // Seatbelt accepts only `*` or `localhost` as the host token in an IP
-    // endpoint filter. `localhost` permits IPv4 and IPv6 loopback connections,
-    // matching the macOS Anthropic Sandbox Runtime behavior. On some hosts it
-    // also matches addresses assigned to other local interfaces; Seatbelt
-    // cannot express a stricter loopback-only rule.
-    writeln!(sb, "(deny network-outbound{message})")?;
-    for port in network.connect_tcp_ports() {
-        writeln!(
-            sb,
-            "(allow network-outbound (remote tcp \"localhost:{port}\"))"
-        )?;
-    }
-
-    if network.allows_local_binding() {
-        // allowLocalBinding also grants host-local UDP on Seatbelt. Match the
-        // destination for outbound traffic: a local/source filter would allow
-        // remote egress from a locally bound socket.
-        for protocol in ["tcp", "udp"] {
+    fn unix_socket_path_rules(&mut self, paths: &[PathBuf]) -> fmt::Result {
+        for path in paths {
+            let escaped = escape_sbpl_literal(&path.to_string_lossy());
             writeln!(
-                sb,
-                "(allow network-outbound (remote {protocol} \"localhost:*\"))"
+                self.sb,
+                "(allow network-outbound (remote unix-socket (subpath \"{escaped}\")))"
             )?;
             writeln!(
-                sb,
-                "(allow network-bind (local {protocol} \"localhost:*\"))"
-            )?;
-            writeln!(
-                sb,
-                "(allow network-inbound (local {protocol} \"localhost:*\"))"
+                self.sb,
+                "(allow network-bind (local unix-socket (subpath \"{escaped}\")))"
             )?;
         }
+        Ok(())
     }
-
-    match network.unix_socket_access() {
-        UnixSocketAccess::Unrestricted => {
-            sb.push_str("(allow network-outbound (remote unix-socket))\n");
-            sb.push_str("(allow network-bind (local unix-socket))\n");
-        }
-        UnixSocketAccess::AllowPaths(paths) => {
-            for path in paths {
-                let escaped = escape_sbpl_literal(&path.to_string_lossy());
-                writeln!(
-                    sb,
-                    "(allow network-outbound (remote unix-socket (subpath \"{escaped}\")))"
-                )?;
-                writeln!(
-                    sb,
-                    "(allow network-bind (local unix-socket (subpath \"{escaped}\")))"
-                )?;
-            }
-        }
-        UnixSocketAccess::Denied => {}
-    }
-
-    Ok(())
 }
 
 fn escape_sbpl_literal(path: &str) -> String {
