@@ -161,6 +161,15 @@ export function paneRow(_theme: Theme, width: number, content = ''): string {
 }
 
 const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const SANDBOX_HELP_ROWS = [
+  ['Tab', 'Next tab'],
+  ['↑ / ↓', 'Scroll when content exceeds pane height'],
+  ['Page Up / Down', 'Scroll by page'],
+  ['Home / End', 'Jump to top or bottom'],
+  ['Enter', 'Toggle sandbox enabled in active configuration scope'],
+  ['Esc', 'Cancel confirmation or close'],
+  ['Ctrl+C', 'Close'],
+] as const;
 const AGENTS_HELP_ROWS = [
   ['Tab', 'Next tab'],
   ['↑ / ↓', 'Select item or scroll when follow is off'],
@@ -313,6 +322,7 @@ function listWindow<T>(
 /** Per-frame drawing context handed to each tab renderer. */
 interface TabFrame {
   contentWidth: number;
+  paneHeight?: number;
   tabs: string;
   pane: (lines: string[]) => string[];
   pad: (value: string, cellWidth: number) => string;
@@ -1621,7 +1631,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     if (nextTools.join('\0') !== activeTools.join('\0')) this.pi.setActiveTools(nextTools);
   }
 
-  async openLandstrip(args: string, ctx: ExtensionContext): Promise<void> {
+  async openLandstrip(
+    args: string,
+    ctx: ExtensionContext,
+    scope?: 'sandbox' | 'subagents',
+  ): Promise<void> {
     if (ctx.mode !== 'tui') {
       ctx.ui.notify('Agent management is available in TUI mode', 'warning');
       return;
@@ -1629,7 +1643,23 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
     const projectTrusted = isProjectTrusted(ctx);
     let tasks = [...this.tasks.values()];
-    const requested = args.trim();
+    let requested = args.trim();
+    if (requested === 'sandbox:help') {
+      scope = 'sandbox';
+      requested = 'help';
+    } else if (requested === 'subagents:help') {
+      scope = 'subagents';
+      requested = 'help';
+    }
+    const viewScope: 'sandbox' | 'subagents' =
+      scope ??
+      (!requested ||
+      requested === 'overview' ||
+      requested === 'sandbox' ||
+      requested === 'status' ||
+      requested === 'policy'
+        ? 'sandbox'
+        : 'subagents');
     let catalog = this.getAgentCatalog(ctx);
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
     let agents = [...catalog.agents.values()]
@@ -1654,18 +1684,22 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     let saving = false;
     let confirmingSandboxDisable = false;
 
-    type LandstripTab = 'overview' | 'settings' | 'primary' | 'subagent' | 'tasks' | 'log' | 'help';
-    const TAB_ORDER: readonly LandstripTab[] = [
-      'overview',
-      'primary',
-      'subagent',
-      'tasks',
-      'log',
-      'settings',
-      'help',
-    ];
+    type LandstripTab =
+      | 'overview'
+      | 'policy'
+      | 'settings'
+      | 'primary'
+      | 'subagent'
+      | 'tasks'
+      | 'log'
+      | 'help';
+    const TAB_ORDER: readonly LandstripTab[] =
+      viewScope === 'sandbox'
+        ? ['overview', 'policy', 'help']
+        : ['tasks', 'log', 'subagent', 'primary', 'settings', 'help'];
     const TAB_LABELS: Record<LandstripTab, string> = {
       overview: 'Overview',
+      policy: 'Policy',
       settings: 'Settings',
       primary: 'Primary',
       subagent: 'Subagent',
@@ -1674,7 +1708,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       help: 'Help',
     };
 
-    let tab: LandstripTab = 'overview';
+    let tab: LandstripTab = viewScope === 'sandbox' ? 'overview' : 'tasks';
     let selectedTask = 0;
     let follow = false;
 
@@ -1682,15 +1716,17 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       tab = 'primary';
     } else if (requested === 'settings') {
       tab = 'settings';
-    } else if (requested === 'overview' || requested === 'sandbox') {
+    } else if (requested === 'overview' || requested === 'sandbox' || requested === 'status') {
       tab = 'overview';
+    } else if (requested === 'policy') {
+      tab = 'policy';
     } else if (requested === 'subagent' || requested === 'subagents') {
       tab = 'subagent';
     } else if (requested === 'tasks') {
       tab = 'tasks';
     } else if (requested === 'help') {
       tab = 'help';
-    } else if (requested === 'log') {
+    } else if (requested === 'log' || requested === 'logs') {
       tab = 'log';
       follow = true;
     } else if (requested) {
@@ -2243,138 +2279,171 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           tui.requestRender();
           return;
         };
-        const renderTab: Record<LandstripTab, (frame: TabFrame) => string[]> = {
-          overview: (frame) => {
-            const { tabs, pane, contentWidth, listValue } = frame;
-            const lines = [tabs, ''];
-            if (!overview) {
-              lines.push(theme.fg('muted', '  Sandbox settings are unavailable.'));
-              lines.push('', dialogKeys(theme, [['Esc', 'close']]));
-              return pane(lines);
-            }
-            const status = overview.noSandboxFlag
-              ? { color: 'warning', label: 'Disabled by --no-sandbox' }
-              : !overview.enabled
-                ? { color: 'warning', label: 'Disabled by configuration' }
-                : !overview.running
-                  ? { color: 'warning', label: 'Inactive' }
-                  : { color: 'success', label: 'Active' };
-            const networkMode = overview.networkMode;
-            const shellReadMode =
-              overview.windowsMode !== undefined
-                ? 'Policy (required)'
-                : overview.shellReadMode === 'host'
-                  ? 'Host-aligned'
-                  : 'Policy';
-            const changePath =
-              overview.changeScope === 'project' ? overview.paths.project : overview.paths.global;
-            const item = (label: string, value: string): string =>
-              `  ${theme.fg('dim', label.padEnd(16))} ${value}`;
-            lines.push(
-              `${theme.fg(status.color as 'success' | 'warning', '●')} ${theme.fg('text', status.label)}`,
-              item(
-                'Configured',
-                overview.enabled ? theme.fg('text', 'Enabled') : theme.fg('warning', 'Disabled'),
-              ),
-              item(
-                'Runtime',
-                overview.running ? theme.fg('success', 'Running') : theme.fg('dim', 'Not running'),
-              ),
-              item(
-                'Tasks',
-                `${tasks.filter((t) => t.state === 'running').length} running · ${tasks.length} total`,
-              ),
-              '',
-              theme.fg('accent', 'Protection'),
-              item('Network', networkMode),
-              item('Shell reads', shellReadMode),
-              item(
-                'Read rules',
-                `${overview.config.filesystem.denyRead.length + overview.config.filesystem.allowRead.length} · ${overview.readRuleScope}`,
-              ),
-              item(
-                'Write rules',
-                String(
-                  overview.config.filesystem.allowWrite.length +
-                    overview.config.filesystem.denyWrite.length,
-                ),
-              ),
-              item(
-                'Session grants',
-                String(
-                  overview.sessionDomains.length +
-                    overview.sessionReadPaths.length +
-                    overview.sessionWritePaths.length,
-                ),
-              ),
-              '',
-              theme.fg('accent', 'Configuration'),
-              item('Change scope', overview.changeScope === 'project' ? 'Project' : 'Global'),
-              item('Change file', truncateToWidth(changePath, Math.max(10, contentWidth - 20))),
-              item(
-                'Project file',
-                truncateToWidth(overview.paths.project, Math.max(10, contentWidth - 20)),
-              ),
-              item(
-                'Global file',
-                truncateToWidth(overview.paths.global, Math.max(10, contentWidth - 20)),
-              ),
-              item(
-                'Landstrip binary',
-                truncateToWidth(overview.paths.binary, Math.max(10, contentWidth - 20)),
-              ),
-            );
-            if (overview.windowsMode !== undefined)
-              lines.push(item('Windows mode', overview.windowsMode));
-            lines.push(
-              '',
-              theme.fg('accent', 'Network'),
-              item('Allowed domains', listValue(overview.config.network.allowedDomains)),
-              item('Denied domains', listValue(overview.config.network.deniedDomains)),
-              item(
-                'Unix sockets',
-                overview.config.network.allowAllUnixSockets
-                  ? 'all'
-                  : listValue(overview.config.network.allowUnixSockets),
-              ),
-              '',
-              theme.fg('accent', 'Filesystem'),
-              item('Shell reads', shellReadMode),
-              item('Read rules for', overview.readRuleScope),
-              item('Denied reads', listValue(overview.config.filesystem.denyRead)),
-              item('Allowed reads', listValue(overview.config.filesystem.allowRead)),
-              item('Allowed writes', listValue(overview.config.filesystem.allowWrite)),
-              item('Denied writes', listValue(overview.config.filesystem.denyWrite)),
-              '',
-              theme.fg('accent', 'Session grants'),
-              item('Domains', listValue(overview.sessionDomains)),
-              item('Read paths', listValue(overview.sessionReadPaths)),
-              item('Write paths', listValue(overview.sessionWritePaths)),
-            );
-            if (saving) lines.push('', theme.fg('dim', 'Saving…'));
-            lines.push('');
-            if (confirmingSandboxDisable) {
-              lines.push(
-                theme.fg('error', 'Disable the sandbox? Commands will run without OS isolation.'),
-                dialogKeys(theme, [
-                  ['Enter', 'confirm'],
-                  ['Esc', 'cancel'],
-                ]),
-              );
-            } else {
-              lines.push(
-                dialogKeys(theme, [
-                  ['Tab', 'next tab'],
-                  [
-                    'Enter',
-                    `${overview.enabled ? 'disable' : 'enable'} in ${overview.changeScope}`,
-                  ],
-                  ['Esc', 'close'],
-                ]),
-              );
-            }
+        const renderSandboxTab = (frame: TabFrame, buildBody: () => string[]): string[] => {
+          const { tabs, pane, paneHeight } = frame;
+          const lines = [tabs, ''];
+          if (!overview) {
+            lines.push(theme.fg('muted', '  Sandbox settings are unavailable.'));
+            lines.push('', dialogKeys(theme, [['Esc', 'close']]));
             return pane(lines);
-          },
+          }
+          const body = buildBody();
+          const footerLines = (saving ? 2 : 0) + 1 + (confirmingSandboxDisable ? 2 : 1);
+          const availableContentRows =
+            paneHeight === undefined ? undefined : Math.max(1, paneHeight - 3 - footerLines);
+          const scrollable =
+            availableContentRows !== undefined && body.length > availableContentRows;
+          const footer: string[] = [];
+          if (saving) footer.push('', theme.fg('dim', 'Saving…'));
+          footer.push('');
+          if (confirmingSandboxDisable) {
+            footer.push(
+              theme.fg('error', 'Disable the sandbox? Commands will run without OS isolation.'),
+              dialogKeys(theme, [
+                ['Enter', 'confirm'],
+                ['Esc', 'cancel'],
+              ]),
+            );
+          } else {
+            footer.push(
+              dialogKeys(theme, [
+                ...(scrollable ? ([['↑ / ↓', 'scroll']] as const) : ([] as const)),
+                ['Tab', 'next tab'],
+                ['Enter', `${overview.enabled ? 'disable' : 'enable'} in ${overview.changeScope}`],
+                ['Esc', 'close'],
+              ]),
+            );
+          }
+          if (!scrollable) {
+            scroll = 0;
+            return pane([...lines, ...body, ...footer]);
+          }
+          const bodyRows = Math.max(1, availableContentRows - 1);
+          const maxScroll = Math.max(0, body.length - bodyRows);
+          scroll = Math.min(scroll, maxScroll);
+          const shown = body.slice(scroll, scroll + bodyRows);
+          return pane([
+            ...lines,
+            ...shown,
+            theme.fg('dim', `${scroll + 1}–${scroll + shown.length} of ${body.length}`),
+            ...footer,
+          ]);
+        };
+        const renderTab: Record<LandstripTab, (frame: TabFrame) => string[]> = {
+          overview: (frame) =>
+            renderSandboxTab(frame, () => {
+              if (!overview) return [];
+              const { contentWidth } = frame;
+              const status = overview.noSandboxFlag
+                ? { color: 'warning', label: 'Disabled by --no-sandbox' }
+                : !overview.enabled
+                  ? { color: 'warning', label: 'Disabled by configuration' }
+                  : !overview.running
+                    ? { color: 'warning', label: 'Inactive' }
+                    : { color: 'success', label: 'Active' };
+              const shellReadMode =
+                overview.windowsMode !== undefined
+                  ? 'Policy (required)'
+                  : overview.shellReadMode === 'host'
+                    ? 'Host-aligned'
+                    : 'Policy';
+              const changePath =
+                overview.changeScope === 'project' ? overview.paths.project : overview.paths.global;
+              const valueWidth = Math.max(10, contentWidth - 23);
+              const item = (label: string, value: string): string =>
+                `  ${theme.fg('dim', label.padEnd(20))} ${value}`;
+              const body = [
+                `${theme.fg(status.color as 'success' | 'warning', '●')} ${theme.fg('text', status.label)}`,
+                item(
+                  'Configured',
+                  overview.enabled ? theme.fg('text', 'Enabled') : theme.fg('warning', 'Disabled'),
+                ),
+                item(
+                  'Runtime',
+                  overview.running
+                    ? theme.fg('success', 'Running')
+                    : theme.fg('dim', 'Not running'),
+                ),
+                item(
+                  'Tasks',
+                  `${tasks.filter((t) => t.state === 'running').length} running · ${tasks.length} total`,
+                ),
+                '',
+                theme.fg('accent', 'Protection'),
+                item('Network', overview.networkMode),
+                item('Shell reads', shellReadMode),
+                item(
+                  'Read rules',
+                  `${overview.config.filesystem.denyRead.length + overview.config.filesystem.denyReadAlways.length + overview.config.filesystem.allowRead.length} · ${overview.readRuleScope}`,
+                ),
+                item(
+                  'Write rules',
+                  String(
+                    overview.config.filesystem.allowWrite.length +
+                      overview.config.filesystem.denyWrite.length +
+                      overview.config.filesystem.denyWriteAlways.length,
+                  ),
+                ),
+                item(
+                  'Session grants',
+                  String(
+                    overview.sessionDomains.length +
+                      overview.sessionReadPaths.length +
+                      overview.sessionWritePaths.length,
+                  ),
+                ),
+                '',
+                theme.fg('accent', 'Configuration'),
+                item('Change scope', overview.changeScope === 'project' ? 'Project' : 'Global'),
+                item('Change file', truncateToWidth(changePath, valueWidth)),
+                item('Project file', truncateToWidth(overview.paths.project, valueWidth)),
+                item('Global file', truncateToWidth(overview.paths.global, valueWidth)),
+                item('Landstrip binary', truncateToWidth(overview.paths.binary, valueWidth)),
+              ];
+              if (overview.windowsMode !== undefined)
+                body.push(item('Windows mode', overview.windowsMode));
+              return body;
+            }),
+          policy: (frame) =>
+            renderSandboxTab(frame, () => {
+              if (!overview) return [];
+              const { listValue } = frame;
+              const shellReadMode =
+                overview.windowsMode !== undefined
+                  ? 'Policy (required)'
+                  : overview.shellReadMode === 'host'
+                    ? 'Host-aligned'
+                    : 'Policy';
+              const item = (label: string, value: string): string =>
+                `  ${theme.fg('dim', label.padEnd(20))} ${value}`;
+              return [
+                theme.fg('accent', 'Network'),
+                item('Mode', overview.networkMode),
+                item('Allowed domains', listValue(overview.config.network.allowedDomains)),
+                item('Denied domains', listValue(overview.config.network.deniedDomains)),
+                item(
+                  'Unix sockets',
+                  overview.config.network.allowAllUnixSockets
+                    ? 'all'
+                    : listValue(overview.config.network.allowUnixSockets),
+                ),
+                '',
+                theme.fg('accent', 'Filesystem'),
+                item('Shell reads', shellReadMode),
+                item('Read rules for', overview.readRuleScope),
+                item('Denied reads', listValue(overview.config.filesystem.denyRead)),
+                item('Always denied reads', listValue(overview.config.filesystem.denyReadAlways)),
+                item('Allowed reads', listValue(overview.config.filesystem.allowRead)),
+                item('Allowed writes', listValue(overview.config.filesystem.allowWrite)),
+                item('Denied writes', listValue(overview.config.filesystem.denyWrite)),
+                item('Always denied writes', listValue(overview.config.filesystem.denyWriteAlways)),
+                '',
+                theme.fg('accent', 'Session grants'),
+                item('Domains', listValue(overview.sessionDomains)),
+                item('Read paths', listValue(overview.sessionReadPaths)),
+                item('Write paths', listValue(overview.sessionWritePaths)),
+              ];
+            }),
           settings: (frame) => {
             const { tabs, pane, contentWidth } = frame;
             const lines = [tabs, '', ...buildSettingsList(tui, theme, done).render(contentWidth)];
@@ -2488,16 +2557,17 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           },
           help: (frame) => {
             const { tabs, pane, contentWidth, pad } = frame;
+            const helpRows = viewScope === 'sandbox' ? SANDBOX_HELP_ROWS : AGENTS_HELP_ROWS;
             const shortcutWidth = Math.max(
               visibleWidth('Shortcut'),
-              ...AGENTS_HELP_ROWS.map(([shortcut]) => visibleWidth(shortcut)),
+              ...helpRows.map(([shortcut]) => visibleWidth(shortcut)),
             );
             const descriptionWidth = Math.max(1, contentWidth - shortcutWidth - 4);
             const lines = [
               tabs,
               '',
               theme.fg('dim', `  ${pad('Shortcut', shortcutWidth)}  Description`),
-              ...AGENTS_HELP_ROWS.map(
+              ...helpRows.map(
                 ([shortcut, description]) =>
                   `  ${theme.fg('accent', pad(shortcut, shortcutWidth))}  ${theme.fg(
                     'text',
@@ -2508,58 +2578,89 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             return pane(lines);
           },
         };
-        const handleTabInput: Record<LandstripTab, (data: string) => void> = {
-          overview: (data) => {
-            if (confirmingSandboxDisable) {
-              if (matchesKey(data, 'escape')) {
-                confirmingSandboxDisable = false;
-                tui.requestRender();
-                return;
-              }
-              if (!matchesKey(data, 'return')) return;
-            }
+        const handleSandboxTabInput = (data: string): void => {
+          if (confirmingSandboxDisable) {
             if (matchesKey(data, 'escape')) {
-              finish();
-              return;
-            }
-            if (!matchesKey(data, 'return')) return;
-            const callbacks = this.integration.sandboxCallbacks;
-            const current = overview;
-            if (!callbacks || !current) {
-              ctx.ui.notify('Sandbox settings are unavailable', 'warning');
-              return;
-            }
-            const enabled = !current.enabled;
-            if (!enabled && !confirmingSandboxDisable) {
-              confirmingSandboxDisable = true;
+              confirmingSandboxDisable = false;
               tui.requestRender();
               return;
             }
-            confirmingSandboxDisable = false;
-            saving = true;
-            tui.requestRender();
-            void callbacks
-              .setEnabled(ctx, enabled, current.changeScope)
-              .then(() => {
-                overview = callbacks.overview(ctx.cwd, projectTrusted);
-                if (enabled && overview.noSandboxFlag) {
-                  ctx.ui.notify('Sandbox remains disabled via --no-sandbox', 'warning');
-                } else {
-                  ctx.ui.notify(
-                    `Sandbox ${enabled ? 'enabled' : 'disabled'} in ${current.changeScope} config`,
-                    'info',
-                  );
-                }
-              })
-              .catch((error: unknown) =>
-                ctx.ui.notify(`Could not update config: ${formatError(error)}`, 'error'),
-              )
-              .finally(() => {
-                saving = false;
-                tui.requestRender();
-              });
+            if (!matchesKey(data, 'return')) return;
+          }
+          if (matchesKey(data, 'escape')) {
+            finish();
             return;
-          },
+          }
+          if (matchesKey(data, 'up')) {
+            scroll = Math.max(0, scroll - 1);
+            tui.requestRender();
+            return;
+          }
+          if (matchesKey(data, 'down')) {
+            scroll += 1;
+            tui.requestRender();
+            return;
+          }
+          if (matchesKey(data, 'pageUp')) {
+            scroll = Math.max(0, scroll - INSPECTOR_BODY_LINES);
+            tui.requestRender();
+            return;
+          }
+          if (matchesKey(data, 'pageDown')) {
+            scroll += INSPECTOR_BODY_LINES;
+            tui.requestRender();
+            return;
+          }
+          if (matchesKey(data, 'home')) {
+            scroll = 0;
+            tui.requestRender();
+            return;
+          }
+          if (matchesKey(data, 'end')) {
+            scroll = Number.MAX_SAFE_INTEGER;
+            tui.requestRender();
+            return;
+          }
+          if (!matchesKey(data, 'return')) return;
+          const callbacks = this.integration.sandboxCallbacks;
+          const current = overview;
+          if (!callbacks || !current) {
+            ctx.ui.notify('Sandbox settings are unavailable', 'warning');
+            return;
+          }
+          const enabled = !current.enabled;
+          if (!enabled && !confirmingSandboxDisable) {
+            confirmingSandboxDisable = true;
+            tui.requestRender();
+            return;
+          }
+          confirmingSandboxDisable = false;
+          saving = true;
+          tui.requestRender();
+          void callbacks
+            .setEnabled(ctx, enabled, current.changeScope)
+            .then(() => {
+              overview = callbacks.overview(ctx.cwd, projectTrusted);
+              if (enabled && overview.noSandboxFlag) {
+                ctx.ui.notify('Sandbox remains disabled via --no-sandbox', 'warning');
+              } else {
+                ctx.ui.notify(
+                  `Sandbox ${enabled ? 'enabled' : 'disabled'} in ${current.changeScope} config`,
+                  'info',
+                );
+              }
+            })
+            .catch((error: unknown) =>
+              ctx.ui.notify(`Could not update config: ${formatError(error)}`, 'error'),
+            )
+            .finally(() => {
+              saving = false;
+              tui.requestRender();
+            });
+        };
+        const handleTabInput: Record<LandstripTab, (data: string) => void> = {
+          overview: handleSandboxTabInput,
+          policy: handleSandboxTabInput,
           settings: (data) => {
             // Refuse activation up front so an untrusted project never opens an editor
             // whose result would only be rejected on save.
@@ -2763,7 +2864,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             };
             const listValue = (values: readonly string[]): string => {
               const value = values.join(', ') || 'none';
-              return truncateToWidth(value, Math.max(10, contentWidth - 20));
+              return truncateToWidth(value, Math.max(10, contentWidth - 23));
             };
             refreshTasks();
             const tabs = dialogTabs(
@@ -2771,7 +2872,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               TAB_ORDER.map((key) => TAB_LABELS[key]),
               TAB_LABELS[tab],
             );
-            return renderTab[tab]({ contentWidth, tabs, pane, pad, listValue });
+            return renderTab[tab]({ contentWidth, paneHeight, tabs, pane, pad, listValue });
           },
           handleInput: (data: string) => {
             if (saving) return;

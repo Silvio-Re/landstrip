@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
-import { matchingTasksById } from './commands.ts';
+import {
+  getLandstripSandboxArgumentCompletions,
+  getLandstripSubagentsArgumentCompletions,
+  matchingTasksById,
+} from './commands.ts';
 import {
   createLandstripIntegration,
   type LandstripBashInput,
@@ -345,6 +349,120 @@ describe('Sandboxed Background Process Execution in Bash Tool', () => {
       const task = runtime.getTasks().find((t) => t.id === result.details.taskId);
       expect(task).toBeDefined();
       expect(task?.state).toBe('completed');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Landstrip Split Views (/landstrip-sandbox and /landstrip-subagents)', () => {
+  test('renders dedicated Overview and Policy tabs in /landstrip-sandbox and scoped tabs in /landstrip-subagents', async () => {
+    const root = mkdtempSync(join(homedir(), '.pi-landstrip-test-'));
+    try {
+      vi.stubEnv('PI_CODING_AGENT_DIR', root);
+      writeFileSync(
+        join(root, 'sandbox.json'),
+        JSON.stringify({
+          enabled: true,
+          filesystem: {
+            denyRead: ['/secret-read'],
+            denyReadAlways: ['/hard-secret-read'],
+            allowRead: ['.'],
+            allowWrite: ['.'],
+            denyWrite: ['**/.env'],
+            denyWriteAlways: ['/hard-secret-write'],
+          },
+        }),
+      );
+
+      const mockApi = createMockExtensionAPI();
+      const integration = createLandstripIntegration({ registerBashTool: false, cwd: root });
+      const runtime = new SubagentRuntime(mockApi.api, integration);
+      integration.setSubagentRuntime?.(runtime);
+      integration.register(mockApi.api);
+      runtime.register();
+
+      let terminalRows = 30;
+      let capturedComponent: any;
+      const ctx = {
+        ...createMockExtensionContext(root),
+        mode: 'tui',
+        hasUI: true,
+        ui: {
+          notify: vi.fn(),
+          setWidget: vi.fn(),
+          custom: vi.fn(async (factory: any) => {
+            const tui = {
+              get terminal() {
+                return { rows: terminalRows };
+              },
+              requestRender: vi.fn(),
+            };
+            const theme = {
+              fg: (_color: string, text: string) => text,
+              bold: (text: string) => text,
+            };
+            capturedComponent = factory(tui, theme, {}, () => {});
+          }),
+        } as any,
+      } as unknown as ExtensionContext;
+
+      const sandboxCommand = mockApi.commands.get('landstrip-sandbox');
+      const subagentsCommand = mockApi.commands.get('landstrip-subagents');
+      expect(sandboxCommand).toBeDefined();
+      expect(subagentsCommand).toBeDefined();
+
+      expect(getLandstripSandboxArgumentCompletions('').map((item) => item.value)).toEqual([
+        'status',
+        'policy',
+        'on',
+        'off',
+        'help',
+      ]);
+      expect(
+        getLandstripSubagentsArgumentCompletions('', runtime).map((item) => item.value),
+      ).toEqual(['tasks', 'logs', 'subagents', 'agents', 'settings', 'help']);
+
+      await sandboxCommand.handler('', ctx);
+      expect(capturedComponent).toBeDefined();
+
+      const initialFrame = capturedComponent.render(100).join('\n');
+      expect(initialFrame).toContain('[Overview]  Policy  Help');
+      expect(initialFrame).not.toContain('Subagent');
+      expect(initialFrame).toContain('Read rules           8 · Workers only');
+      expect(initialFrame).toContain('Write rules          9');
+      expect(initialFrame).toContain('Enter disable in global');
+
+      capturedComponent.handleInput('\r');
+      const confirmFrame = capturedComponent.render(100).join('\n');
+      expect(confirmFrame).toContain(
+        'Disable the sandbox? Commands will run without OS isolation.',
+      );
+      expect(confirmFrame).toContain('Enter confirm  ·  Esc cancel');
+
+      capturedComponent.handleInput('\x1b');
+      capturedComponent.handleInput('\t');
+      const policyFrame = capturedComponent.render(100).join('\n');
+      expect(policyFrame).toContain('Overview  [Policy]  Help');
+      expect(policyFrame).toContain('Network');
+      expect(policyFrame).toContain('Filesystem');
+      expect(policyFrame).toContain('/secret-read');
+      expect(policyFrame).toContain('Always denied reads  /hard-secret-read');
+      expect(policyFrame).toContain('**/.env');
+      expect(policyFrame).toContain('Always denied writes /hard-secret-write');
+
+      terminalRows = 20;
+      const compactPolicyFrame = capturedComponent.render(100).join('\n');
+      expect(compactPolicyFrame).toContain('↑ / ↓ scroll');
+      capturedComponent.handleInput('\x1b[F');
+      const bottomPolicyFrame = capturedComponent.render(100).join('\n');
+      expect(bottomPolicyFrame).toContain('Session grants');
+
+      terminalRows = 30;
+      await subagentsCommand.handler('', ctx);
+      const subagentsFrame = capturedComponent.render(100).join('\n');
+      expect(subagentsFrame).toContain('[Tasks]  Log  Subagent  Primary  Settings  Help');
+      expect(subagentsFrame).not.toContain('Overview');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
