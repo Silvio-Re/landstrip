@@ -28,7 +28,7 @@ pub(crate) use notify::ensure_notification_supported;
 pub(crate) use supervise::NotificationSyscalls;
 
 use super::filter::FilterSet;
-use super::landlock::enforce_access_policy;
+use super::landlock::LandlockRuleset;
 use super::namespace::Launch;
 use super::signals::ForwardSignals;
 use crate::error::{Error as LandstripError, Mechanism};
@@ -279,7 +279,7 @@ pub(super) fn run_broker(
                         error.into_boxed_dyn_error(),
                     )
                 })?;
-                enforce_access_policy(policy, false)?;
+                LandlockRuleset::try_from(policy)?.enforce()?;
 
                 {
                     let notify = filters.install()?;
