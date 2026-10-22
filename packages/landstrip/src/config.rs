@@ -33,11 +33,23 @@ impl PolicyFormat {
                 "policy root and filesystem must be objects",
             )));
         }
-        for pointer in ["/filesystem/denyReadAlways", "/filesystem/denyWriteAlways"] {
+        for pointer in [
+            "/filesystem/allowWrite",
+            "/filesystem/denyWrite",
+            "/filesystem/allowRead",
+            "/filesystem/denyRead",
+            "/filesystem/denyReadAlways",
+            "/filesystem/denyWriteAlways",
+            "/network/allowUnixSockets",
+        ] {
             if let Some(paths) = value.pointer_mut(pointer) {
                 let resolved = deserialize_paths(paths.take()).map_err(Error::parse_failed)?;
                 *paths = serde_json::to_value(resolved).map_err(Error::parse_failed)?;
             }
+        }
+        if let Some(services) = value.pointer_mut("/macos/allowMachLookup") {
+            let resolved = deserialize_strings(services.take()).map_err(Error::parse_failed)?;
+            *services = serde_json::to_value(resolved).map_err(Error::parse_failed)?;
         }
         Ok(value)
     }
