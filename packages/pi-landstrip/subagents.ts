@@ -3356,18 +3356,22 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           finishedAt: Date.now(),
         });
 
-        const commandOutput =
-          task.outputFile && existsSync(task.outputFile)
-            ? readFileSync(task.outputFile, 'utf8').trim()
-            : (task.output ?? '');
-        const deliveryText = `Background command ${task.state === 'completed' ? 'completed' : 'failed'}: ${task.description}\n\n${renderTaskResult(task.id, task.state, commandOutput || (task.error ?? ''))}`;
-        const delivered = await this.deliverBackground(task, deliveryText);
-        if (delivered) {
-          task.delivered = true;
-          this.persist(task);
-        }
-        if (task.state === 'error') {
-          ctx.ui.notify(`Background command failed: ${task.description}`, 'error');
+        if (!this.shuttingDown && !task.delivered && task.state !== 'cancelled') {
+          const rawOutput =
+            task.outputFile && existsSync(task.outputFile)
+              ? readFileSync(task.outputFile, 'utf8').trim()
+              : (task.output ?? '');
+          const commandOutput = rawOutput ? this.storeTaskText(task, rawOutput, 'output') : '';
+          if (commandOutput) task.output = commandOutput;
+          const deliveryText = `Background command ${task.state === 'completed' ? 'completed' : 'failed'}: ${task.description}\n\n${renderTaskResult(task.id, task.state, commandOutput || (task.error ?? ''))}`;
+          const delivered = await this.deliverBackground(task, deliveryText);
+          if (delivered) {
+            task.delivered = true;
+            this.persist(task);
+          }
+          if (task.state === 'error') {
+            ctx.ui.notify(`Background command failed: ${task.description}`, 'error');
+          }
         }
 
         this.notifyTaskUpdate();
