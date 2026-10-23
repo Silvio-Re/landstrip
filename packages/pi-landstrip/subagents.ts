@@ -1990,6 +1990,41 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           unsubscribe();
           done(undefined);
         };
+        const runSaving = (errorPrefix: string, action: () => Promise<void>): void => {
+          saving = true;
+          void action()
+            .catch((error: unknown) =>
+              ctx.ui.notify(`${errorPrefix}: ${formatError(error)}`, 'error'),
+            )
+            .finally(() => {
+              saving = false;
+              tui.requestRender();
+            });
+        };
+        const startSteering = (task: TaskRecord): void => {
+          const input = new Input();
+          input.focused = true;
+          input.onEscape = () => {
+            steering = undefined;
+            tui.requestRender();
+          };
+          input.onSubmit = (value) => {
+            const message = value.trim();
+            if (!message) {
+              ctx.ui.notify('Steering message must not be empty', 'warning');
+              return;
+            }
+            steering = undefined;
+            void this.steerTask(task, message)
+              .then(() => ctx.ui.notify(`Steered task ${task.id.slice(0, 8)}`, 'info'))
+              .catch((error: unknown) =>
+                ctx.ui.notify(`Could not steer task: ${formatError(error)}`, 'error'),
+              )
+              .finally(() => tui.requestRender());
+            tui.requestRender();
+          };
+          steering = input;
+        };
         const renderAgentsTab = (frame: TabFrame): string[] => {
           const { tabs, pane, contentWidth, pad } = frame;
           const listedAgents = agentsForTab();
@@ -2209,22 +2244,14 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               ctx.ui.notify('Agent editing requires a trusted project', 'warning');
               return;
             }
-            saving = true;
-            void (async () => {
+            runSaving('Could not edit agent', async () => {
               const document = prepareProjectAgentEditor(ctx.cwd, agent);
               const edited = await ctx.ui.editor(document.title, document.content);
               if (edited === undefined) return;
               await document.save(edited);
               await refreshAgentRuntime(agent.name);
               ctx.ui.notify(`Updated project agent ${agent.name}`, 'info');
-            })()
-              .catch((error: unknown) =>
-                ctx.ui.notify(`Could not edit agent: ${formatError(error)}`, 'error'),
-              )
-              .finally(() => {
-                saving = false;
-                tui.requestRender();
-              });
+            });
             return;
           } else if (data === ' ' && agent && !saving) {
             if (!projectTrusted) {
@@ -2232,22 +2259,14 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               return;
             }
             const disabled = !agent.disabled;
-            saving = true;
-            void setAgentDisabledForScope(ctx.cwd, agent.name, disabled, 'project')
-              .then(async () => {
-                await refreshAgentRuntime(agent.name);
-                ctx.ui.notify(
-                  `${agent.name} ${disabled ? 'disabled' : 'enabled'} in project settings`,
-                  'info',
-                );
-              })
-              .catch((error: unknown) =>
-                ctx.ui.notify(`Could not update agent: ${formatError(error)}`, 'error'),
-              )
-              .finally(() => {
-                saving = false;
-                tui.requestRender();
-              });
+            runSaving('Could not update agent', async () => {
+              await setAgentDisabledForScope(ctx.cwd, agent.name, disabled, 'project');
+              await refreshAgentRuntime(agent.name);
+              ctx.ui.notify(
+                `${agent.name} ${disabled ? 'disabled' : 'enabled'} in project settings`,
+                'info',
+              );
+            });
             return;
           } else if (data.toLowerCase() === 'i' && agent && !saving) {
             if (!projectTrusted) {
@@ -2255,19 +2274,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               return;
             }
             if (!disabledOverrides.project.has(agent.name)) return;
-            saving = true;
-            void clearAgentDisabledForScope(ctx.cwd, agent.name, 'project')
-              .then(async () => {
-                await refreshAgentRuntime(agent.name);
-                ctx.ui.notify(`${agent.name} now inherits its global state`, 'info');
-              })
-              .catch((error: unknown) =>
-                ctx.ui.notify(`Could not update agent: ${formatError(error)}`, 'error'),
-              )
-              .finally(() => {
-                saving = false;
-                tui.requestRender();
-              });
+            runSaving('Could not update agent', async () => {
+              await clearAgentDisabledForScope(ctx.cwd, agent.name, 'project');
+              await refreshAgentRuntime(agent.name);
+              ctx.ui.notify(`${agent.name} now inherits its global state`, 'info');
+            });
             return;
           } else if (
             tab === 'primary' &&
@@ -2344,6 +2355,14 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             ...footer,
           ]);
         };
+        const item = (label: string, value: string): string =>
+          `  ${theme.fg('dim', label.padEnd(20))} ${value}`;
+        const shellReadLabel = (current: NonNullable<typeof overview>): string =>
+          current.windowsMode !== undefined
+            ? 'Policy (required)'
+            : current.shellReadMode === 'host'
+              ? 'Host-aligned'
+              : 'Policy';
         const renderTab: Record<LandstripTab, (frame: TabFrame) => string[]> = {
           overview: (frame) =>
             renderSandboxTab(frame, () => {
@@ -2356,17 +2375,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                   : !overview.running
                     ? { color: 'warning', label: 'Inactive' }
                     : { color: 'success', label: 'Active' };
-              const shellReadMode =
-                overview.windowsMode !== undefined
-                  ? 'Policy (required)'
-                  : overview.shellReadMode === 'host'
-                    ? 'Host-aligned'
-                    : 'Policy';
               const changePath =
                 overview.changeScope === 'project' ? overview.paths.project : overview.paths.global;
               const valueWidth = Math.max(10, contentWidth - 23);
-              const item = (label: string, value: string): string =>
-                `  ${theme.fg('dim', label.padEnd(20))} ${value}`;
               const body = [
                 `${theme.fg(status.color as 'success' | 'warning', '●')} ${theme.fg('text', status.label)}`,
                 item(
@@ -2386,7 +2397,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                 '',
                 theme.fg('accent', 'Protection'),
                 item('Network', overview.networkMode),
-                item('Shell reads', shellReadMode),
+                item('Shell reads', shellReadLabel(overview)),
                 item(
                   'Read rules',
                   `${overview.config.filesystem.denyRead.length + overview.config.filesystem.denyReadAlways.length + overview.config.filesystem.allowRead.length} · ${overview.readRuleScope}`,
@@ -2423,14 +2434,6 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             renderSandboxTab(frame, () => {
               if (!overview) return [];
               const { listValue } = frame;
-              const shellReadMode =
-                overview.windowsMode !== undefined
-                  ? 'Policy (required)'
-                  : overview.shellReadMode === 'host'
-                    ? 'Host-aligned'
-                    : 'Policy';
-              const item = (label: string, value: string): string =>
-                `  ${theme.fg('dim', label.padEnd(20))} ${value}`;
               return [
                 theme.fg('accent', 'Network'),
                 item('Mode', overview.networkMode),
@@ -2444,7 +2447,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                 ),
                 '',
                 theme.fg('accent', 'Filesystem'),
-                item('Shell reads', shellReadMode),
+                item('Shell reads', shellReadLabel(overview)),
                 item('Read rules for', overview.readRuleScope),
                 item('Denied reads', listValue(overview.config.filesystem.denyRead)),
                 item('Always denied reads', listValue(overview.config.filesystem.denyReadAlways)),
@@ -2792,42 +2795,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               tab = 'log';
               follow = true;
               scroll = 0;
-              const input = new Input();
-              input.focused = true;
-              input.onEscape = () => {
-                steering = undefined;
-                tui.requestRender();
-              };
-              input.onSubmit = (value) => {
-                const message = value.trim();
-                if (!message) {
-                  ctx.ui.notify('Steering message must not be empty', 'warning');
-                  return;
-                }
-                steering = undefined;
-                void (async () => {
-                  const running = this.running.get(task.id);
-                  if (running) {
-                    await running.rpc.steer(message);
-                  } else if (
-                    (task.state === 'queued' || task.state === 'running') &&
-                    this.runPromises.has(task.id)
-                  ) {
-                    const pending = this.pendingSteers.get(task.id) ?? [];
-                    pending.push(message);
-                    this.pendingSteers.set(task.id, pending);
-                  } else {
-                    throw new Error('Task is no longer active');
-                  }
-                  ctx.ui.notify(`Steered task ${task.id.slice(0, 8)}`, 'info');
-                })()
-                  .catch((error: unknown) =>
-                    ctx.ui.notify(`Could not steer task: ${formatError(error)}`, 'error'),
-                  )
-                  .finally(() => tui.requestRender());
-                tui.requestRender();
-              };
-              steering = input;
+              startSteering(task);
             } else if (data.toLowerCase() === 'r') {
               const finished = tasks.filter(
                 (t) =>
@@ -2886,42 +2854,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               (task.state === 'queued' || task.state === 'running') &&
               task.kind !== 'command'
             ) {
-              const input = new Input();
-              input.focused = true;
-              input.onEscape = () => {
-                steering = undefined;
-                tui.requestRender();
-              };
-              input.onSubmit = (value) => {
-                const message = value.trim();
-                if (!message) {
-                  ctx.ui.notify('Steering message must not be empty', 'warning');
-                  return;
-                }
-                steering = undefined;
-                void (async () => {
-                  const running = this.running.get(task.id);
-                  if (running) {
-                    await running.rpc.steer(message);
-                  } else if (
-                    (task.state === 'queued' || task.state === 'running') &&
-                    this.runPromises.has(task.id)
-                  ) {
-                    const pending = this.pendingSteers.get(task.id) ?? [];
-                    pending.push(message);
-                    this.pendingSteers.set(task.id, pending);
-                  } else {
-                    throw new Error('Task is no longer active');
-                  }
-                  ctx.ui.notify(`Steered task ${task.id.slice(0, 8)}`, 'info');
-                })()
-                  .catch((error: unknown) =>
-                    ctx.ui.notify(`Could not steer task: ${formatError(error)}`, 'error'),
-                  )
-                  .finally(() => tui.requestRender());
-                tui.requestRender();
-              };
-              steering = input;
+              startSteering(task);
             } else if (data.toLowerCase() === 'f') {
               follow = !follow;
             } else if (matchesKey(data, 'up')) {
@@ -3020,20 +2953,12 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                   tui.requestRender();
                   return;
                 }
-                saving = true;
-                void deleteProjectAgent(ctx.cwd, agent)
-                  .then(async (deleted) => {
-                    if (!deleted) return;
-                    await refreshAgentRuntime(name);
-                    ctx.ui.notify(`Deleted project agent ${name}`, 'info');
-                  })
-                  .catch((error: unknown) =>
-                    ctx.ui.notify(`Could not delete agent: ${formatError(error)}`, 'error'),
-                  )
-                  .finally(() => {
-                    saving = false;
-                    tui.requestRender();
-                  });
+                runSaving('Could not delete agent', async () => {
+                  const deleted = await deleteProjectAgent(ctx.cwd, agent);
+                  if (!deleted) return;
+                  await refreshAgentRuntime(name);
+                  ctx.ui.notify(`Deleted project agent ${name}`, 'info');
+                });
                 return;
               }
               return;
@@ -3279,16 +3204,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           if (task.state !== 'running' && task.state !== 'queued') {
             throw new Error(`Task ${task.id.slice(0, 8)} is no longer active (${task.state})`);
           }
-          const running = this.running.get(task.id);
-          if (running) {
-            await running.rpc.steer(message);
-          } else if (this.runPromises.has(task.id)) {
-            const pending = this.pendingSteers.get(task.id) ?? [];
-            pending.push(message);
-            this.pendingSteers.set(task.id, pending);
-          } else {
-            throw new Error(`Task ${task.id.slice(0, 8)} is no longer active`);
-          }
+          await this.steerTask(task, message, `Task ${task.id.slice(0, 8)} is no longer active`);
           return {
             content: [
               {
@@ -3315,6 +3231,26 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         throw new Error(`Unknown action: ${action}`);
       },
     };
+  }
+
+  private async steerTask(
+    task: TaskRecord,
+    message: string,
+    inactiveMessage = 'Task is no longer active',
+  ): Promise<void> {
+    const running = this.running.get(task.id);
+    if (running) {
+      await running.rpc.steer(message);
+    } else if (
+      (task.state === 'queued' || task.state === 'running') &&
+      this.runPromises.has(task.id)
+    ) {
+      const pending = this.pendingSteers.get(task.id) ?? [];
+      pending.push(message);
+      this.pendingSteers.set(task.id, pending);
+    } else {
+      throw new Error(inactiveMessage);
+    }
   }
 
   async runBackgroundShellTask(
