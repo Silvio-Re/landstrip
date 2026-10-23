@@ -1502,7 +1502,7 @@ export function workerConfigFromEnvironment(): WorkerConfig | undefined {
 }
 
 export class SubagentRuntime implements CommandSubagentRuntime {
-  private semaphore = new Semaphore(1);
+  private readonly semaphore = new Semaphore(1);
   private readonly broker: PermissionBroker;
   private readonly tasks = new Map<string, TaskRecord>();
   private readonly running = new Map<string, RunningTask>();
@@ -4606,8 +4606,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     this.primaryRules = undefined;
     this.primaryConfigurationError = false;
     const catalog = this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
-    this.maxSubagents = catalog.maxSubagents;
-    this.semaphore = new Semaphore(this.maxSubagents);
+    this.setMaxSubagents(catalog.maxSubagents);
     if (catalog.diagnostics.length > 0) {
       this.invalidatePrimaryAgent(catalog, ctx);
       return;

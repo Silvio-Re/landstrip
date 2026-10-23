@@ -6,8 +6,9 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, describe, expect, onTestFinished, test, vi } from 'vitest';
 
+import type { AgentCatalog } from './agents.ts';
 import {
   getLandstripSandboxArgumentCompletions,
   getLandstripSubagentsArgumentCompletions,
@@ -18,6 +19,7 @@ import {
   type LandstripBashInput,
   type LandstripIntegration,
 } from './index.ts';
+import type { RpcProcess } from './rpc-process.ts';
 import { SubagentRuntime, type SubagentTaskRecord, type TasksToolInput } from './subagents.ts';
 
 afterEach(() => {
@@ -850,5 +852,184 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+async function createReloadHarness() {
+  const root = mkdtempSync(join(homedir(), '.pi-landstrip-reload-test-'));
+  vi.stubEnv('PI_CODING_AGENT_DIR', root);
+  const mockApi = createMockExtensionAPI();
+  const ctx = createMockExtensionContext(root);
+  let maxSubagents = 1;
+  const catalog: AgentCatalog = {
+    agents: new Map([
+      [
+        'build',
+        {
+          name: 'build',
+          source: 'global',
+          prompt: 'Test agent',
+          mode: 'all',
+          hidden: false,
+          disabled: false,
+          permissions: [],
+          providerOptions: {},
+        },
+      ],
+    ]),
+    permissions: [{ permission: '*', pattern: '*', action: 'allow' }],
+    diagnostics: [],
+    maxSubagents,
+  };
+  const workers = new Map<string, { finish: () => void; dispose: ReturnType<typeof vi.fn> }>();
+  // Drain the current promise chain without advancing a timer or releasing a worker.
+  const checkpoint = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const runtime = new SubagentRuntime(
+    mockApi.api,
+    createLandstripIntegration({ registerBashTool: false, cwd: root }),
+    async (task) => {
+      let finish!: () => void;
+      const completed = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const dispose = vi.fn(async () => {});
+      workers.set(task.description, { finish, dispose });
+      return {
+        rpc: {
+          onEvent() {},
+          prompt: () => completed,
+          getLastAssistantText: async () => 'Done',
+          stop: async () => finish(),
+        } as unknown as RpcProcess,
+        dispose,
+      };
+    },
+    () => ({ ...catalog, maxSubagents }),
+  );
+  onTestFinished(async () => {
+    try {
+      for (const listener of mockApi.listeners.get('session_shutdown') ?? []) {
+        await listener({}, ctx);
+      }
+      for (const worker of workers.values()) expect(worker.dispose).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  runtime.register();
+  for (const listener of mockApi.listeners.get('session_start') ?? []) await listener({}, ctx);
+
+  const submit = (description: string) =>
+    mockApi.tools
+      .get('task')
+      .execute(
+        description,
+        { description, prompt: description, subagent_type: 'build', background: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+  return {
+    runtime,
+    workers,
+    submit,
+    async launch(description: string) {
+      const result = await submit(description);
+      await checkpoint();
+      return runtime.getTasks().find((task) => task.id === result.details.taskId)!;
+    },
+    async finish(description: string) {
+      workers.get(description)!.finish();
+      await checkpoint();
+    },
+    async reload(limit: number) {
+      maxSubagents = limit;
+      // The primary-agent TUI edit/reload path calls this without restarting the session.
+      await (
+        runtime as unknown as { restorePrimaryAgent(ctx: ExtensionContext): Promise<void> }
+      ).restorePrimaryAgent(ctx);
+      await checkpoint();
+      expect(runtime.getMaxSubagents()).toBe(limit);
+      expect(mockApi.api.getActiveTools()).toEqual(
+        limit > 0 ? ['bash', 'tasks', 'task'] : ['bash', 'tasks'],
+      );
+    },
+  };
+}
+
+describe('Primary agent reload concurrency', () => {
+  test('keeps active workers and old and new waiters on the same limit', async () => {
+    const h = await createReloadHarness();
+    const active = await h.launch('active');
+    const queued = await h.launch('queued');
+    expect([active.state, queued.state]).toEqual(['running', 'queued']);
+
+    await h.reload(1);
+    const newest = await h.launch('newest');
+    expect([active.state, queued.state, newest.state]).toEqual(['running', 'queued', 'queued']);
+    expect([...h.workers.keys()]).toEqual(['active']);
+
+    await h.finish('active');
+    expect([active.state, queued.state, newest.state]).toEqual(['completed', 'running', 'queued']);
+    await h.finish('queued');
+    expect([queued.state, newest.state]).toEqual(['completed', 'running']);
+    await h.finish('newest');
+    expect(newest.state).toBe('completed');
+  });
+
+  test('increases capacity for existing waiters and decreases it without forgetting active workers', async () => {
+    const h = await createReloadHarness();
+    const first = await h.launch('first');
+    const second = await h.launch('second');
+    const third = await h.launch('third');
+
+    await h.reload(2);
+    expect([first.state, second.state, third.state]).toEqual(['running', 'running', 'queued']);
+    const fourth = await h.launch('fourth');
+    expect(fourth.state).toBe('queued');
+
+    await h.reload(1);
+    expect([first.state, second.state, third.state, fourth.state]).toEqual([
+      'running',
+      'running',
+      'queued',
+      'queued',
+    ]);
+    await h.finish('first');
+    expect([first.state, second.state, third.state, fourth.state]).toEqual([
+      'completed',
+      'running',
+      'queued',
+      'queued',
+    ]);
+    await h.finish('second');
+    expect([second.state, third.state, fourth.state]).toEqual(['completed', 'running', 'queued']);
+    await h.finish('third');
+    expect([third.state, fourth.state]).toEqual(['completed', 'running']);
+    await h.finish('fourth');
+    expect(fourth.state).toBe('completed');
+  });
+
+  test('zero disables task dispatch without cancelling active workers or losing waiters', async () => {
+    const h = await createReloadHarness();
+    const active = await h.launch('active');
+    const queued = await h.launch('queued');
+
+    await h.reload(0);
+    expect([active.state, queued.state]).toEqual(['running', 'queued']);
+    await expect(h.submit('disabled')).rejects.toThrow('Subagents are disabled by maxSubagents: 0');
+    expect(h.runtime.getTasks()).toHaveLength(2);
+    await h.finish('active');
+    expect([active.state, queued.state]).toEqual(['completed', 'queued']);
+    expect([...h.workers.keys()]).toEqual(['active']);
+
+    await h.reload(1);
+    expect(queued.state).toBe('running');
+    const newest = await h.launch('newest');
+    expect(newest.state).toBe('queued');
+    await h.finish('queued');
+    expect([queued.state, newest.state]).toEqual(['completed', 'running']);
+    await h.finish('newest');
+    expect(newest.state).toBe('completed');
   });
 });
