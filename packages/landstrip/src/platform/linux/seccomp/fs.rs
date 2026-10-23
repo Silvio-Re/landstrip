@@ -7,7 +7,7 @@ use super::grant::{
     PathMutation, open_path,
 };
 use super::notify::NotificationResult;
-use super::process::{ResolvedPath, TargetProcess};
+use super::process::{MissingTarget, ResolvedPath, TargetProcess};
 use super::supervise::{Denial, Denials};
 use crate::paths::normalize_path_lexically;
 use crate::policy::{AccessPolicy, DenialReason};
@@ -568,13 +568,12 @@ fn resolve_open_target(
     let filesystem = process.filesystem()?;
     let follow = open.flags & libc::O_NOFOLLOW == 0
         && open.flags & (libc::O_CREAT | libc::O_EXCL) != (libc::O_CREAT | libc::O_EXCL);
-    let resolved = filesystem.resolve(
-        dirfd,
-        path,
-        follow,
-        open.flags & libc::O_CREAT != 0,
-        open.resolve,
-    )?;
+    let missing = if open.flags & libc::O_CREAT != 0 {
+        MissingTarget::File
+    } else {
+        MissingTarget::Disallow
+    };
+    let resolved = filesystem.resolve(dirfd, path, follow, missing, open.resolve)?;
     let raw = resolved.raw.clone();
     let label = resolved.label.clone();
     let grant = OpenGrant::new(resolved, open.flags, open.mode, open.resolve);
@@ -755,7 +754,7 @@ pub(super) fn handle_mutation(
 
     let process = TargetProcess::from_raw(request.pid);
     let filesystem = process.filesystem()?;
-    let mut paths = Vec::with_capacity(spec.paths.len());
+    let mut paths: Vec<(ResolvedPath, PathBuf)> = Vec::with_capacity(spec.paths.len());
     let no_follow = spec.kind.no_follow(&request.data.args);
     for (index, (dirfd_arg, path_arg)) in spec.paths.iter().enumerate() {
         let dirfd = match dirfd_arg {
@@ -789,7 +788,21 @@ pub(super) fn handle_mutation(
                 MutationSyscall::Link | MutationSyscall::Linkat => index == 0,
                 _ => true,
             };
-        let target = filesystem.resolve(dirfd, &path, follow, true, 0)?;
+        let missing = if spec.kind.is_mkdir()
+            || (index == 1
+                && matches!(
+                    spec.kind,
+                    MutationSyscall::Rename
+                        | MutationSyscall::Renameat
+                        | MutationSyscall::Renameat2
+                )
+                && paths.first().is_some_and(|(from, _)| from.is_directory()))
+        {
+            MissingTarget::Directory
+        } else {
+            MissingTarget::File
+        };
+        let target = filesystem.resolve(dirfd, &path, follow, missing, 0)?;
         if spec.kind.is_mkdir()
             && target
                 .anchor

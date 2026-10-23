@@ -4,7 +4,7 @@
 use super::error::{BrokerError, SysResult};
 use super::grant::{Grant, SocketGrant};
 use super::notify::NotificationResult;
-use super::process::TargetProcess;
+use super::process::{MissingTarget, TargetProcess};
 use super::supervise::{Denial, Denials};
 use crate::paths::PathCoverage;
 use crate::policy::{AccessPolicy, UnixSocketAccess};
@@ -440,7 +440,7 @@ fn handle_unix_connect(
     };
     let process = TargetProcess::from_raw(pid);
     let filesystem = process.filesystem()?;
-    let target = filesystem.resolve(libc::AT_FDCWD, &path, true, false, 0)?;
+    let target = filesystem.resolve(libc::AT_FDCWD, &path, true, MissingTarget::Disallow, 0)?;
     let anchor = target.anchor.ok_or(BrokerError::SystemCall {
         errno: libc::ENOENT,
     })?;
@@ -480,7 +480,7 @@ fn handle_unix_bind(
     };
     let process = TargetProcess::from_raw(pid);
     let filesystem = process.filesystem()?;
-    let target = filesystem.resolve(libc::AT_FDCWD, &path, false, true, 0)?;
+    let target = filesystem.resolve(libc::AT_FDCWD, &path, false, MissingTarget::File, 0)?;
     let anchor = target.anchor.ok_or(BrokerError::SystemCall {
         errno: libc::ENOENT,
     })?;

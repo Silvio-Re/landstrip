@@ -366,11 +366,28 @@ impl TargetProcess {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MissingTarget {
+    Disallow,
+    File,
+    Directory,
+}
+
 pub(super) struct ResolvedPath {
     pub(super) raw: PathBuf,
     pub(super) label: PathBuf,
     pub(super) anchor: Option<super::grant::Anchor>,
     pub(super) root: OwnedFd,
+}
+
+impl ResolvedPath {
+    pub(super) fn is_directory(&self) -> bool {
+        self.anchor
+            .as_ref()
+            .and_then(|anchor| anchor.target.as_ref())
+            .and_then(|fd| fstat(fd).ok())
+            .is_some_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    }
 }
 
 pub(super) struct TargetFilesystem<'a> {
@@ -495,7 +512,7 @@ impl TargetFilesystem<'_> {
         dirfd: RawFd,
         path: &Path,
         follow: bool,
-        allow_missing: bool,
+        missing: MissingTarget,
         resolve: u64,
     ) -> SysResult<ResolvedPath> {
         const BENEATH: u64 = 0x08;
@@ -562,8 +579,10 @@ impl TargetFilesystem<'_> {
                 Ok(fd) => Some(fd),
                 Err(BrokerError::SystemCall {
                     errno: libc::ENOENT,
-                }) if allow_missing => {
-                    if !pending.is_empty() || trailing_slash {
+                }) if missing != MissingTarget::Disallow => {
+                    if !pending.is_empty()
+                        || (trailing_slash && missing != MissingTarget::Directory)
+                    {
                         let mut label = self
                             .label(parent.as_fd())?
                             .join(OsStr::from_bytes(&component));
@@ -584,7 +603,9 @@ impl TargetFilesystem<'_> {
             if let Some(fd) = &object {
                 let stat = fstat(fd)?;
                 if stat.st_mode & libc::S_IFMT == libc::S_IFLNK
-                    && (!pending.is_empty() || follow || trailing_slash)
+                    && (!pending.is_empty()
+                        || follow
+                        || (trailing_slash && missing != MissingTarget::Directory))
                 {
                     if resolve & NO_SYMLINKS != 0 || links == 40 {
                         return Err(BrokerError::syscall(libc::ELOOP));
@@ -611,6 +632,7 @@ impl TargetFilesystem<'_> {
                                     continue;
                                 }
                                 if trailing_slash
+                                    && missing != MissingTarget::Directory
                                     && fstat(&target)?.st_mode & libc::S_IFMT != libc::S_IFDIR
                                 {
                                     return Err(BrokerError::syscall(libc::ENOTDIR));
@@ -665,7 +687,10 @@ impl TargetFilesystem<'_> {
                     dirs.push(object.ok_or_else(|| BrokerError::syscall(libc::EIO))?);
                     continue;
                 }
-                if trailing_slash && stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                if trailing_slash
+                    && missing != MissingTarget::Directory
+                    && stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+                {
                     return Err(BrokerError::syscall(libc::ENOTDIR));
                 }
             }
