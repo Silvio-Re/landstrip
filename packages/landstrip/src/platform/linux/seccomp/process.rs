@@ -374,8 +374,9 @@ pub(super) enum MissingTarget {
 }
 
 pub(super) struct ResolvedPath {
-    pub(super) raw: PathBuf,
+    pub(super) lexical: PathBuf,
     pub(super) label: PathBuf,
+    pub(super) trailing_slash: bool,
     pub(super) anonymous: bool,
     pub(super) anchor: Option<super::grant::Anchor>,
     pub(super) root: OwnedFd,
@@ -541,11 +542,11 @@ impl TargetFilesystem<'_> {
             self.root.try_clone()?
         };
         let base_label = self.label(base.as_fd())?;
-        let raw = if path.is_absolute() && !scoped {
+        let lexical = crate::paths::normalize_path_lexically(&if path.is_absolute() && !scoped {
             path.to_path_buf()
         } else {
             base_label.join(path.strip_prefix("/").unwrap_or(path))
-        };
+        });
         let mut dirs = self.directory_stack(base.as_fd())?;
         let floor = if scoped { dirs.len() } else { 1 };
         let mut pending = path_components(path.as_os_str().as_bytes());
@@ -591,8 +592,9 @@ impl TargetFilesystem<'_> {
                             label.push(OsStr::from_bytes(&part));
                         }
                         return Ok(ResolvedPath {
-                            raw,
+                            lexical,
                             label: crate::paths::normalize_path_lexically(&label),
+                            trailing_slash,
                             anonymous: false,
                             anchor: None,
                             root: self.root.try_clone()?,
@@ -652,8 +654,9 @@ impl TargetFilesystem<'_> {
                                         ),
                                     };
                                 return Ok(ResolvedPath {
-                                    raw,
+                                    lexical,
                                     label,
+                                    trailing_slash,
                                     anonymous,
                                     anchor: Some(super::grant::Anchor {
                                         dir: parent.try_clone()?,
@@ -716,8 +719,9 @@ impl TargetFilesystem<'_> {
                     .join(OsStr::from_bytes(name.as_bytes())),
             };
             return Ok(ResolvedPath {
-                raw,
+                lexical,
                 label,
+                trailing_slash,
                 anonymous: false,
                 anchor: Some(super::grant::Anchor {
                     dir: parent.try_clone()?,

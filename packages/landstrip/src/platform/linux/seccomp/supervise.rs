@@ -42,22 +42,27 @@ impl Denial {
             Self::Network(_, _, _) => true,
         }
     }
-}
 
-impl From<Denial> for Trap {
-    fn from(denial: Denial) -> Self {
-        match denial {
-            Denial::Filesystem(denial) => Self::filesystem(denial, None),
-            Denial::Network(operation, target, process) => {
-                Self::network(operation, target, process, None)
+    pub(super) fn into_trap(self, query_id: Option<u64>) -> Trap {
+        match self {
+            Self::Filesystem(denial) => Trap::filesystem(denial, query_id),
+            Self::Network(operation, target, process) => {
+                Trap::network(operation, target, process, query_id)
             }
         }
     }
 }
 
-#[derive(Default)]
+impl From<Denial> for Trap {
+    fn from(denial: Denial) -> Self {
+        denial.into_trap(None)
+    }
+}
+
 pub(super) struct Denials<'a> {
-    pub(super) trap_fd: Option<&'a TrapFd>,
+    trap_fd: Option<&'a TrapFd>,
+    query_enabled: bool,
+    next_query_id: u64,
     seen: HashSet<Denial>,
     pending: Vec<Denial>,
 }
@@ -66,8 +71,20 @@ impl<'a> Denials<'a> {
     pub(super) fn new(trap_fd: Option<&'a TrapFd>) -> Self {
         Self {
             trap_fd,
-            ..Self::default()
+            query_enabled: trap_fd.is_some_and(TrapFd::is_stream_socket),
+            next_query_id: 1,
+            seen: HashSet::new(),
+            pending: Vec::new(),
         }
+    }
+
+    pub(super) fn can_query(&self, allow_query: bool) -> bool {
+        self.query_enabled && allow_query
+    }
+
+    pub(super) fn disable_queries(&mut self) {
+        self.trap_fd = None;
+        self.query_enabled = false;
     }
 
     pub(super) fn write(&self, trap: &Trap) -> io::Result<()> {
@@ -78,6 +95,25 @@ impl<'a> Denials<'a> {
         if self.seen.insert(denial.clone()) {
             self.pending.push(denial);
         }
+    }
+
+    pub(super) fn deny(
+        &mut self,
+        denial: Denial,
+        allow_query: bool,
+        grant: Option<Grant>,
+    ) -> SysResult<NotificationResult> {
+        if self.can_query(allow_query) {
+            let query_id = self.next_query_id;
+            self.next_query_id += 1;
+            return Ok(NotificationResult::query(
+                query_id,
+                denial.into_trap(Some(query_id)),
+                grant,
+            ));
+        }
+        self.record(denial);
+        Err(BrokerError::PolicyDenied)
     }
 
     pub(super) fn emit(self, status: WaitStatus) -> i32 {
@@ -109,34 +145,16 @@ pub(super) struct NotificationContext<'a> {
     pub(super) policy: &'a AccessPolicy,
     pub(super) syscalls: &'a NotificationSyscalls,
     pub(super) notify_filesystem: bool,
-    pub(super) query_enabled: bool,
     pub(super) mount_namespace: NamespaceId,
 }
 
 impl NotificationContext<'_> {
-    fn handle(
-        &self,
-        request: &libc::seccomp_notif,
-        denials: &mut Denials<'_>,
-        next_query_id: &mut u64,
-    ) -> HandleResult {
+    fn handle(&self, request: &libc::seccomp_notif, denials: &mut Denials<'_>) -> HandleResult {
         let syscall = i64::from(request.data.nr);
         let result = if syscall == self.syscalls.bind {
-            handle_bind(
-                self.policy,
-                request,
-                denials,
-                self.query_enabled,
-                next_query_id,
-            )
+            handle_bind(self.policy, request, denials)
         } else if syscall == self.syscalls.connect {
-            handle_connect(
-                self.policy,
-                request,
-                denials,
-                self.query_enabled,
-                next_query_id,
-            )
+            handle_connect(self.policy, request, denials)
         } else if syscall == self.syscalls.sendto {
             handle_sendto(request, denials)
         } else if syscall == self.syscalls.sendmsg {
@@ -144,13 +162,7 @@ impl NotificationContext<'_> {
         } else if syscall == self.syscalls.sendmmsg {
             handle_sendmmsg(request, denials)
         } else if self.notify_filesystem && self.syscalls.is_open(syscall) {
-            handle_openat(
-                self.policy,
-                request,
-                denials,
-                self.query_enabled,
-                next_query_id,
-            )
+            handle_openat(self.policy, request, denials)
         } else if self.notify_filesystem && self.syscalls.is_handle_syscall(syscall) {
             Err(BrokerError::PolicyDenied)
         } else if self.notify_filesystem
@@ -158,17 +170,10 @@ impl NotificationContext<'_> {
                 .iter()
                 .any(|spec| !spec.landlock_backed && spec.nr == Some(syscall))
         {
-            handle_mutation(
-                self.policy,
-                request,
-                denials,
-                self.query_enabled,
-                next_query_id,
-            )
+            handle_mutation(self.policy, request, denials)
         } else {
             Ok(NotificationResult::Continue)
         };
-
         match result {
             Ok(NotificationResult::Continue) => {
                 HandleResult::Respond(NotificationResponse::continue_syscall(request.id))
@@ -313,18 +318,14 @@ impl Supervisor<'_> {
             .trap_fd
             .filter(|trap_fd| trap_fd.is_stream_socket())
             .map(AsFd::as_fd);
-        let query_enabled = trap_fd.is_some();
-        let mut ctx = NotificationContext {
+        let ctx = NotificationContext {
             policy: self.policy,
             syscalls: self.syscalls,
             notify_filesystem: self.notify_filesystem,
-            query_enabled,
             mount_namespace: self.mount_namespace,
         };
         let mut pending_queries: HashMap<u64, PendingQuery> = HashMap::new();
         let mut control_buffer: Vec<u8> = Vec::new();
-        let mut next_query_id: u64 = 1;
-
         loop {
             loop {
                 match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
@@ -371,9 +372,8 @@ impl Supervisor<'_> {
                         ));
                 if dead {
                     deny_all_pending(&mut pending_queries, notify);
-                    denials.trap_fd = None;
+                    denials.disable_queries();
                     trap_fd = None;
-                    ctx.query_enabled = false;
                 }
             }
 
@@ -382,7 +382,7 @@ impl Supervisor<'_> {
             }
 
             let Some((request, handle_result)) =
-                receive_handled_notification(notify, &ctx, &mut denials, &mut next_query_id)?
+                receive_handled_notification(notify, &ctx, &mut denials)?
             else {
                 continue;
             };
@@ -404,9 +404,8 @@ impl Supervisor<'_> {
                     if let Err(error) = denials.write(&decision.trap) {
                         log::debug!("trap query write failed: {error}");
                         deny_all_pending(&mut pending_queries, notify);
-                        denials.trap_fd = None;
+                        denials.disable_queries();
                         trap_fd = None;
-                        ctx.query_enabled = false;
                         notify.respond(NotificationResponse::error(
                             request.id,
                             LandstripError::DENIAL_ERRNO,
@@ -433,14 +432,13 @@ fn receive_handled_notification(
     notify: NotificationChannel<'_>,
     ctx: &NotificationContext,
     denials: &mut Denials<'_>,
-    next_query_id: &mut u64,
 ) -> Result<Option<(libc::seccomp_notif, HandleResult)>> {
     let request = notify.receive()?;
     if !notify.is_id_valid(request.id)? {
         return Ok(None);
     }
     let handle_result = match ctx.mount_namespace.verify(request.pid) {
-        Ok(()) => ctx.handle(&request, denials, next_query_id),
+        Ok(()) => ctx.handle(&request, denials),
         Err(error) => HandleResult::Respond(NotificationResponse::error(request.id, error.errno())),
     };
     if !notify.is_id_valid(request.id)? {

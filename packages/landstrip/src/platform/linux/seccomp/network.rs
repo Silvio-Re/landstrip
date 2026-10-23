@@ -8,7 +8,7 @@ use super::process::{MissingTarget, TargetProcess};
 use super::supervise::{Denial, Denials};
 use crate::paths::PathCoverage;
 use crate::policy::{AccessPolicy, UnixSocketAccess};
-use crate::trap::{NetworkOperation, Trap};
+use crate::trap::NetworkOperation;
 use nix::sys::stat::fstat;
 use std::env;
 use std::ffi::OsStr;
@@ -158,7 +158,6 @@ impl TargetSocket {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn deny(
         self,
         operation: NetworkOperation,
@@ -166,20 +165,14 @@ impl TargetSocket {
         pid: u32,
         call: SocketAddrCall,
         denials: &mut Denials<'_>,
-        query_enabled: bool,
-        next_query_id: &mut u64,
     ) -> SysResult<NotificationResult> {
         let target = endpoint.addr.to_string();
         let process = TargetProcess::from_raw(pid).context();
-        if query_enabled {
-            let qid = *next_query_id;
-            *next_query_id += 1;
-            let trap = Trap::network(operation, target, process, Some(qid));
-            let grant = Grant::from(SocketGrant::new(self, call));
-            return Ok(NotificationResult::query(qid, trap, Some(grant)));
-        }
-        denials.record(Denial::Network(operation, target, process));
-        Err(BrokerError::PolicyDenied)
+        denials.deny(
+            Denial::Network(operation, target, process),
+            true,
+            Some(Grant::from(SocketGrant::new(self, call))),
+        )
     }
 }
 
@@ -187,8 +180,6 @@ pub(super) fn handle_bind(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
     denials: &mut Denials<'_>,
-    query_enabled: bool,
-    next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
     let socket = TargetSocket::try_from(request)?;
 
@@ -208,8 +199,6 @@ pub(super) fn handle_bind(
                         request.pid,
                         libc::bind,
                         denials,
-                        query_enabled,
-                        next_query_id,
                     );
                 }
                 return Err(BrokerError::PolicyDenied);
@@ -222,8 +211,6 @@ pub(super) fn handle_bind(
                     request.pid,
                     libc::bind,
                     denials,
-                    query_enabled,
-                    next_query_id,
                 );
             }
 
@@ -248,8 +235,6 @@ pub(super) fn handle_connect(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
     denials: &mut Denials<'_>,
-    query_enabled: bool,
-    next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
     let socket = TargetSocket::try_from(request)?;
 
@@ -272,8 +257,6 @@ pub(super) fn handle_connect(
                     request.pid,
                     libc::connect,
                     denials,
-                    query_enabled,
-                    next_query_id,
                 );
             }
 
@@ -300,8 +283,6 @@ pub(super) fn handle_connect(
                     request.pid,
                     libc::connect,
                     denials,
-                    query_enabled,
-                    next_query_id,
                 );
             }
 
@@ -490,7 +471,7 @@ fn handle_unix_bind(
         anchor.target.as_ref().map(AsFd::as_fd),
     )?;
     if policy
-        .write_reason(&target.label, &target.raw, true)
+        .write_reason(&target.label, &target.lexical, true)
         .is_some()
     {
         return Err(BrokerError::PolicyDenied);

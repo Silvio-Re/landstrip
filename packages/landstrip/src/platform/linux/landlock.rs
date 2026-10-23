@@ -29,7 +29,6 @@ const TARGET_ABI: ABI = ABI::V7;
 
 pub(super) struct LandlockRuleset {
     created: RulesetCreated,
-    handled_access_fs: BitFlags<AccessFs>,
     handled_access_net: BitFlags<AccessNet>,
 }
 
@@ -37,8 +36,6 @@ impl TryFrom<&AccessPolicy> for LandlockRuleset {
     type Error = Error;
 
     fn try_from(policy: &AccessPolicy) -> std::result::Result<Self, Self::Error> {
-        let handled_access_fs = AccessFs::from_write(TARGET_ABI);
-
         let mut handled_access_net = BitFlags::<AccessNet>::empty();
         if policy.network_access.restricts_connect_tcp() {
             handled_access_net |= AccessNet::ConnectTcp;
@@ -48,7 +45,7 @@ impl TryFrom<&AccessPolicy> for LandlockRuleset {
         }
 
         let mut ruleset = Ruleset::default()
-            .handle_access(handled_access_fs)
+            .handle_access(AccessFs::from_write(TARGET_ABI))
             .map_err(Error::landlock)?;
         if !handled_access_net.is_empty() {
             ruleset = ruleset
@@ -64,7 +61,7 @@ impl TryFrom<&AccessPolicy> for LandlockRuleset {
             .map_err(Error::landlock)?;
         let mut created = ruleset.create().map_err(Error::landlock)?;
 
-        created = Self::add_path_rules(created, &policy.write_roots, handled_access_fs)?;
+        created = Self::add_path_rules(created, &policy.write_roots)?;
 
         if !handled_access_net.is_empty() {
             created = Self::add_network_rules(created, policy)?;
@@ -72,7 +69,6 @@ impl TryFrom<&AccessPolicy> for LandlockRuleset {
 
         Ok(Self {
             created,
-            handled_access_fs,
             handled_access_net,
         })
     }
@@ -82,7 +78,6 @@ impl LandlockRuleset {
     pub(super) fn enforce(self) -> Result<()> {
         let Self {
             created,
-            handled_access_fs,
             handled_access_net,
         } = self;
         let status = created.restrict_self().map_err(Error::landlock)?;
@@ -90,11 +85,7 @@ impl LandlockRuleset {
             RulesetStatus::FullyEnforced => {}
             RulesetStatus::PartiallyEnforced => log::debug!(
                 "{}",
-                Self::partial_enforcement_warning(
-                    status.landlock,
-                    handled_access_fs,
-                    handled_access_net,
-                )
+                Self::partial_enforcement_warning(status.landlock, handled_access_net)
             ),
             RulesetStatus::NotEnforced => {
                 return Err(Error::landlock(
@@ -119,7 +110,6 @@ impl LandlockRuleset {
 
     fn partial_enforcement_warning(
         status: LandlockStatus,
-        handled_access_fs: BitFlags<AccessFs>,
         handled_access_net: BitFlags<AccessNet>,
     ) -> String {
         let LandlockStatus::Available { effective_abi, .. } = status else {
@@ -134,7 +124,7 @@ impl LandlockRuleset {
             (AccessFs::Truncate, "filesystem TRUNCATE"),
             (AccessFs::IoctlDev, "filesystem IOCTL_DEV"),
         ] {
-            if handled_access_fs.contains(access) && !supported_fs.contains(access) {
+            if !supported_fs.contains(access) {
                 missing.push(name);
             }
         }
@@ -169,8 +159,8 @@ impl LandlockRuleset {
     fn add_path_rules(
         mut ruleset: RulesetCreated,
         paths: &[PathBuf],
-        access: BitFlags<AccessFs>,
     ) -> std::result::Result<RulesetCreated, Error> {
+        let access = AccessFs::from_write(TARGET_ABI);
         for path in paths {
             let fd = match open(path, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty())
                 .map_err(io::Error::from)

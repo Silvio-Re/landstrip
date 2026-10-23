@@ -42,6 +42,41 @@ impl OpenHow {
         let fd = RawFd::try_from(fd).map_err(|_| BrokerError::syscall(libc::EMFILE))?;
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
+
+    fn validate(&self) -> SysResult<()> {
+        match self.openat2(libc::AT_FDCWD, c"") {
+            Err(BrokerError::SystemCall {
+                errno: libc::ENOENT,
+            }) => Ok(()),
+            Err(err) => Err(err),
+            Ok(_) => Err(BrokerError::syscall(libc::EIO)),
+        }
+    }
+}
+
+impl TryFrom<&[u8]> for OpenHow {
+    type Error = BrokerError;
+
+    fn try_from(buf: &[u8]) -> SysResult<Self> {
+        if buf.len() < OPEN_HOW_SIZE {
+            return Err(BrokerError::InvalidAddress);
+        }
+        if buf[OPEN_HOW_SIZE..].iter().any(|byte| *byte != 0) {
+            return Err(BrokerError::SystemCall { errno: libc::E2BIG });
+        }
+
+        let how = Self {
+            flags: u64::from_ne_bytes(buf[0..8].try_into().map_err(|_| BrokerError::BadAddress)?),
+            mode: u64::from_ne_bytes(buf[8..16].try_into().map_err(|_| BrokerError::BadAddress)?),
+            resolve: u64::from_ne_bytes(
+                buf[16..24]
+                    .try_into()
+                    .map_err(|_| BrokerError::BadAddress)?,
+            ),
+        };
+        how.validate()?;
+        Ok(how)
+    }
 }
 
 pub(super) enum Grant {
@@ -157,7 +192,7 @@ impl OpenGrant {
             return Err(BrokerError::syscall(libc::EOPNOTSUPP));
         }
         let mut anchor = resolved.anchor.take().ok_or_else(|| {
-            if resolved.raw.as_os_str().as_bytes().ends_with(b"/") && flags & libc::O_CREAT != 0 {
+            if resolved.trailing_slash && flags & libc::O_CREAT != 0 {
                 BrokerError::syscall(libc::EISDIR)
             } else {
                 BrokerError::syscall(libc::ENOENT)
