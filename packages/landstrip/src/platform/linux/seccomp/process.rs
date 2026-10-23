@@ -376,6 +376,7 @@ pub(super) enum MissingTarget {
 pub(super) struct ResolvedPath {
     pub(super) raw: PathBuf,
     pub(super) label: PathBuf,
+    pub(super) anonymous: bool,
     pub(super) anchor: Option<super::grant::Anchor>,
     pub(super) root: OwnedFd,
 }
@@ -393,7 +394,7 @@ impl ResolvedPath {
 pub(super) struct TargetFilesystem<'a> {
     process: &'a TargetProcess,
     pub(super) root: OwnedFd,
-    root_label: PathBuf,
+    pub(super) root_label: PathBuf,
 }
 
 impl TargetFilesystem<'_> {
@@ -592,6 +593,7 @@ impl TargetFilesystem<'_> {
                         return Ok(ResolvedPath {
                             raw,
                             label: crate::paths::normalize_path_lexically(&label),
+                            anonymous: false,
                             anchor: None,
                             root: self.root.try_clone()?,
                         });
@@ -628,6 +630,9 @@ impl TargetFilesystem<'_> {
                             }
                             if let Some(target) = self.proc_magic(parent.as_fd(), &component)? {
                                 if !pending.is_empty() {
+                                    if fstat(&target)?.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                                        return Err(BrokerError::syscall(libc::ENOTDIR));
+                                    }
                                     dirs = self.directory_stack(target.as_fd())?;
                                     continue;
                                 }
@@ -637,9 +642,19 @@ impl TargetFilesystem<'_> {
                                 {
                                     return Err(BrokerError::syscall(libc::ENOTDIR));
                                 }
+                                let (label, anonymous) =
+                                    match fd_label_under_root(&self.root_label, target.as_fd())? {
+                                        Some(label) => (label, false),
+                                        None => (
+                                            self.label(parent.as_fd())?
+                                                .join(OsStr::from_bytes(name.as_bytes())),
+                                            true,
+                                        ),
+                                    };
                                 return Ok(ResolvedPath {
                                     raw,
-                                    label: self.label(target.as_fd())?,
+                                    label,
+                                    anonymous,
                                     anchor: Some(super::grant::Anchor {
                                         dir: parent.try_clone()?,
                                         name,
@@ -703,6 +718,7 @@ impl TargetFilesystem<'_> {
             return Ok(ResolvedPath {
                 raw,
                 label,
+                anonymous: false,
                 anchor: Some(super::grant::Anchor {
                     dir: parent.try_clone()?,
                     name,
@@ -742,13 +758,20 @@ fn same_object(left: BorrowedFd<'_>, right: BorrowedFd<'_>) -> SysResult<bool> {
     Ok(identity(left)? == identity(right)?)
 }
 
-pub(super) fn label_under_root(root: &Path, fd: BorrowedFd<'_>) -> SysResult<PathBuf> {
+pub(super) fn fd_label_under_root(root: &Path, fd: BorrowedFd<'_>) -> SysResult<Option<PathBuf>> {
     let label = super::grant::open_fd_path(fd)?;
-    if !label.is_absolute() || label.as_os_str().as_bytes().ends_with(b" (deleted)") {
+    if !label.is_absolute() {
+        return Ok(None);
+    }
+    if label.as_os_str().as_bytes().ends_with(b" (deleted)") {
         return Err(BrokerError::syscall(libc::EACCES));
     }
     let relative = label
         .strip_prefix(root)
         .map_err(|_| BrokerError::syscall(libc::EXDEV))?;
-    Ok(Path::new("/").join(relative))
+    Ok(Some(Path::new("/").join(relative)))
+}
+
+pub(super) fn label_under_root(root: &Path, fd: BorrowedFd<'_>) -> SysResult<PathBuf> {
+    fd_label_under_root(root, fd)?.ok_or_else(|| BrokerError::syscall(libc::EACCES))
 }

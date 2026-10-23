@@ -5,7 +5,7 @@ use super::error::{BrokerError, SysResult};
 use super::fs::SYS_FCHMODAT2;
 use super::network::{SocketAddrCall, TargetSocket};
 use super::notify::{NotificationChannel, NotificationResponse};
-use super::process::{ResolvedPath, label_under_root};
+use super::process::{ResolvedPath, fd_label_under_root, label_under_root};
 use crate::error::Error as LandstripError;
 use crate::policy::AccessPolicy;
 use nix::errno::Errno;
@@ -234,7 +234,10 @@ impl OpenGrant {
 
     fn check_policy(&self, policy: &AccessPolicy, fd: BorrowedFd<'_>) -> SysResult<()> {
         let root = open_fd_path(self.root.as_fd())?;
-        self.check_label(policy, &label_under_root(&root, fd)?)
+        if let Some(label) = fd_label_under_root(&root, fd)? {
+            self.check_label(policy, &label)?;
+        }
+        Ok(())
     }
 
     fn check_label(&self, policy: &AccessPolicy, label: &Path) -> SysResult<()> {

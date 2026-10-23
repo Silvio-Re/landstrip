@@ -7,7 +7,7 @@ use super::grant::{
     PathMutation, open_path,
 };
 use super::notify::NotificationResult;
-use super::process::{MissingTarget, ResolvedPath, TargetProcess};
+use super::process::{MissingTarget, ResolvedPath, TargetProcess, fd_label_under_root};
 use super::supervise::{Denial, Denials};
 use crate::paths::normalize_path_lexically;
 use crate::policy::{AccessPolicy, DenialReason};
@@ -564,7 +564,7 @@ fn resolve_open_target(
     dirfd: i32,
     path: &Path,
     open: &Open,
-) -> SysResult<(PathBuf, PathBuf, SysResult<OpenGrant>)> {
+) -> SysResult<(PathBuf, PathBuf, bool, SysResult<OpenGrant>)> {
     let filesystem = process.filesystem()?;
     let follow = open.flags & libc::O_NOFOLLOW == 0
         && open.flags & (libc::O_CREAT | libc::O_EXCL) != (libc::O_CREAT | libc::O_EXCL);
@@ -576,8 +576,9 @@ fn resolve_open_target(
     let resolved = filesystem.resolve(dirfd, path, follow, missing, open.resolve)?;
     let raw = resolved.raw.clone();
     let label = resolved.label.clone();
+    let anonymous = resolved.anonymous;
     let grant = OpenGrant::new(resolved, open.flags, open.mode, open.resolve);
-    Ok((raw, label, grant))
+    Ok((raw, label, anonymous, grant))
 }
 
 pub(super) fn handle_openat(
@@ -597,7 +598,7 @@ pub(super) fn handle_openat(
         syscall,
     } = OpenRequest::try_from(request)?;
 
-    let (raw, resolved, open_grant) = resolve_open_target(
+    let (raw, resolved, anonymous, open_grant) = resolve_open_target(
         &process,
         dirfd,
         &path,
@@ -626,7 +627,7 @@ pub(super) fn handle_openat(
 
     if wants_write
         && !hard_read_denied
-        && let Some(reason) = policy.write_reason(&resolved, &lexical, true)
+        && let Some(reason) = policy.write_reason(&resolved, &lexical, !anonymous)
     {
         return deny_open(
             OpenDenial {
@@ -933,7 +934,6 @@ fn handle_fd_mutation(
 
     let target = mutation_target_fd(&process, args[0].to_i32(), spec.kind)?;
     let filesystem = process.filesystem()?;
-    let requested_path = filesystem.label(target.as_fd())?;
     let mutation = match spec.kind {
         MutationSyscall::Fchmod => FdMutation::Chmod {
             mode: args[1].to_u32(),
@@ -967,6 +967,12 @@ fn handle_fd_mutation(
                 errno: libc::EINVAL,
             });
         }
+    };
+    let Some(requested_path) = fd_label_under_root(&filesystem.root_label, target.as_fd())? else {
+        return Ok(NotificationResult::grant(MutationGrant::Fd {
+            target,
+            mutation,
+        }));
     };
     let resolved = requested_path.clone();
     let lexical = normalize_path_lexically(&requested_path);
@@ -1024,6 +1030,7 @@ impl MutationSyscall {
                     ResolvedPath {
                         raw: resolved.raw.clone(),
                         label: resolved.label.clone(),
+                        anonymous: false,
                         anchor: Some(at),
                         root: resolved.root.try_clone()?,
                     },
