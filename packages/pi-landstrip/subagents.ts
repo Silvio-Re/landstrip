@@ -3301,12 +3301,12 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
         const durationSec = taskDuration(taskDetails(task)) ?? '';
         const exitMsg =
-          task.exitCode !== undefined && task.exitCode !== null
-            ? task.exitCode === 0
-              ? 'completed'
-              : `failed (exit ${task.exitCode})`
-            : task.state === 'cancelled'
-              ? 'cancelled'
+          task.state === 'cancelled'
+            ? 'cancelled'
+            : task.exitCode !== undefined && task.exitCode !== null
+              ? task.exitCode === 0
+                ? 'completed'
+                : `failed (exit ${task.exitCode})`
               : 'error';
         this.recentCompletions.set(taskId, {
           label: task.description,
@@ -4311,19 +4311,21 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     } catch (error) {
       if (this.shuttingDown || task.delivered || this.foregroundClaims.has(task.id)) return;
       const message = formatError(error);
+      const cancelled = task.state === 'cancelled';
+      const status = cancelled ? 'cancelled' : 'failed';
       const durationSec = taskDuration(taskDetails(task)) ?? '';
       this.recentCompletions.set(task.id, {
         label: task.description,
-        status: task.state === 'cancelled' ? 'cancelled' : 'error',
-        text: `@${task.agent}: ${task.description} failed (${durationSec})`,
+        status: cancelled ? 'cancelled' : 'error',
+        text: `@${task.agent}: ${task.description} ${status} (${durationSec})`,
         finishedAt: Date.now(),
       });
       const delivered = await this.deliverBackground(
         task,
-        `Background task failed: ${task.description}\n\n${renderTaskResult(task.id, 'error', message)}`,
+        `Background task ${status}: ${task.description}\n\n${renderTaskResult(task.id, task.state, message)}`,
       );
       if (!delivered) return;
-      ctx.ui.notify(`Background task failed: ${task.description}`, 'error');
+      ctx.ui.notify(`Background task ${status}: ${task.description}`, cancelled ? 'info' : 'error');
       task.delivered = true;
       this.persist(task);
       this.notifyTaskUpdate();
@@ -4440,9 +4442,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
   private abortTaskProcess(taskId: string): void {
     const running = this.running.get(taskId);
     if (running) {
-      try {
-        running.rpc.abort();
-      } catch {}
+      void running.rpc.abort().catch(() => undefined);
     }
     const controller = this.controllers.get(taskId);
     if (controller) {

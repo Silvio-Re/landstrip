@@ -365,9 +365,13 @@ impl Settings {
         // fail-closed because sandbox SIDs receive no access to those paths.
         #[cfg(target_os = "windows")]
         retain_windows_allow_roots(&mut write_allow);
-        let mut resolved_write_deny = resolver.resolve_deny_paths(&filesystem.deny_write)?;
+        // Linux mediates denyWrite globs dynamically; expanding them here can scan
+        // an entire project before even starting a simple command.
+        let mut resolved_write_deny =
+            resolver.resolve_deny_paths(&filesystem.deny_write, !cfg!(target_os = "linux"))?;
         let mut write_denied_links = resolver.collect_symlink_ancestors(&filesystem.deny_write)?;
-        let resolved_write_always = resolver.resolve_deny_paths(&filesystem.deny_write_always)?;
+        let resolved_write_always =
+            resolver.resolve_deny_paths(&filesystem.deny_write_always, true)?;
         let write_always_links =
             resolver.collect_symlink_ancestors(&filesystem.deny_write_always)?;
         resolved_write_deny.merge_always(&resolved_write_always, &mut write_allow);
@@ -384,10 +388,11 @@ impl Settings {
         let mut read_allow = resolver.resolve_paths(&filesystem.allow_read)?;
         #[cfg(target_os = "windows")]
         retain_windows_allow_roots(&mut read_allow);
-        let mut resolved_read_deny = resolver.resolve_deny_paths(&filesystem.deny_read)?;
+        let mut resolved_read_deny = resolver.resolve_deny_paths(&filesystem.deny_read, true)?;
         let mut read_denied_roots =
             effective_denied_roots(&resolved_read_deny.concrete, &read_allow);
-        let resolved_read_always = resolver.resolve_deny_paths(&filesystem.deny_read_always)?;
+        let resolved_read_always =
+            resolver.resolve_deny_paths(&filesystem.deny_read_always, true)?;
         let read_carveouts = resolved_read_deny.carveouts(&resolved_read_always, &read_allow);
         resolved_read_deny.merge_always(&resolved_read_always, &mut read_allow);
         let read_deny = resolved_read_deny.concrete;
@@ -722,7 +727,11 @@ impl PolicyResolver {
         Ok(resolved)
     }
 
-    fn resolve_deny_paths(&self, paths: &[PathSelector]) -> Result<ResolvedDenyPaths> {
+    fn resolve_deny_paths(
+        &self,
+        paths: &[PathSelector],
+        expand_globs: bool,
+    ) -> Result<ResolvedDenyPaths> {
         let mut concrete: Vec<PathBuf> = Vec::new();
         let mut patterns: Vec<String> = Vec::new();
 
@@ -730,8 +739,10 @@ impl PolicyResolver {
             let resolved = self.resolve_sandbox_path(selector.as_str())?;
             let resolved_str = resolved.to_string_lossy();
             if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
-                for candidate in GlobPattern::new(&resolved_str).expand()? {
-                    push_path_variants(&mut concrete, &candidate);
+                if expand_globs {
+                    for candidate in GlobPattern::new(&resolved_str).expand()? {
+                        push_path_variants(&mut concrete, &candidate);
+                    }
                 }
                 patterns.push(resolved_str.clone().into_owned());
                 let base = GlobPattern::new(&resolved_str).base();

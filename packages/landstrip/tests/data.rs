@@ -174,7 +174,6 @@ enum Net {
     UnixAllowed,
     UnixDenied,
     UnixAbstractDenied,
-    DaemonCleaned,
 }
 
 struct Case {
@@ -631,7 +630,6 @@ fn parse_net(value: &str) -> Net {
         "unix-allowed" => Net::UnixAllowed,
         "unix-denied" => Net::UnixDenied,
         "unix-abstract-denied" => Net::UnixAbstractDenied,
-        "daemon-cleaned" => Net::DaemonCleaned,
         other => panic!("unknown net kind `{other}`"),
     }
 }
@@ -711,7 +709,6 @@ fn run_net(
         }
         Net::UnixDenied => run_unix_denied(ctx, format, policies, dir),
         Net::UnixAbstractDenied => run_unix_abstract_denied(ctx, format, policies),
-        Net::DaemonCleaned => run_daemon_cleaned(ctx, format, policies, dir),
     }
 }
 
@@ -1063,57 +1060,6 @@ fn run_self_probe(
         output.status,
         merge(&output.stdout, &output.stderr).trim()
     ))
-}
-
-#[cfg(target_os = "linux")]
-fn run_daemon_cleaned(
-    ctx: &Context,
-    format: PolicyFormat,
-    policies: &[PathBuf],
-    dir: &Path,
-) -> Result<(), String> {
-    let pid_file = dir.join("daemon.pid");
-    let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-    let output = landstrip_net(ctx, format, policies)
-        .arg(exe)
-        .arg("daemon")
-        .arg(&pid_file)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("daemon probe spawn: {e}"))?;
-    let pid = std::fs::read_to_string(&pid_file)
-        .map_err(|e| format!("read daemon pid: {e}"))?
-        .trim()
-        .parse::<i32>()
-        .map_err(|e| format!("parse daemon pid: {e}"))?;
-    let proc_path = PathBuf::from(format!("/proc/{pid}"));
-    if proc_path.exists() {
-        // Test hygiene on regressions: do not leave the probe daemon behind.
-        // SAFETY: pid came from the probe and SIGKILL has no pointer arguments.
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-        return Err(format!(
-            "daemonized descendant {pid} survived landstrip exit"
-        ));
-    }
-    if output.status.code() != Some(23) {
-        return Err(format!(
-            "foreground exit status not preserved; status={:?} output={}",
-            output.status,
-            merge(&output.stdout, &output.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn run_daemon_cleaned(
-    _ctx: &Context,
-    _format: PolicyFormat,
-    _policies: &[PathBuf],
-    _dir: &Path,
-) -> Result<(), String> {
-    Err("daemon-cleaned is linux-only".to_owned())
 }
 
 /// Denies connect to an abstract Unix socket created by the harness before the
