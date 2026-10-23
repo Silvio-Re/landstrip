@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use super::{
-    AppContainerProfile, LookupRoots, ProcThreadAttributeList, current_process_in_job,
-    update_attribute,
-};
+use super::{AppContainerProfile, LookupRoots, ProcThreadAttributeList, current_process_in_job};
 use crate::config::AppContainerMode;
 use crate::error::Mechanism;
 use crate::outcome::WindowsStatusReport;
@@ -64,25 +61,16 @@ fn probe(mode: AppContainerMode) -> Result<()> {
         CapabilityCount: 0,
         Reserved: 0,
     };
-    update_attribute(
-        attributes.as_mut_ptr(),
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-        (&raw mut capabilities).cast(),
-        mem::size_of_val(&capabilities),
+    attributes.update(
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+        &mut capabilities,
     )?;
-    update_attribute(
-        attributes.as_mut_ptr(),
-        PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-        (&raw mut job_handle).cast(),
-        mem::size_of_val(&job_handle),
-    )?;
+    attributes.update(PROC_THREAD_ATTRIBUTE_JOB_LIST, &mut job_handle)?;
     let mut all_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
     if mode == AppContainerMode::Lpac {
-        update_attribute(
-            attributes.as_mut_ptr(),
-            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
-            (&raw mut all_packages_policy).cast(),
-            mem::size_of_val(&all_packages_policy),
+        attributes.update(
+            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+            &mut all_packages_policy,
         )?;
     }
     let mut startup = STARTUPINFOEXW {

@@ -841,38 +841,22 @@ fn create_process_in_appcontainer(
     };
     let mut all_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
-    update_attribute(
-        attribute_list.as_mut_ptr(),
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-        (&raw mut capabilities).cast(),
-        mem::size_of::<SECURITY_CAPABILITIES>(),
+    attribute_list.update(
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+        &mut capabilities,
     )?;
     if app_container_mode == AppContainerMode::Lpac {
-        update_attribute(
-            attribute_list.as_mut_ptr(),
-            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
-            (&raw mut all_packages_policy).cast(),
-            mem::size_of::<u32>(),
+        attribute_list.update(
+            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+            &mut all_packages_policy,
         )?;
     }
-    update_attribute(
-        attribute_list.as_mut_ptr(),
-        PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-        (&raw mut job_handle).cast(),
-        mem::size_of::<HANDLE>(),
-    )?;
-    update_attribute(
-        attribute_list.as_mut_ptr(),
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-        inherited_handles.as_mut_ptr().cast(),
-        mem::size_of_val(&inherited_handles),
-    )?;
+    attribute_list.update(PROC_THREAD_ATTRIBUTE_JOB_LIST, &mut job_handle)?;
+    attribute_list.update_slice(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &mut inherited_handles)?;
     if mitigation_policy != 0 {
-        update_attribute(
-            attribute_list.as_mut_ptr(),
-            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
-            (&raw mut mitigation_policy).cast(),
-            mem::size_of::<u64>(),
+        attribute_list.update(
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+            &mut mitigation_policy,
         )?;
     }
 
@@ -970,33 +954,6 @@ fn create_process(
     Ok(process_info)
 }
 
-fn update_attribute(
-    list: LPPROC_THREAD_ATTRIBUTE_LIST,
-    attribute: usize,
-    value: *mut c_void,
-    size: usize,
-) -> Result<()> {
-    let ok = unsafe {
-        UpdateProcThreadAttribute(
-            list,
-            0,
-            attribute,
-            value,
-            size,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(LandstripError::sandbox_setup(
-            Mechanism::Appcontainer,
-            io::Error::last_os_error(),
-        )
-        .into());
-    }
-    Ok(())
-}
-
 struct ProcThreadAttributeList {
     storage: Vec<u8>,
 }
@@ -1031,6 +988,40 @@ impl ProcThreadAttributeList {
 
     fn as_mut_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
         self.storage.as_mut_ptr().cast()
+    }
+
+    fn update<T>(&mut self, attribute: u32, value: &mut T) -> Result<()> {
+        self.update_raw(attribute, (&raw mut *value).cast(), mem::size_of::<T>())
+    }
+
+    fn update_slice<T>(&mut self, attribute: u32, values: &mut [T]) -> Result<()> {
+        self.update_raw(
+            attribute,
+            values.as_mut_ptr().cast(),
+            mem::size_of_val(values),
+        )
+    }
+
+    fn update_raw(&mut self, attribute: u32, value: *mut c_void, size: usize) -> Result<()> {
+        let ok = unsafe {
+            UpdateProcThreadAttribute(
+                self.as_mut_ptr(),
+                0,
+                attribute as usize,
+                value,
+                size,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Appcontainer,
+                io::Error::last_os_error(),
+            )
+            .into());
+        }
+        Ok(())
     }
 }
 
