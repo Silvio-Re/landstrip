@@ -52,8 +52,8 @@ function createMockExtensionAPI() {
         if (idx !== -1) list.splice(idx, 1);
       };
     },
-    sendMessage(message: any) {
-      messages.push(message);
+    sendMessage(message: any, options?: any) {
+      messages.push({ message, options });
     },
     appendEntry(customType: string, data: any) {
       entries.push({ customType, data });
@@ -634,12 +634,12 @@ describe('Foreground vs Background Task Differentiation', () => {
 });
 
 describe('Background Subagent Lifecycle & Context Seeding', () => {
-  test('supports tasks wait, steer, bounded inspect slicing, and parent context seeding', async () => {
+  test('supports non-blocking background lifecycle, steer, bounded inspect slicing, and parent context seeding', async () => {
     const root = mkdtempSync(join(homedir(), '.pi-landstrip-test-'));
     try {
       vi.stubEnv('PI_CODING_AGENT_DIR', root);
       const mockApi = createMockExtensionAPI();
-      const integration = createLandstripIntegration({ registerBashTool: false, cwd: root });
+      const integration = createLandstripIntegration({ registerBashTool: true, cwd: root });
       const runtime = new SubagentRuntime(mockApi.api, integration);
       integration.setSubagentRuntime?.(runtime);
       integration.register(mockApi.api);
@@ -688,10 +688,18 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
         resolveRun = r;
       });
       (runtime as any).runPromises.set(bgTask.id, runPromise);
+      void (runtime as any).notifyWhenDone(bgTask, runPromise, ctx);
 
+      const bashTool = mockApi.tools.get('bash');
+      const taskTool = mockApi.tools.get('task');
       const tasksTool = mockApi.tools.get('tasks');
+      expect(bashTool?.promptGuidelines?.join('\n')).toContain(
+        'Do not sleep or poll tasks to wait',
+      );
+      expect(taskTool?.promptGuidelines?.join('\n')).toContain('Do not poll tasks to wait');
+      expect(tasksTool?.promptGuidelines?.join('\n')).toContain('not as a waiting primitive');
 
-      // Bounded inspect with offset + lines
+      // Bounded inspect with offset + lines and active background guidance
       const slicedInspect = await tasksTool.execute(
         'call-slice',
         {
@@ -705,6 +713,9 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
         ctx,
       );
       expect(slicedInspect.content[0].text).toContain('Step 3\nStep 4\nStep 5');
+      expect(slicedInspect.content[0].text).toContain(
+        'Next action: task is still active; do not poll inspect in a loop—end this turn and wait for the automatic completion follow-up turn.',
+      );
       expect(slicedInspect.content[0].text).not.toContain('Step 1');
       expect(slicedInspect.content[0].text).not.toContain('Step 6');
 
@@ -723,41 +734,22 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
       expect(steerRes.content[0].text).toContain('Steered task bg-lifec (@explore)');
       expect((runtime as any).pendingSteers.get(bgTask.id)).toEqual(['Focus on seccomp EACCES']);
 
-      // Wait with timeout while still running
-      const timeoutWait = await tasksTool.execute(
-        'call-wait-timeout',
-        {
-          action: 'wait',
-          task_id: 'bg-lifecycle',
-          timeout_ms: 20,
-        } satisfies TasksToolInput,
-        new AbortController().signal,
-        () => {},
-        ctx,
-      );
-      expect(timeoutWait.content[0].text).toContain('Wait: timed out (task still active)');
+      // Automatic follow-up turn delivery when background task completes
+      bgTask.state = 'completed';
+      bgTask.output = 'Completed audit.';
+      bgTask.finishedAt = Date.now();
+      resolveRun('Completed audit.');
+      await runPromise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
 
-      // Wait until completion
-      setTimeout(() => {
-        bgTask.state = 'completed';
-        bgTask.output = 'Completed audit.';
-        bgTask.finishedAt = Date.now();
-        resolveRun('Completed audit.');
-      }, 15);
-      const completedWait = await tasksTool.execute(
-        'call-wait-done',
-        {
-          action: 'wait',
-          task_id: 'bg-lifecycle',
-          timeout_ms: 2000,
-        } satisfies TasksToolInput,
-        new AbortController().signal,
-        () => {},
-        ctx,
-      );
-      expect(completedWait.content[0].text).toContain('State: completed');
-      expect(completedWait.content[0].text).toContain('Completed audit.');
-
+      expect(mockApi.messages).toContainEqual({
+        message: expect.objectContaining({
+          customType: 'landstrip.task.result',
+          content: expect.stringContaining('Completed audit.'),
+          details: { taskId: bgTask.id },
+        }),
+        options: { triggerTurn: true, deliverAs: 'followUp' },
+      });
       // Verify parent context projection helper used by include_context
       const seededPrompt = (runtime as any).withParentContext('Check line 55', ctx);
       expect(seededPrompt).toContain('<parent_context>');

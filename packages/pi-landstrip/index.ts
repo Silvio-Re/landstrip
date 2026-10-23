@@ -145,7 +145,8 @@ export const LandstripBashSchema = Type.Object({
   ),
   background: Type.Optional(
     Type.Boolean({
-      description: 'Run command asynchronously in the background and return a task ID',
+      description:
+        'Run command asynchronously in the background and return a task ID immediately; completion automatically triggers a follow-up turn',
     }),
   ),
   name: Type.Optional(
@@ -2664,6 +2665,10 @@ function createLandstripIntegrationWithPrompts(
       ...localBash,
       label: 'bash (landstrip)',
       description: 'Execute commands with the active Landstrip shell provider.',
+      promptGuidelines: [
+        ...(localBash.promptGuidelines ?? []),
+        'After launching a bash command with background: true, continue only independent work that does not wait on the command; otherwise end the current turn and wait for the automatic completion follow-up turn. Do not sleep or poll tasks to wait.',
+      ],
       parameters: LandstripBashSchema,
       renderCall(args, theme, context) {
         const bashArgs = args as LandstripBashInput;

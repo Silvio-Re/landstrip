@@ -332,7 +332,10 @@ const taskParameters = Type.Object({
   task_id: Type.Optional(Type.String({ description: 'Task ID to resume' })),
   command: Type.Optional(Type.String({ description: 'Originating command, if any' })),
   background: Type.Optional(
-    Type.Boolean({ description: 'Return immediately and run in background' }),
+    Type.Boolean({
+      description:
+        'Return immediately and run in background; completion automatically triggers a follow-up turn',
+    }),
   ),
   include_context: Type.Optional(
     Type.Boolean({
@@ -341,24 +344,23 @@ const taskParameters = Type.Object({
   ),
 });
 
+const BACKGROUND_LAUNCH_GUIDANCE = [
+  'Terminal notification: enabled.',
+  'Automatic follow-up turn: enabled.',
+  'Next action: do not poll or sleep to wait; continue only independent useful work, otherwise end this turn and wait for the completion notification.',
+].join('\n');
+
 export const TasksToolSchema = Type.Object({
   action: Type.Union(
-    [
-      Type.Literal('list'),
-      Type.Literal('inspect'),
-      Type.Literal('wait'),
-      Type.Literal('steer'),
-      Type.Literal('cancel'),
-    ],
+    [Type.Literal('list'), Type.Literal('inspect'), Type.Literal('steer'), Type.Literal('cancel')],
     {
       description:
-        'Task management action: "list" to view task sessions, "inspect" for status/output, "wait" to await completion, "steer" to guide a running subagent, or "cancel" to stop an active task',
+        'Task management action: "list" to view task sessions, "inspect" for point-in-time status/output, "steer" to guide a running subagent, or "cancel" to stop an active task',
     },
   ),
   task_id: Type.Optional(
     Type.String({
-      description:
-        'Task ID or unique prefix (required for "inspect", "wait", "steer", and "cancel")',
+      description: 'Task ID or unique prefix (required for "inspect", "steer", and "cancel")',
     }),
   ),
   mode: Type.Optional(
@@ -386,20 +388,13 @@ export const TasksToolSchema = Type.Object({
     Type.Integer({
       minimum: 1,
       maximum: 500,
-      description: 'Number of transcript lines to return for "inspect" or "wait" (default 100)',
+      description: 'Number of transcript lines to return for "inspect" (default 100)',
     }),
   ),
   offset: Type.Optional(
     Type.Integer({
       minimum: 0,
       description: '0-indexed starting line offset for "inspect" (omit for tail)',
-    }),
-  ),
-  timeout_ms: Type.Optional(
-    Type.Integer({
-      minimum: 1,
-      maximum: 600000,
-      description: 'Optional timeout in milliseconds for "wait"',
     }),
   ),
   message: Type.Optional(
@@ -409,13 +404,12 @@ export const TasksToolSchema = Type.Object({
   ),
 });
 export type TasksToolInput = {
-  action: 'list' | 'inspect' | 'wait' | 'steer' | 'cancel';
+  action: 'list' | 'inspect' | 'steer' | 'cancel';
   task_id?: string;
   mode?: 'all' | 'background' | 'foreground';
   state?: TaskState;
   lines?: number;
   offset?: number;
-  timeout_ms?: number;
   message?: string;
 };
 
@@ -1467,6 +1461,10 @@ export function registerSubagentWorker(pi: ExtensionAPI, config: WorkerConfig): 
       name: 'task',
       label: 'Task',
       description: 'Delegate a task to a Pi subagent process.',
+      promptSnippet: 'Delegate a task to a sandboxed Pi subagent process',
+      promptGuidelines: [
+        'After launching a task with background: true, continue only independent work that does not wait on the subagent; otherwise end the current turn and wait for the automatic completion follow-up turn. Do not poll tasks to wait.',
+      ],
       parameters: taskParameters,
       executionMode: 'parallel',
       async execute(_id, input, signal, _onUpdate, ctx) {
@@ -3071,7 +3069,14 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     return {
       name: 'tasks',
       label: 'Tasks',
-      description: 'Inspect, list, and cancel background tasks and subagents managed by Landstrip.',
+      description:
+        'Inspect, list, steer, and cancel background tasks and subagents managed by Landstrip. Point-in-time management only, not a waiting primitive; background tasks automatically notify and trigger a follow-up turn when done.',
+      promptSnippet:
+        'Inspect, list, steer, or cancel background tasks and subagents without polling',
+      promptGuidelines: [
+        'Use tasks for point-in-time inspection, steering, or cancellation, not as a waiting primitive.',
+        'Do not poll tasks with list or inspect while waiting for a background task to finish; completion automatically triggers a follow-up turn.',
+      ],
       parameters: TasksToolSchema,
       executionMode: 'parallel',
       renderCall: (input, theme) => {
@@ -3083,7 +3088,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           0,
         );
       },
-      execute: async (_toolCallId, input, signal, _onUpdate, callCtx) => {
+      execute: async (_toolCallId, input, _signal, _onUpdate, callCtx) => {
         const ctx = boundCtx ?? callCtx;
         if (!ctx) throw new Error('Task context is unavailable');
         const action = input.action;
@@ -3096,7 +3101,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             throw new Error(`Task ID prefix "${input.task_id}" matches ${matched.length} tasks`);
           return matched[0]!;
         };
-        const formatInspectResult = (task: TaskRecord, timedOut = false) => {
+        const formatInspectResult = (task: TaskRecord) => {
           const details = taskDetails(task);
           const transcript = taskTranscript(task);
           const maxLines = Math.max(1, Math.min(500, input.lines ?? 100));
@@ -3106,11 +3111,14 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               : transcript.slice(-maxLines);
           const outputText = sliced.join('\n');
           const modeLabel = details.background ? 'background' : 'foreground';
-          const timeoutNote = timedOut ? '\nWait: timed out (task still active)' : '';
+          const activeGuidance =
+            details.background && (details.state === 'queued' || details.state === 'running')
+              ? '\nNext action: task is still active; do not poll inspect in a loop—end this turn and wait for the automatic completion follow-up turn.'
+              : '';
           const header =
             task.kind === 'command'
-              ? `$ bash ${task.command ?? task.description}\nMode: ${modeLabel}\nCWD: ${task.cwd}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nExit code: ${details.exitCode ?? 'none'}${timeoutNote}`
-              : `@${task.agent}: ${task.description}\nMode: ${modeLabel}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nTool calls: ${task.toolCalls ?? 0}${timeoutNote}`;
+              ? `$ bash ${task.command ?? task.description}\nMode: ${modeLabel}\nCWD: ${task.cwd}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nExit code: ${details.exitCode ?? 'none'}${activeGuidance}`
+              : `@${task.agent}: ${task.description}\nMode: ${modeLabel}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nTool calls: ${task.toolCalls ?? 0}${activeGuidance}`;
           return {
             content: [
               { type: 'text' as const, text: `${header}\n\nRecent Output:\n${outputText}` },
@@ -3151,50 +3159,6 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         if (action === 'inspect') {
           const task = resolveSingleTask('inspect');
           return formatInspectResult(task);
-        }
-        if (action === 'wait') {
-          const task = resolveSingleTask('wait');
-          let timedOut = false;
-          const runPromise = this.runPromises.get(task.id);
-          if (runPromise && (task.state === 'queued' || task.state === 'running')) {
-            const waiters: Array<Promise<void>> = [
-              runPromise.then(
-                () => undefined,
-                () => undefined,
-              ),
-            ];
-            let timer: ReturnType<typeof setTimeout> | undefined;
-            if (input.timeout_ms && input.timeout_ms > 0) {
-              waiters.push(
-                new Promise<void>((resolveWait) => {
-                  timer = setTimeout(() => {
-                    timedOut = true;
-                    resolveWait();
-                  }, input.timeout_ms);
-                }),
-              );
-            }
-            let onAbort: (() => void) | undefined;
-            if (signal) {
-              waiters.push(
-                new Promise<void>((_, rejectWait) => {
-                  if (signal.aborted) {
-                    rejectWait(new Error('Wait aborted'));
-                    return;
-                  }
-                  onAbort = () => rejectWait(new Error('Wait aborted'));
-                  signal.addEventListener('abort', onAbort, { once: true });
-                }),
-              );
-            }
-            try {
-              await Promise.race(waiters);
-            } finally {
-              if (timer !== undefined) clearTimeout(timer);
-              if (onAbort && signal) signal.removeEventListener('abort', onAbort);
-            }
-          }
-          return formatInspectResult(task, timedOut);
         }
         if (action === 'steer') {
           const task = resolveSingleTask('steer');
@@ -3385,7 +3349,13 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       content: [
         {
           type: 'text',
-          text: `Command launched in background.\nTask ID: ${taskId}\nOutput file: ${outputFile}\nUse /landstrip-subagents tasks to view live progress or cancel.`,
+          text: [
+            'Command launched in background.',
+            `Task ID: ${taskId}`,
+            `Output file: ${outputFile}`,
+            BACKGROUND_LAUNCH_GUIDANCE,
+            'Use /landstrip-subagents tasks to view live progress or cancel.',
+          ].join('\n'),
         },
       ],
       details: {
@@ -3422,6 +3392,10 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       description:
         'Delegate a task to a Pi subagent process.' +
         (descriptions ? `\n\nAvailable subagents:\n${descriptions}` : ''),
+      promptSnippet: 'Delegate a task to a sandboxed Pi subagent process',
+      promptGuidelines: [
+        'After launching a task with background: true, continue only independent work that does not wait on the subagent; otherwise end the current turn and wait for the automatic completion follow-up turn. Do not poll tasks to wait.',
+      ],
       parameters: taskParameters,
       executionMode: 'parallel',
       renderCall: (input, theme) => {
@@ -3606,7 +3580,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             void this.notifyWhenDone(task, existingRun, ctx);
           }
           const state = task.state === 'queued' ? 'queued' : 'running';
-          const status = state === 'queued' ? 'Background task queued' : 'Background task updated';
+          const status = `${state === 'queued' ? 'Background task queued' : 'Background task updated'}\n${BACKGROUND_LAUNCH_GUIDANCE}`;
           return { task, text: renderTaskResult(task.id, state, status), state };
         }
         this.claimForeground(task.id);
@@ -3668,7 +3642,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       void this.notifyWhenDone(task, run, ctx);
       return {
         task,
-        text: renderTaskResult(task.id, 'queued', 'Background task queued'),
+        text: renderTaskResult(
+          task.id,
+          'queued',
+          `Background task queued\n${BACKGROUND_LAUNCH_GUIDANCE}`,
+        ),
         state: 'queued',
       };
     }
