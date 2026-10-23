@@ -10,14 +10,15 @@ mod restricted_user;
 pub(crate) use restricted_user::{manage, run_worker, status};
 
 use crate::error::{Error, Mechanism};
-use crate::policy::AccessPolicy;
+use crate::policy::{AccessPolicy, ReadAccess};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PATH_NOT_FOUND,
@@ -34,6 +35,9 @@ use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetTokenInformation, InitializeSecurityDescriptor,
     PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
     SetFileSecurityW, SetSecurityDescriptorDacl, TOKEN_USER, TokenUser,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -531,6 +535,109 @@ pub(crate) fn set_path_access(
     }
     let _new_dacl = unsafe { OwnedLocal::from_raw(new_dacl) };
     apply_path_dacl(&path_wide, new_dacl, propagate)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PathAccessEntry {
+    pub(crate) access_mode: ACCESS_MODE,
+    pub(crate) path: PathBuf,
+    pub(crate) access: u32,
+    pub(crate) inherit: bool,
+    pub(crate) propagate: bool,
+}
+
+impl PathAccessEntry {
+    pub(crate) fn policy_entries(policy: &AccessPolicy) -> Result<Vec<Self>> {
+        let read_roots = match &policy.read_access {
+            ReadAccess::AllowRoots(read_roots) => read_roots,
+            ReadAccess::Unrestricted => {
+                return Err(Error::PolicyUnrestrictedRead.into());
+            }
+        };
+        let mut entries = Vec::new();
+        for path in read_roots {
+            Self::push_grant(
+                &mut entries,
+                path,
+                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+                true,
+            );
+        }
+        for path in &policy.write_roots {
+            Self::push_grant(
+                &mut entries,
+                path,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+                true,
+            );
+        }
+        // Placed after grant entries so the resulting DACL has DENY before
+        // GRANT in access-evaluation order.
+        for path in &policy.write_denied_roots {
+            entries.push(Self::subtree_deny(
+                path,
+                FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE,
+            ));
+        }
+        for path in &policy.read_denied_roots {
+            entries.push(Self::subtree_deny(
+                path,
+                FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | DELETE,
+            ));
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn push_grant(
+        entries: &mut Vec<Self>,
+        path: &Path,
+        access: u32,
+        inherit_and_propagate: bool,
+    ) {
+        let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+        for ancestor in path.ancestors().skip(1) {
+            entries.push(Self {
+                access_mode: GRANT_ACCESS,
+                path: ancestor.to_path_buf(),
+                access: ancestor_access,
+                inherit: false,
+                propagate: false,
+            });
+        }
+        entries.push(Self {
+            access_mode: GRANT_ACCESS,
+            path: path.to_path_buf(),
+            access,
+            inherit: inherit_and_propagate,
+            propagate: inherit_and_propagate,
+        });
+    }
+
+    fn subtree_deny(path: &Path, access: u32) -> Self {
+        Self {
+            access_mode: DENY_ACCESS,
+            path: path.to_path_buf(),
+            access,
+            inherit: true,
+            propagate: true,
+        }
+    }
+
+    pub(crate) fn apply(&self, sid: PSID) -> Win32CallResult<()> {
+        set_path_access(
+            &self.path,
+            sid,
+            self.access,
+            self.access_mode,
+            self.inherit,
+            self.propagate,
+        )
+    }
+
+    pub(crate) fn revoke(&self, sid: PSID) -> Win32CallResult<()> {
+        set_path_access(&self.path, sid, 0, REVOKE_ACCESS, false, self.propagate)
+    }
 }
 
 /// Apply a constructed DACL to a path.

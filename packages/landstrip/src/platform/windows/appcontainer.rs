@@ -8,13 +8,13 @@ mod doctor;
 pub(super) use doctor::{probe_null_device, status};
 
 use super::{
-    LocalSid, NamedMutex, SandboxJob, ToWideNul, is_locked_error, join_command_line, own_handle,
-    path_access_failed, quote_command_arg, set_path_access, wait_process_exit, win32_error,
-    win32_status,
+    LocalSid, NamedMutex, PathAccessEntry, SandboxJob, ToWideNul, is_locked_error,
+    join_command_line, own_handle, path_access_failed, quote_command_arg, set_path_access,
+    wait_process_exit, win32_error, win32_status,
 };
 use crate::config::AppContainerMode;
 use crate::error::{Cause, Error as LandstripError, Mechanism};
-use crate::policy::{AccessPolicy, ReadAccess};
+use crate::policy::AccessPolicy;
 use anyhow::{Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString, c_void};
@@ -35,9 +35,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
     NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
 };
-use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, DENY_ACCESS, GRANT_ACCESS, REVOKE_ACCESS,
-};
+use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
@@ -48,10 +46,9 @@ use windows_sys::Win32::Security::{
     WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, DELETE, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType,
-    OPEN_EXISTING,
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR,
+    FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
@@ -492,75 +489,16 @@ impl Drop for LoopbackConfig {
 
 impl GrantedAccess {
     fn new(policy: &AccessPolicy, sid: PSID) -> Result<Self> {
-        let read_roots = match &policy.read_access {
-            ReadAccess::AllowRoots(read_roots) => read_roots,
-            ReadAccess::Unrestricted => {
-                return Err(LandstripError::PolicyUnrestrictedRead.into());
-            }
-        };
+        let entries = PathAccessEntry::policy_entries(policy)?;
         let mut granted = Self {
             sid,
-            paths: Vec::new(),
+            entries: Vec::with_capacity(entries.len()),
         };
-
-        for path in read_roots {
-            granted.grant_root(path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
+        for entry in entries {
+            apply_appcontainer_entry(&entry, sid)?;
+            granted.entries.push(entry);
         }
-
-        for path in &policy.write_roots {
-            granted.grant_root(
-                path,
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-            )?;
-        }
-
-        // DENY ACEs after grants so evaluation order still denies nested holes under
-        // allow roots. Patterns are not expressible as static ACLs on AppContainer;
-        // restricted_user has the same root-only limitation today.
-        for path in &policy.write_denied_roots {
-            granted.deny_subtree(path, FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE)?;
-        }
-        for path in &policy.read_denied_roots {
-            granted.deny_subtree(path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | DELETE)?;
-        }
-
         Ok(granted)
-    }
-
-    fn grant_root(&mut self, path: &Path, access: u32) -> Result<()> {
-        // Path lookup needs read and execute access on every ancestor. Keep the
-        // ancestor ACEs local to avoid propagating inheritable entries.
-        let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-        for ancestor in path.ancestors().skip(1) {
-            set_appcontainer_path_access(
-                ancestor,
-                self.sid,
-                ancestor_access,
-                GRANT_ACCESS,
-                false,
-                false,
-            )?;
-            self.paths.push(GrantedPath {
-                path: ancestor.to_path_buf(),
-                propagate: false,
-            });
-        }
-
-        set_appcontainer_path_access(path, self.sid, access, GRANT_ACCESS, true, true)?;
-        self.paths.push(GrantedPath {
-            path: path.to_path_buf(),
-            propagate: true,
-        });
-        Ok(())
-    }
-
-    fn deny_subtree(&mut self, path: &Path, access: u32) -> Result<()> {
-        set_appcontainer_path_access(path, self.sid, access, DENY_ACCESS, true, true)?;
-        self.paths.push(GrantedPath {
-            path: path.to_path_buf(),
-            propagate: true,
-        });
-        Ok(())
     }
 }
 
@@ -689,51 +627,39 @@ impl LookupRoots {
     }
 }
 
-struct GrantedPath {
-    path: PathBuf,
-    propagate: bool,
-}
-
 struct GrantedAccess {
     sid: PSID,
-    paths: Vec<GrantedPath>,
+    entries: Vec<PathAccessEntry>,
 }
 
 impl Drop for GrantedAccess {
     fn drop(&mut self) {
-        for granted in self.paths.iter().rev() {
-            let _ = set_appcontainer_path_access(
-                &granted.path,
-                self.sid,
-                0,
-                REVOKE_ACCESS,
-                false,
-                granted.propagate,
-            );
+        for entry in self.entries.iter().rev() {
+            let _ = entry.revoke(self.sid);
         }
     }
 }
 
-fn set_appcontainer_path_access(
-    path: &Path,
-    sid: PSID,
-    access: u32,
-    mode: ACCESS_MODE,
-    inherit: bool,
-    propagate: bool,
-) -> Result<()> {
-    match set_path_access(path, sid, access, mode, inherit, propagate) {
+fn apply_appcontainer_entry(entry: &PathAccessEntry, sid: PSID) -> Result<()> {
+    match entry.apply(sid) {
         Ok(()) => Ok(()),
         Err((api, error))
-            if api != "SetEntriesInAclW" && mode == GRANT_ACCESS && is_locked_error(&error) =>
+            if api != "SetEntriesInAclW"
+                && entry.access_mode == GRANT_ACCESS
+                && is_locked_error(&error) =>
         {
             // Skipping an inaccessible grant or descendant during propagation is
             // fail-closed because AppContainer SIDs have no access by default.
             Ok(())
         }
-        Err((api, error)) => {
-            Err(path_access_failed(Mechanism::Appcontainer, path, mode, api, &error).into())
-        }
+        Err((api, error)) => Err(path_access_failed(
+            Mechanism::Appcontainer,
+            &entry.path,
+            entry.access_mode,
+            api,
+            &error,
+        )
+        .into()),
     }
 }
 
