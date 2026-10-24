@@ -41,7 +41,7 @@ function splitHostPort(target) {
 const proxyAuthenticateChallenge = 'Basic realm="landstrip"';
 
 function denyProxyRequest(client, status = '403 Forbidden', headers = {}) {
-  let response = `HTTP/1.1 ${status}\r\nContent-Length: 0\r\n`;
+  let response = `HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n`;
   for (const [name, value] of Object.entries(headers)) response += `${name}: ${value}\r\n`;
   client.write(`${response}\r\n`);
   client.end();
