@@ -20,6 +20,8 @@ import { packageRoot, transpile } from './helper.mjs';
 const require = createRequire(import.meta.url);
 const apiSource = new URL('../../landstrip-api/', import.meta.url);
 const apiManifest = JSON.parse(readFileSync(new URL('package.json', apiSource), 'utf8'));
+const cliSource = new URL('../../landstrip-cli/', import.meta.url);
+const cliManifest = JSON.parse(readFileSync(new URL('package.json', cliSource), 'utf8'));
 
 function apiFixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'landstrip-binary-test-'));
@@ -28,8 +30,12 @@ function apiFixture(t) {
   mkdirSync(apiDir, { recursive: true });
   writeFileSync(join(apiDir, 'package.json'), JSON.stringify(apiManifest));
   cpSync(new URL('lib/', apiSource), join(apiDir, 'lib'), { recursive: true });
+  const cliDir = join(root, 'node_modules', '@landstrip', 'landstrip');
+  mkdirSync(cliDir, { recursive: true });
+  writeFileSync(join(cliDir, 'package.json'), JSON.stringify(cliManifest));
+  cpSync(new URL('lib/', cliSource), join(cliDir, 'lib'), { recursive: true });
   const api = require(join(apiDir, 'lib', 'index.js'));
-  return { root, apiDir, api };
+  return { root, cliDir, api };
 }
 
 function binaryPackage(directory, name, platform = process.platform) {
@@ -42,17 +48,17 @@ function binaryPackage(directory, name, platform = process.platform) {
 
 function installBinary(fixture, platform = process.platform, arch = process.arch) {
   const name = fixture.api.packageName(platform, arch);
-  const directory = join(fixture.apiDir, 'node_modules', name);
+  const directory = join(fixture.cliDir, 'node_modules', name);
   return binaryPackage(directory, name, platform);
 }
 
 function linkPackage(fixture, directory) {
-  const link = join(fixture.apiDir, 'node_modules', fixture.api.packageName());
+  const link = join(fixture.cliDir, 'node_modules', fixture.api.packageName());
   mkdirSync(dirname(link), { recursive: true });
   symlinkSync(directory, link, 'junction');
 }
 
-for (const name of Object.keys(apiManifest.optionalDependencies)) {
+for (const name of Object.keys(cliManifest.optionalDependencies)) {
   const [platform, arch] = name.slice('@landstrip/landstrip-'.length).split('-');
   test(`binaryPath resolves the official ${platform}-${arch} package`, (t) => {
     const fixture = apiFixture(t);
@@ -73,13 +79,13 @@ test('binaryPath resolves a symlinked official package', (t) => {
 test('binaryPath resolves a binary symlink to another official package', (t) => {
   const fixture = apiFixture(t);
   const binary = installBinary(fixture);
-  const target = binaryPackage(join(fixture.root, 'store', 'api'), apiManifest.name);
+  const target = binaryPackage(join(fixture.root, 'store', 'cli'), cliManifest.name);
   rmSync(binary);
   symlinkSync(target, binary, 'file');
   assert.equal(fixture.api.binaryPath(), realpathSync.native(target));
 });
 
-for (const manifest of [{ name: 'foreign-binary' }, null, '{invalid JSON']) {
+for (const manifest of [{ name: apiManifest.name }, null, '{invalid JSON']) {
   test(`binaryPath rejects foreign ownership with manifest ${JSON.stringify(manifest)}`, (t) => {
     const fixture = apiFixture(t);
     const binary = installBinary(fixture);
@@ -93,7 +99,7 @@ for (const manifest of [{ name: 'foreign-binary' }, null, '{invalid JSON']) {
     symlinkSync(target, binary, 'file');
     assert.throws(
       () => fixture.api.binaryPath(),
-      /Refusing to use landstrip binary outside official @landstrip\/landstrip-api packages/,
+      /Refusing to use landstrip binary outside official @landstrip\/landstrip packages/,
     );
   });
 }

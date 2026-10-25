@@ -4,6 +4,9 @@ import { describe, expect, it } from 'vitest';
 
 interface PackageJson {
   version: string;
+  name?: string;
+  main?: string;
+  bin?: Record<string, string>;
   dependencies?: Record<string, string>;
   optionalDependencies?: Record<string, string>;
   peerDependencies?: Record<string, string>;
@@ -31,11 +34,30 @@ describe('package metadata', () => {
   it('matches the Landstrip release', () => {
     const extensionPackage = readJson<PackageJson>(new URL('./package.json', import.meta.url));
     const extensionLock = readJson<PackageLock>(new URL('./package-lock.json', import.meta.url));
-    const landstripPackage = readJson<PackageJson>(
+    const apiPackage = readJson<PackageJson>(
       new URL('../landstrip-api/package.json', import.meta.url),
     );
-    const version = landstripPackage.version;
-    const platformDependencies = Object.keys(landstripPackage.optionalDependencies ?? {});
+    const cliPackage = readJson<PackageJson>(
+      new URL('../landstrip-cli/package.json', import.meta.url),
+    );
+    const version = apiPackage.version;
+    const platformDependencies = {
+      '@landstrip/landstrip-darwin-arm64': version,
+      '@landstrip/landstrip-darwin-x64': version,
+      '@landstrip/landstrip-linux-x64': version,
+      '@landstrip/landstrip-linux-arm64': version,
+      '@landstrip/landstrip-win32-x64': version,
+      '@landstrip/landstrip-win32-arm64': version,
+    };
+
+    expect(cliPackage.name).toBe('@landstrip/landstrip');
+    expect(cliPackage.version).toBe(version);
+    expect(cliPackage.main).toBe('lib/index.js');
+    expect(cliPackage.bin).toEqual({ landstrip: 'bin/landstrip.js' });
+    expect(cliPackage.optionalDependencies).toEqual(platformDependencies);
+    expect(apiPackage.dependencies?.['@landstrip/landstrip']).toBe(version);
+    expect(apiPackage.bin).toBeUndefined();
+    expect(apiPackage.optionalDependencies).toBeUndefined();
 
     expect(extensionPackage.version).toBe(version);
     expect(extensionLock.version).toBe(version);
@@ -45,12 +67,20 @@ describe('package metadata', () => {
       `^${version}`,
     );
 
-    for (const packageName of ['@landstrip/landstrip-api', ...platformDependencies]) {
+    for (const packageName of [
+      '@landstrip/landstrip-api',
+      '@landstrip/landstrip',
+      ...Object.keys(platformDependencies),
+    ]) {
       expectLockedPackage(extensionLock, packageName, version);
     }
+    const lockedApi = extensionLock.packages['node_modules/@landstrip/landstrip-api'];
+    expect(lockedApi.dependencies).toEqual(apiPackage.dependencies);
+    expect(lockedApi.bin).toBeUndefined();
+    expect(lockedApi.optionalDependencies).toBeUndefined();
     expect(
-      extensionLock.packages['node_modules/@landstrip/landstrip-api'].optionalDependencies,
-    ).toEqual(landstripPackage.optionalDependencies);
+      extensionLock.packages['node_modules/@landstrip/landstrip'].optionalDependencies,
+    ).toEqual(cliPackage.optionalDependencies);
   });
 
   it('uses host-provided Pi extension dependencies', () => {

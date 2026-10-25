@@ -15,9 +15,26 @@ function assertLockedPackage(lock, packageName, version) {
 test('package metadata matches the Landstrip release', () => {
   const extensionPackage = readJson(new URL('../package.json', import.meta.url));
   const extensionLock = readJson(new URL('../package-lock.json', import.meta.url));
-  const landstripPackage = readJson(new URL('../../landstrip-api/package.json', import.meta.url));
-  const version = landstripPackage.version;
-  const platformDependencies = Object.keys(landstripPackage.optionalDependencies ?? {});
+  const apiPackage = readJson(new URL('../../landstrip-api/package.json', import.meta.url));
+  const cliPackage = readJson(new URL('../../landstrip-cli/package.json', import.meta.url));
+  const version = apiPackage.version;
+  const platformDependencies = {
+    '@landstrip/landstrip-darwin-arm64': version,
+    '@landstrip/landstrip-darwin-x64': version,
+    '@landstrip/landstrip-linux-x64': version,
+    '@landstrip/landstrip-linux-arm64': version,
+    '@landstrip/landstrip-win32-x64': version,
+    '@landstrip/landstrip-win32-arm64': version,
+  };
+
+  assert.equal(cliPackage.name, '@landstrip/landstrip');
+  assert.equal(cliPackage.version, version);
+  assert.equal(cliPackage.main, 'lib/index.js');
+  assert.deepEqual(cliPackage.bin, { landstrip: 'bin/landstrip.js' });
+  assert.deepEqual(cliPackage.optionalDependencies, platformDependencies);
+  assert.equal(apiPackage.dependencies?.['@landstrip/landstrip'], version);
+  assert.equal(apiPackage.bin, undefined);
+  assert.equal(apiPackage.optionalDependencies, undefined);
 
   assert.equal(extensionPackage.version, version);
   assert.equal(extensionLock.version, version);
@@ -40,12 +57,20 @@ test('package metadata matches the Landstrip release', () => {
   assert.equal(extensionLock.packages['node_modules/@opentui/core']?.dev, undefined);
   assert.equal(extensionLock.packages['node_modules/@opentui/keymap'], undefined);
 
-  for (const packageName of ['@landstrip/landstrip-api', ...platformDependencies]) {
+  for (const packageName of [
+    '@landstrip/landstrip-api',
+    '@landstrip/landstrip',
+    ...Object.keys(platformDependencies),
+  ]) {
     assertLockedPackage(extensionLock, packageName, version);
   }
+  const lockedApi = extensionLock.packages['node_modules/@landstrip/landstrip-api'];
+  assert.deepEqual(lockedApi.dependencies, apiPackage.dependencies);
+  assert.equal(lockedApi.bin, undefined);
+  assert.equal(lockedApi.optionalDependencies, undefined);
   assert.deepEqual(
-    extensionLock.packages['node_modules/@landstrip/landstrip-api'].optionalDependencies,
-    landstripPackage.optionalDependencies,
+    extensionLock.packages['node_modules/@landstrip/landstrip'].optionalDependencies,
+    cliPackage.optionalDependencies,
   );
 });
 
