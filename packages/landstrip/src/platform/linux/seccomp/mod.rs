@@ -255,6 +255,7 @@ pub(super) fn run_broker(
         notify_syscalls.push(syscalls.bind);
     }
     notify_syscalls.push(syscalls.connect);
+    notify_syscalls.extend(syscalls.access_syscalls());
     if restricted && allow_local_binding {
         notify_syscalls.push(syscalls.sendto);
         notify_syscalls.push(syscalls.sendmsg);

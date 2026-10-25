@@ -88,6 +88,17 @@ pub fn fd_metadata_probe(
     let value = b"value";
     let rc = match operation.to_str() {
         Some("fchmod") => unsafe { libc::fchmod(file.as_raw_fd(), 0o600) },
+        Some("access-read") => unsafe { libc::access(path.as_ptr(), libc::R_OK) },
+        Some("access-write") => unsafe { libc::access(path.as_ptr(), libc::W_OK) },
+        Some("faccessat2-write-empty") => unsafe {
+            libc::syscall(
+                libc::SYS_faccessat2,
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::W_OK,
+                libc::AT_EMPTY_PATH,
+            ) as i32
+        },
         Some("fchmod-unlinked") => unsafe {
             libc::unlink(path.as_ptr());
             libc::fchmod(file.as_raw_fd(), 0o600)

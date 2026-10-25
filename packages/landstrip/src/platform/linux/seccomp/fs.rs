@@ -11,7 +11,7 @@ use super::process::{MissingTarget, ResolvedPath, TargetProcess, fd_label_under_
 use super::supervise::{Denial, Denials};
 use crate::paths::normalize_path_lexically;
 use crate::policy::{AccessPolicy, DenialReason};
-use crate::trap::{FilesystemDenial, TrapOperation};
+use crate::trap::{FilesystemDenial, ProcessContext, TrapOperation};
 use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
@@ -20,6 +20,7 @@ pub(super) const SYS_FCHMODAT2: i64 = 452;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(super) mod legacy_syscall {
     pub const OPEN: Option<i64> = Some(libc::SYS_open);
+    pub const ACCESS: Option<i64> = Some(libc::SYS_access);
     pub const RENAME: Option<i64> = Some(libc::SYS_rename);
     pub const LINK: Option<i64> = Some(libc::SYS_link);
     pub const SYMLINK: Option<i64> = Some(libc::SYS_symlink);
@@ -36,6 +37,7 @@ pub(super) mod legacy_syscall {
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 pub(super) mod legacy_syscall {
     pub const OPEN: Option<i64> = None;
+    pub const ACCESS: Option<i64> = None;
     pub const RENAME: Option<i64> = None;
     pub const LINK: Option<i64> = None;
     pub const SYMLINK: Option<i64> = None;
@@ -511,6 +513,244 @@ impl OpenRequest {
         };
         filesystem.resolve(self.dirfd, &self.path, follow, missing, self.open.resolve)
     }
+}
+
+#[derive(Clone, Copy)]
+struct AccessMode(i32);
+
+impl AccessMode {
+    fn reads(self) -> bool {
+        self.0 & libc::R_OK != 0
+    }
+
+    fn writes(self) -> bool {
+        self.0 & libc::W_OK != 0
+    }
+
+    fn is_supported(self) -> bool {
+        self.0 & !(libc::R_OK | libc::W_OK | libc::X_OK) == 0
+    }
+}
+
+impl TryFrom<u64> for AccessMode {
+    type Error = BrokerError;
+
+    fn try_from(mode: u64) -> SysResult<Self> {
+        Ok(Self(
+            i32::try_from(mode).map_err(|_| BrokerError::InvalidAddress)?,
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AccessFlags(i32);
+
+impl AccessFlags {
+    const KNOWN: i32 = libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
+
+    fn parse(flags: i32) -> Option<Self> {
+        (flags & !Self::KNOWN == 0).then_some(Self(flags))
+    }
+
+    fn follows(self) -> bool {
+        self.0 & libc::AT_SYMLINK_NOFOLLOW == 0
+    }
+
+    fn empty_path(self) -> bool {
+        self.0 & libc::AT_EMPTY_PATH != 0
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AccessSyscall {
+    Access,
+    Faccessat,
+    Faccessat2,
+}
+
+impl AccessSyscall {
+    fn from_nr(nr: i64) -> Option<Self> {
+        if legacy_syscall::ACCESS.is_some_and(|access| nr == access) {
+            Some(Self::Access)
+        } else if nr == libc::SYS_faccessat {
+            Some(Self::Faccessat)
+        } else if nr == libc::SYS_faccessat2 {
+            Some(Self::Faccessat2)
+        } else {
+            None
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Access => "access",
+            Self::Faccessat => "faccessat",
+            Self::Faccessat2 => "faccessat2",
+        }
+    }
+
+    fn takes_dirfd(self) -> bool {
+        !matches!(self, Self::Access)
+    }
+
+    fn flags(self, args: &[u64; 6]) -> Option<AccessFlags> {
+        let flags = match self {
+            Self::Faccessat2 => i32::try_from(args[3]).ok()?,
+            Self::Access | Self::Faccessat => 0,
+        };
+        AccessFlags::parse(flags)
+    }
+}
+
+struct AccessRequest {
+    process: TargetProcess,
+    dirfd: RawFd,
+    path: PathBuf,
+    mode: AccessMode,
+    flags: AccessFlags,
+    syscall: AccessSyscall,
+}
+
+impl AccessRequest {
+    fn from_notification(request: &libc::seccomp_notif) -> SysResult<Option<Self>> {
+        let Some(syscall) = AccessSyscall::from_nr(i64::from(request.data.nr)) else {
+            return Ok(None);
+        };
+        let args = &request.data.args;
+        let Some(flags) = syscall.flags(args) else {
+            return Ok(None);
+        };
+        let path_arg = usize::from(syscall.takes_dirfd());
+        let path_ptr = usize::try_from(args[path_arg]).map_err(|_| BrokerError::BadAddress)?;
+        let process = TargetProcess::from_raw(request.pid);
+        let path = if flags.empty_path() {
+            process.read_path(path_ptr)?
+        } else {
+            process.read_nonempty_path(path_ptr)?
+        };
+        Ok(Some(Self {
+            mode: AccessMode::try_from(args[path_arg + 1])?,
+            dirfd: if syscall.takes_dirfd() {
+                args[0].to_i32()
+            } else {
+                libc::AT_FDCWD
+            },
+            path,
+            flags,
+            syscall,
+            process,
+        }))
+    }
+
+    fn resolve(&self) -> SysResult<Option<AccessTarget>> {
+        if self.flags.empty_path() && self.path.as_os_str().is_empty() {
+            let filesystem = self.process.filesystem()?;
+            let target = self.process.duplicate_fd(self.dirfd)?;
+            let Some(label) = fd_label_under_root(&filesystem.root_label, target.as_fd())? else {
+                return Ok(None);
+            };
+            let lexical = normalize_path_lexically(&label);
+            return Ok(Some(AccessTarget {
+                requested_path: label.clone(),
+                label,
+                lexical,
+            }));
+        }
+        let target = self.process.filesystem()?.resolve(
+            self.dirfd,
+            &self.path,
+            self.flags.follows(),
+            MissingTarget::Disallow,
+            0,
+        )?;
+        Ok(Some(AccessTarget {
+            label: target.label,
+            lexical: target.lexical,
+            requested_path: self.path.clone(),
+        }))
+    }
+}
+
+struct AccessTarget {
+    label: PathBuf,
+    lexical: PathBuf,
+    requested_path: PathBuf,
+}
+
+struct AccessDenial {
+    operation: TrapOperation,
+    path: PathBuf,
+    requested_path: PathBuf,
+    syscall: &'static str,
+    reason: DenialReason,
+    process: ProcessContext,
+}
+
+impl AccessDenial {
+    fn deny(self, denials: &mut Denials<'_>, allow_query: bool) -> SysResult<NotificationResult> {
+        denials.deny(
+            Denial::Filesystem(FilesystemDenial {
+                operation: self.operation,
+                path: self.path,
+                requested_path: self.requested_path,
+                syscall: self.syscall,
+                flags: Vec::new(),
+                reason: self.reason,
+                process: self.process,
+            }),
+            allow_query,
+            None,
+        )
+    }
+}
+
+pub(super) fn handle_access(
+    policy: &AccessPolicy,
+    request: &libc::seccomp_notif,
+    denials: &mut Denials<'_>,
+) -> SysResult<NotificationResult> {
+    let Some(access) = AccessRequest::from_notification(request)? else {
+        return Ok(NotificationResult::Continue);
+    };
+    if !access.mode.is_supported() || (!access.mode.reads() && !access.mode.writes()) {
+        return Ok(NotificationResult::Continue);
+    }
+    let Some(target) = access.resolve()? else {
+        return Ok(NotificationResult::Continue);
+    };
+    let writes = access.mode.writes();
+    let reads = access.mode.reads();
+    let hard_write_denied = writes && policy.is_write_denied_always(&target.label, &target.lexical);
+    let hard_read_denied = reads
+        && (policy.is_read_denied_always(&target.label)
+            || policy.is_read_denied_always(&target.lexical));
+    let allow_query = !hard_write_denied && !hard_read_denied;
+    let denial = |operation, reason| AccessDenial {
+        operation,
+        path: target.label.clone(),
+        requested_path: target.requested_path.clone(),
+        syscall: access.syscall.name(),
+        reason,
+        process: access.process.context(),
+    };
+
+    if writes && let Some(reason) = policy.write_reason(&target.label, &target.lexical, true) {
+        return denial(TrapOperation::Write, reason).deny(denials, allow_query);
+    }
+    if reads
+        && let Some(reason) = policy
+            .read_reason(&target.label)
+            .or_else(|| {
+                policy
+                    .is_read_denied(&target.lexical)
+                    .then_some(DenialReason::DenyMatch)
+            })
+            .or_else(|| hard_read_denied.then_some(DenialReason::DenyMatch))
+    {
+        return denial(TrapOperation::Read, reason).deny(denials, allow_query);
+    }
+
+    Ok(NotificationResult::Continue)
 }
 
 pub(super) fn handle_openat(

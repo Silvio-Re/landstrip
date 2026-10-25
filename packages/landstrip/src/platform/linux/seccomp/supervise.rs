@@ -3,7 +3,7 @@
 
 use super::super::signals::ForwardSignals;
 use super::error::{BrokerError, SysResult};
-use super::fs::{MUTATION_SYSCALLS, handle_mutation, handle_openat, legacy_syscall};
+use super::fs::{MUTATION_SYSCALLS, handle_access, handle_mutation, handle_openat, legacy_syscall};
 use super::grant::Grant;
 use super::network::{handle_bind, handle_connect, handle_sendmmsg, handle_sendmsg, handle_sendto};
 use super::notify::{NotificationChannel, NotificationResponse, NotificationResult, QueryDecision};
@@ -163,6 +163,8 @@ impl NotificationContext<'_> {
             handle_sendmmsg(request, denials)
         } else if self.notify_filesystem && self.syscalls.is_open(syscall) {
             handle_openat(self.policy, request, denials)
+        } else if self.syscalls.is_access(syscall) {
+            handle_access(self.policy, request, denials)
         } else if self.notify_filesystem && self.syscalls.is_handle_syscall(syscall) {
             Err(BrokerError::PolicyDenied)
         } else if self.notify_filesystem
@@ -228,6 +230,9 @@ pub(crate) struct NotificationSyscalls {
     openat: i64,
     openat2: i64,
     open: Option<i64>,
+    access: Option<i64>,
+    faccessat: i64,
+    faccessat2: i64,
     name_to_handle_at: i64,
     open_by_handle_at: i64,
 }
@@ -247,6 +252,9 @@ impl NotificationSyscalls {
             openat: libc::SYS_openat,
             openat2: libc::SYS_openat2,
             open: legacy_syscall::OPEN,
+            access: legacy_syscall::ACCESS,
+            faccessat: libc::SYS_faccessat,
+            faccessat2: libc::SYS_faccessat2,
             name_to_handle_at: libc::SYS_name_to_handle_at,
             open_by_handle_at: libc::SYS_open_by_handle_at,
         }
@@ -258,8 +266,22 @@ impl NotificationSyscalls {
             || self.open.is_some_and(|open| open == syscall)
     }
 
+    fn is_access(&self, syscall: i64) -> bool {
+        syscall == self.faccessat
+            || syscall == self.faccessat2
+            || self.access.is_some_and(|access| access == syscall)
+    }
+
     fn is_handle_syscall(&self, syscall: i64) -> bool {
         syscall == self.name_to_handle_at || syscall == self.open_by_handle_at
+    }
+
+    pub(crate) fn access_syscalls(&self) -> Vec<i64> {
+        let mut nrs = vec![self.faccessat, self.faccessat2];
+        if let Some(access) = self.access {
+            nrs.push(access);
+        }
+        nrs
     }
 
     pub(crate) fn filesystem_syscalls(&self) -> Vec<i64> {
