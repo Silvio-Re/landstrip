@@ -11,13 +11,13 @@ if (!/^\d+\.\d+\.\d+$/.test(version ?? "") || extensionDirs.length === 0) {
 }
 
 const npm = process.env.NPM || "npm";
-const rootPackageData = JSON.parse(fs.readFileSync("packages/landstrip-api/package.json", "utf8"));
-const landstripPackage = rootPackageData.name;
-const platformPackages = Object.keys(rootPackageData.optionalDependencies ?? {});
+const cliPackageData = JSON.parse(fs.readFileSync("packages/landstrip-cli/package.json", "utf8"));
+const apiPackageData = JSON.parse(fs.readFileSync("packages/landstrip-api/package.json", "utf8"));
+const platformPackages = Object.keys(cliPackageData.optionalDependencies ?? {});
 if (platformPackages.length !== 6) {
   throw new Error(`expected six platform packages, found ${platformPackages.length}`);
 }
-const packageNames = [landstripPackage, ...platformPackages];
+const packageNames = [...platformPackages, cliPackageData.name, apiPackageData.name];
 const distributions = new Map();
 
 for (const packageName of packageNames) {

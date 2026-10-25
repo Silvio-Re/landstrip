@@ -108,7 +108,7 @@ SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$head_commit")"
 export SOURCE_DATE_EPOCH
 
 cargo_root="$repo_root/packages/landstrip"
-package_json="$repo_root/packages/landstrip-api/package.json"
+package_json="$repo_root/packages/landstrip-cli/package.json"
 [[ -f "$cargo_root/Cargo.toml" ]] || die "missing $cargo_root/Cargo.toml"
 [[ -f "$package_json" ]] || die "missing $package_json"
 

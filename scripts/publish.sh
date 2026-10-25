@@ -79,17 +79,13 @@ prepare_npm_package_build() {
   require_command bun
   printf 'installing build deps for %s\n' \
     "$($NODE -p "require('$package_dir/package.json').name")"
-  # Wire the local meta package (and host optional binary) so unpublished
-  # versions resolve; ignore-scripts / --no-save keep the tree side-effect free.
+  # Install packed CLI, API, and host binary so unpublished versions resolve locally.
   host_platform="$($NODE -e 'process.stdout.write(process.platform + "-" + process.arch)')"
-  host_pkg="$repo_root/npm/$host_platform"
-  if [[ -d "$host_pkg" ]]; then
-    $NPM install --prefix "$package_dir" --package-lock=false --ignore-scripts --no-save \
-      "$repo_root/packages/landstrip-api" "$host_pkg"
-  else
-    $NPM install --prefix "$package_dir" --package-lock=false --ignore-scripts --no-save \
-      "$repo_root/packages/landstrip-api"
-  fi
+  host_pkg="$workdir/release/landstrip-landstrip-$host_platform-$version.tgz"
+  [[ -f "$host_pkg" ]] || die "missing local platform tarball: $host_pkg"
+  $NPM install --prefix "$package_dir" --workspaces=false --package-lock=false --ignore-scripts --no-save \
+    "$host_pkg" "$workdir/release/landstrip-landstrip-$version.tgz" \
+    "$workdir/release/landstrip-landstrip-api-$version.tgz"
 }
 
 pack_npm_package() {
@@ -318,7 +314,7 @@ fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid version: $version"
 
 # Provenance refers to the tagged source: never package a newer tip tree.
-tip_version="$($NODE -p 'require("./packages/landstrip-api/package.json").version')"
+tip_version="$($NODE -p 'require("./packages/landstrip-cli/package.json").version')"
 [[ "$version" == "$tip_version" ]] \
   || die "tag $version does not match tip package.json $tip_version"
 
@@ -363,7 +359,7 @@ git merge-base --is-ancestor "$tag_commit" "$remote_main" \
 cargo_root="$repo_root"
 printf 'staging tag %s\n' "$version"
 
-package_version="$($NODE -p "require('$cargo_root/packages/landstrip-api/package.json').version")"
+package_version="$($NODE -p "require('$cargo_root/packages/landstrip-cli/package.json').version")"
 [[ "$version" == "$package_version" ]] \
   || die "tag $version package.json version is $package_version"
 
@@ -441,7 +437,7 @@ if ((${#missing[@]} > 0)); then
   die "run 'PACKAGE_STRICT=1 make package' before publish"
 fi
 
-npm_package_dirs+=("$repo_root/packages/landstrip-api")
+npm_package_dirs+=("$repo_root/packages/landstrip-cli" "$repo_root/packages/landstrip-api")
 for extension_dir in "${extension_dirs[@]}"; do
   npm_package_dirs+=("$repo_root/$extension_dir")
 done

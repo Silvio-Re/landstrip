@@ -38,6 +38,7 @@ release_files=(
   packages/landstrip/Cargo.lock
   package.json
   package-lock.json
+  packages/landstrip-cli/package.json
   packages/landstrip-api/package.json
   npm/darwin-arm64/package.json
   npm/darwin-x64/package.json
@@ -117,6 +118,7 @@ const fs = require('node:fs');
 
 const [nextVersion, ...packageDirs] = process.argv.slice(2);
 const corePackagePaths = [
+  'packages/landstrip-cli/package.json',
   'packages/landstrip-api/package.json',
   'npm/darwin-arm64/package.json',
   'npm/darwin-x64/package.json',
@@ -129,12 +131,17 @@ const corePackages = corePackagePaths.map((packagePath) => [
   packagePath,
   JSON.parse(fs.readFileSync(packagePath, 'utf8')),
 ]);
-const root = corePackages[0][1];
+const cli = corePackages[0][1];
+const api = corePackages[1][1];
+const cliDependency = cli.name;
+const landstripDependency = api.name;
 
-root.version = nextVersion;
-for (const [, data] of corePackages.slice(1)) {
+cli.version = nextVersion;
+api.version = nextVersion;
+api.dependencies[cliDependency] = nextVersion;
+for (const [, data] of corePackages.slice(2)) {
   data.version = nextVersion;
-  root.optionalDependencies[data.name] = nextVersion;
+  cli.optionalDependencies[data.name] = nextVersion;
 }
 for (const [packagePath, data] of corePackages) {
   fs.writeFileSync(packagePath, `${JSON.stringify(data, null, 2)}\n`);
@@ -143,9 +150,8 @@ const rootData = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 rootData.version = nextVersion;
 fs.writeFileSync('package.json', `${JSON.stringify(rootData, null, 2)}\n`);
 
-const landstripDependency = '@landstrip/landstrip-api';
 const landstripRange = `^${nextVersion}`;
-const platformDependencies = Object.keys(root.optionalDependencies);
+const platformDependencies = Object.keys(cli.optionalDependencies);
 
 function updateLockedPackage(lock, packageName) {
   const lockedPackage = lock.packages[`node_modules/${packageName}`];
@@ -161,25 +167,41 @@ function updateLockedPackage(lock, packageName) {
 }
 
 function updateExtensionLock(lock) {
+  updateLockedPackage(lock, cliDependency);
   updateLockedPackage(lock, landstripDependency);
   for (const packageName of platformDependencies) updateLockedPackage(lock, packageName);
 
-  const lockedLandstrip = lock.packages[`node_modules/${landstripDependency}`];
-  for (const packageName of platformDependencies) {
-    lockedLandstrip.optionalDependencies[packageName] = nextVersion;
-  }
+  const lockedCli = lock.packages[`node_modules/${cliDependency}`];
+  lockedCli.bin = cli.bin;
+  lockedCli.optionalDependencies = { ...cli.optionalDependencies };
+  const lockedApi = lock.packages[`node_modules/${landstripDependency}`];
+  lockedApi.dependencies[cliDependency] = nextVersion;
+  delete lockedApi.bin;
+  delete lockedApi.optionalDependencies;
 }
 
 const rootLockPath = 'package-lock.json';
 const rootLock = JSON.parse(fs.readFileSync(rootLockPath, 'utf8'));
 rootLock.version = nextVersion;
 rootLock.packages[''].version = nextVersion;
-if (rootLock.packages['packages/landstrip-api']) {
-  rootLock.packages['packages/landstrip-api'].version = nextVersion;
-  for (const packageName of platformDependencies) {
-    rootLock.packages['packages/landstrip-api'].optionalDependencies[packageName] = nextVersion;
+for (const [packageDir, data] of [
+  ['packages/landstrip-cli', cli],
+  ['packages/landstrip-api', api],
+]) {
+  const workspacePackage = rootLock.packages[packageDir];
+  if (!workspacePackage) {
+    throw new Error(`package-lock.json does not contain workspace ${packageDir}`);
   }
+  workspacePackage.version = nextVersion;
+  rootLock.packages[`node_modules/${data.name}`] = { resolved: packageDir, link: true };
 }
+const lockedCli = rootLock.packages['packages/landstrip-cli'];
+lockedCli.bin = cli.bin;
+lockedCli.optionalDependencies = { ...cli.optionalDependencies };
+const lockedApi = rootLock.packages['packages/landstrip-api'];
+lockedApi.dependencies[cliDependency] = nextVersion;
+delete lockedApi.bin;
+delete lockedApi.optionalDependencies;
 for (const packageName of platformDependencies) updateLockedPackage(rootLock, packageName);
 
 for (const packageDir of packageDirs) {

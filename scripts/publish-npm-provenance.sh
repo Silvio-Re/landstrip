@@ -19,7 +19,7 @@ source scripts/sha256.sh
 NODE="${NODE:-node}"
 NPM="${NPM:-npm}"
 
-package_dirs=(npm/* packages/landstrip-api)
+package_dirs=(npm/* packages/landstrip-cli packages/landstrip-api)
 while IFS= read -r extension_dir; do
   package_dirs+=("$extension_dir")
 done < <(scripts/test-extensions.sh --list)

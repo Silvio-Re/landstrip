@@ -24,6 +24,9 @@ mocks="$work/mocks"
 mkdir -p "$mocks" "$work/home"
 "$git_path" clone --quiet --no-local "$repo_root" "$test_repo"
 cp "$script_dir/package.sh" "$test_repo/packages/landstrip/scripts/package.sh"
+mkdir -p "$test_repo/packages/landstrip-cli"
+cp "$repo_root/packages/landstrip-cli/package.json" \
+  "$test_repo/packages/landstrip-cli/package.json"
 
 (
   cd "$test_repo"
