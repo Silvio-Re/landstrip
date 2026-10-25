@@ -171,6 +171,10 @@ impl MutationSyscall {
         matches!(self, Self::Mkdir | Self::Mkdirat)
     }
 
+    pub(super) fn is_removal(self) -> bool {
+        matches!(self, Self::Unlink | Self::Unlinkat | Self::Rmdir)
+    }
+
     pub(super) fn is_reparent(self) -> bool {
         matches!(
             self,
@@ -949,6 +953,22 @@ pub(super) fn handle_mutation(
             });
         }
         paths.push((target, path));
+    }
+
+    // A removal of a missing target can only fail with ENOENT, which is
+    // also what the kernel would answer. Denying it with the write policy
+    // instead would make `rm -f` fail on nonexistent denyWrite paths.
+    if spec.kind.is_removal()
+        && paths.iter().all(|(target, _)| {
+            target
+                .anchor
+                .as_ref()
+                .is_none_or(|anchor| anchor.target.is_none())
+        })
+    {
+        return Err(BrokerError::SystemCall {
+            errno: libc::ENOENT,
+        });
     }
 
     let mut denial = None;

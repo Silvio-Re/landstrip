@@ -328,6 +328,33 @@ pub fn truncate_probe(_path: Option<std::ffi::OsString>) -> i32 {
     2
 }
 
+/// Unlinks a path and reports the errno class: 0 when unlinked, 3 for
+/// ENOENT, 1 for any other error, and 2 for bad usage.
+#[cfg(target_os = "linux")]
+pub fn unlink_probe(path: Option<std::ffi::OsString>) -> i32 {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(path) = path else {
+        return 2;
+    };
+    let Ok(c_path) = std::ffi::CString::new(path.as_bytes()) else {
+        return 2;
+    };
+    // SAFETY: c_path is NUL-terminated.
+    if unsafe { libc::unlink(c_path.as_ptr()) } == 0 {
+        return 0;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENOENT) => 3,
+        _ => 1,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn unlink_probe(_path: Option<std::ffi::OsString>) -> i32 {
+    2
+}
+
 #[cfg(target_os = "linux")]
 pub fn exclusive_open_probe(path: Option<std::ffi::OsString>) -> i32 {
     use std::os::unix::ffi::OsStrExt;

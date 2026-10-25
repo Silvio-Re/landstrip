@@ -15,6 +15,7 @@ pub fn dispatch(subcommand: &std::ffi::OsStr, mut args: std::env::ArgsOs) -> Opt
         "opath" => Some(fs::opath_probe(args.next())),
         "futimens" => Some(fs::futimens_probe(args.next())),
         "truncate" => Some(fs::truncate_probe(args.next())),
+        "unlink" => Some(fs::unlink_probe(args.next())),
         "exclusive-open" => Some(fs::exclusive_open_probe(args.next())),
         "openat2" => Some(fs::openat2_probe(args.next(), args.next())),
         "fd-metadata" => Some(fs::fd_metadata_probe(args.next(), args.next())),
