@@ -24,7 +24,7 @@ for (const workspace of workspaces) {
   const parent = workspace.slice(0, -2);
   for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
     const packageDir = `${parent}/${entry.name}`;
-    if (entry.isDirectory() && entry.name !== "landstrip-api" && fs.existsSync(`${packageDir}/package.json`)) {
+    if (entry.isDirectory() && !["landstrip-cli", "landstrip-api"].includes(entry.name) && fs.existsSync(`${packageDir}/package.json`)) {
       console.log(packageDir);
     }
   }
@@ -64,11 +64,12 @@ cleanup_local_root() {
   if ((restricted_user_setup)); then
     "packages/landstrip/target/debug/$binary" windows uninstall >/dev/null 2>&1 || true
   fi
-  [[ -z "${tarball:-}" ]] || rm -f "$tarball"
+  [[ -z "${pack_dir:-}" ]] || rm -rf "$pack_dir"
 }
 
 if ((local_root)); then
-  tarball="$("$NPM" pack ./packages/landstrip-api --silent)"
+  pack_dir="$(mktemp -d)"
+  trap cleanup_local_root EXIT
   platform_package="npm/$(node -p '`${process.platform}-${process.arch}`')"
   [[ -d "$platform_package" ]] || {
     printf 'no local binary package for %s\n' "$platform_package" >&2
@@ -82,7 +83,11 @@ if ((local_root)); then
   if [[ "$(uname -s)" == "Darwin" ]]; then
     codesign -s - -f "$platform_package/bin/$binary" 2>/dev/null || true
   fi
-  trap cleanup_local_root EXIT
+  local_tarballs=()
+  for package_dir in "$platform_package" packages/landstrip-cli packages/landstrip-api; do
+    tarball="$("$NPM" pack "./$package_dir" --pack-destination "$pack_dir" --silent)"
+    local_tarballs+=("$pack_dir/$tarball")
+  done
 
   if [[ "$platform_package" == npm/win32-* && "${CI:-}" == true ]]; then
     "packages/landstrip/target/debug/$binary" windows install \
@@ -95,7 +100,7 @@ fi
 for package_dir in "${extension_dirs[@]}"; do
   if (( local_root )); then
     "$NPM" install --prefix "$package_dir" --workspaces=false --package-lock=false \
-      --ignore-scripts --no-save "./$tarball" "./$platform_package"
+      --ignore-scripts --no-save "${local_tarballs[@]}"
   else
     "$NPM" ci --prefix "$package_dir" --workspaces=false --ignore-scripts
   fi

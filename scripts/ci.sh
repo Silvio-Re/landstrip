@@ -77,17 +77,22 @@ if [[ "$host_platform" == darwin-* ]]; then
   codesign -s - -f "npm/$host_platform/bin/$binary_name" 2>/dev/null || true
 fi
 
-printf '==> npm install local platform package\n'
-tarball="$("$NPM" pack ./packages/landstrip-api --silent)"
-"$NPM" install --package-lock=false --ignore-scripts --no-save "./$tarball" "./npm/$host_platform"
-rm -f "$tarball"
-$NODE packages/landstrip-api/bin/landstrip.js --version >/dev/null
+printf '==> npm install local CLI, API, and platform packages\n'
+pack_dir="$(mktemp -d)"
+trap 'rm -rf "$pack_dir"' EXIT
+local_tarballs=()
+for package_dir in "npm/$host_platform" packages/landstrip-cli packages/landstrip-api; do
+  tarball="$("$NPM" pack "./$package_dir" --pack-destination "$pack_dir" --silent)"
+  local_tarballs+=("$pack_dir/$tarball")
+done
+"$NPM" install --package-lock=false --ignore-scripts --no-save "${local_tarballs[@]}"
+$NODE packages/landstrip-cli/bin/landstrip.js --version >/dev/null
 
 export PATH="$repo_root/packages/landstrip/target/debug:$PATH"
 
 printf '==> extension checks\n'
 # test-extensions.sh --local-root rebuilds the host binary, npm-packs the
-# meta package, installs each extension workspace, and runs its
+# CLI, API, and platform packages, installs each extension workspace, and runs its
 # ci:fmt / ci:lint / ci:check / ci:test scripts.
 "$NPM" run ci:extensions:local
 
