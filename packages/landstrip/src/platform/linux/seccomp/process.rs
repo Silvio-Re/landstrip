@@ -767,9 +767,17 @@ pub(super) fn fd_label_under_root(root: &Path, fd: BorrowedFd<'_>) -> SysResult<
     if !label.is_absolute() {
         return Ok(None);
     }
-    if label.as_os_str().as_bytes().ends_with(b" (deleted)") {
-        return Err(BrokerError::syscall(libc::EACCES));
-    }
+    let label = if let Some(label) = label.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+        // An unlinked file still has the path it was opened through in procfs.
+        // Check that path instead of rejecting every deleted descriptor, but
+        // keep denying deleted entries that remain reachable through a link.
+        if fstat(fd)?.st_nlink != 0 {
+            return Err(BrokerError::syscall(libc::EACCES));
+        }
+        PathBuf::from(OsStr::from_bytes(label))
+    } else {
+        label
+    };
     let relative = label
         .strip_prefix(root)
         .map_err(|_| BrokerError::syscall(libc::EXDEV))?;

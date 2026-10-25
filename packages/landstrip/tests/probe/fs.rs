@@ -88,6 +88,21 @@ pub fn fd_metadata_probe(
     let value = b"value";
     let rc = match operation.to_str() {
         Some("fchmod") => unsafe { libc::fchmod(file.as_raw_fd(), 0o600) },
+        Some("fchmod-unlinked") => unsafe {
+            libc::unlink(path.as_ptr());
+            libc::fchmod(file.as_raw_fd(), 0o600)
+        },
+        Some("fchmod-deleted-hardlink") => unsafe {
+            let mut link = path.as_bytes().to_vec();
+            link.extend_from_slice(b".link");
+            let Ok(link) = std::ffi::CString::new(link) else {
+                return 2;
+            };
+            if libc::link(path.as_ptr(), link.as_ptr()) != 0 || libc::unlink(path.as_ptr()) != 0 {
+                return 2;
+            }
+            libc::fchmod(file.as_raw_fd(), 0o600)
+        },
         Some("path-metadata") => {
             // Exercise the pinned O_PATH target, not the ordinary descriptor above.
             let results = unsafe {
