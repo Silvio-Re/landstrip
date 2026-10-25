@@ -1,7 +1,7 @@
 {
   "name": "@landstrip/landstrip-api",
   "version": "0.20.9",
-  "description": "Sandbox runner using Landlock, Seatbelt, and AppContainer",
+  "description": "TypeScript APIs for the Landstrip sandbox",
   "license": "Apache-2.0",
   "homepage": "https://github.com/landstrip/landstrip#readme",
   "repository": {
@@ -27,25 +27,14 @@
       "default": "./lib/proxy.js"
     }
   },
-  "bin": {
-    "landstrip": "bin/landstrip.js"
-  },
   "files": [
-    "bin",
     "lib",
     "README.md",
     "LICENSE"
   ],
   "dependencies": {
+    "@landstrip/landstrip": "0.20.9",
     "ipaddr.js": "^2.5.0"
-  },
-  "optionalDependencies": {
-    "@landstrip/landstrip-darwin-arm64": "0.20.9",
-    "@landstrip/landstrip-darwin-x64": "0.20.9",
-    "@landstrip/landstrip-linux-x64": "0.20.9",
-    "@landstrip/landstrip-linux-arm64": "0.20.9",
-    "@landstrip/landstrip-win32-x64": "0.20.9",
-    "@landstrip/landstrip-win32-arm64": "0.20.9"
   },
   "publishConfig": {
     "access": "public"

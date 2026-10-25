@@ -1,7 +1,8 @@
 # @landstrip/landstrip-api
 
-Node.js wrapper and types for Landstrip. Requires Node.js ≥18; native binaries
-support Linux, macOS, and Windows on x64/arm64.
+TypeScript APIs for Landstrip. Requires Node.js ≥18 and depends on
+`@landstrip/landstrip` to install the executable for Linux, macOS, and Windows on
+x64/arm64. This API package does not own the CLI or platform binary packages.
 
 ## Install
 
@@ -77,5 +78,5 @@ Run `make ci` from the repository root.
 
 ## License
 
-[Apache-2.0](LICENSE); bundled native binaries are
-[LGPL-2.1-or-later](../landstrip/LICENSE).
+[Apache-2.0](LICENSE); native binaries installed through `@landstrip/landstrip`
+are [LGPL-2.1-or-later](../landstrip/LICENSE).

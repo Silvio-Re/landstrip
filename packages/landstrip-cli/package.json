@@ -1,0 +1,38 @@
+{
+  "name": "@landstrip/landstrip",
+  "version": "0.20.9",
+  "description": "Landstrip sandbox command-line executable",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/landstrip/landstrip#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/landstrip/landstrip.git"
+  },
+  "bugs": {
+    "url": "https://github.com/landstrip/landstrip/issues"
+  },
+  "main": "lib/index.js",
+  "bin": {
+    "landstrip": "bin/landstrip.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "optionalDependencies": {
+    "@landstrip/landstrip-darwin-arm64": "0.20.9",
+    "@landstrip/landstrip-darwin-x64": "0.20.9",
+    "@landstrip/landstrip-linux-x64": "0.20.9",
+    "@landstrip/landstrip-linux-arm64": "0.20.9",
+    "@landstrip/landstrip-win32-x64": "0.20.9",
+    "@landstrip/landstrip-win32-arm64": "0.20.9"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
