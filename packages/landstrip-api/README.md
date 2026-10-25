@@ -10,8 +10,17 @@ x64/arm64. This API package does not own the CLI or platform binary packages.
 npm install --save-dev @landstrip/landstrip-api
 ```
 
-See the [quick start](../../README.md#quick-start) for a policy and CLI example;
-[landstrip(1)](../landstrip/man/man1/landstrip.1) covers policy and platform limits.
+## Usage
+
+```sh
+npx landstrip run -p policy.json -- cargo test
+npx landstrip check -p policy.json
+npx landstrip doctor
+```
+
+See the [quick start](../../README.md#quick-start) for a policy example;
+[landstrip(1)](../landstrip/man/man1/landstrip.1) covers policy and platform
+limits.
 
 ## Node.js API
 
