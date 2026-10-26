@@ -64,6 +64,7 @@ import {
   isRecord,
   isQueryTrap,
   matchesPathPattern,
+  matchesWriteDenyPattern,
   mergeArray,
   parseLandstripTraps,
   parseSandboxConfig,
@@ -1265,15 +1266,16 @@ function createLandstripIntegrationWithPrompts(
       const config = loadConfig(ctx.cwd);
       if (!config.enabled) return { allowed: true, prompted: false };
       for (const access of normalized) {
-        if (
-          matchesPattern(
-            access.path,
-            access.operation === 'read'
-              ? config.filesystem.denyReadAlways
-              : mergeArray(config.filesystem.denyWriteAlways, config.filesystem.denyWrite),
-            ctx.cwd,
-          )
-        ) {
+        const denied =
+          access.operation === 'read'
+            ? matchesPattern(access.path, config.filesystem.denyReadAlways, ctx.cwd)
+            : matchesWriteDenyPattern(
+                access.path,
+                mergeArray(config.filesystem.denyWriteAlways, config.filesystem.denyWrite),
+                ctx.cwd,
+                getEffectiveAllowWrite(config),
+              );
+        if (denied) {
           return {
             allowed: false,
             prompted: false,
@@ -1530,8 +1532,18 @@ function createLandstripIntegrationWithPrompts(
       }
       if (
         trap.operation === 'write' &&
-        (matchesPattern(path, config.filesystem.denyWriteAlways, cwd) ||
-          matchesPattern(path, config.filesystem.denyWrite, cwd))
+        (matchesWriteDenyPattern(
+          path,
+          config.filesystem.denyWriteAlways,
+          cwd,
+          getEffectiveAllowWrite(config, allowances),
+        ) ||
+          matchesWriteDenyPattern(
+            path,
+            config.filesystem.denyWrite,
+            cwd,
+            getEffectiveAllowWrite(config, allowances),
+          ))
       ) {
         return { action: 'deny', reason: 'hard-deny' };
       }
@@ -2356,16 +2368,31 @@ function createLandstripIntegrationWithPrompts(
       if (!ctx.hasUI) return null;
 
       const { globalPath, projectPath } = getPiConfigPaths(ctx.cwd, 'sandbox.json');
+      const writeDeniedBy = (config: SandboxConfig): 'denyWriteAlways' | 'denyWrite' | null => {
+        const writeRoots = getEffectiveAllowWrite(config, allowances);
+        if (
+          matchesWriteDenyPattern(
+            blockedPath,
+            config.filesystem.denyWriteAlways,
+            ctx.cwd,
+            writeRoots,
+          )
+        ) {
+          return 'denyWriteAlways';
+        }
+        if (
+          matchesWriteDenyPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd, writeRoots)
+        ) {
+          return 'denyWrite';
+        }
+        return null;
+      };
       const current = (): boolean | undefined => {
         const config = loadConfig(ctx.cwd);
         if (
-          matchesPattern(
-            blockedPath,
-            operation === 'read'
-              ? config.filesystem.denyReadAlways
-              : mergeArray(config.filesystem.denyWriteAlways, config.filesystem.denyWrite),
-            ctx.cwd,
-          )
+          operation === 'read'
+            ? matchesPattern(blockedPath, config.filesystem.denyReadAlways, ctx.cwd)
+            : writeDeniedBy(config) !== null
         ) {
           return false;
         }
@@ -2416,38 +2443,30 @@ function createLandstripIntegrationWithPrompts(
       );
       if (!access) {
         const config = loadConfig(ctx.cwd);
-        if (
-          operation === 'write' &&
-          (matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd) ||
-            matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd))
-        ) {
-          const tier = matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd)
-            ? 'denyWriteAlways'
-            : 'denyWrite';
-          notify(
-            ctx,
-            `"${blockedPath}" is blocked by ${tier}. Check:\n  ${projectPath}\n  ${globalPath}`,
-            'warning',
-          );
+        if (operation === 'write') {
+          const tier = writeDeniedBy(config);
+          if (tier) {
+            notify(
+              ctx,
+              `"${blockedPath}" is blocked by ${tier}. Check:\n  ${projectPath}\n  ${globalPath}`,
+              'warning',
+            );
+          }
         }
         return null;
       }
 
       let config = loadConfig(ctx.cwd);
-      if (
-        operation === 'write' &&
-        (matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd) ||
-          matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd))
-      ) {
-        const tier = matchesPattern(blockedPath, config.filesystem.denyWriteAlways, ctx.cwd)
-          ? 'denyWriteAlways'
-          : 'denyWrite';
-        notify(
-          ctx,
-          `"${blockedPath}" was added to allowWrite, but ${tier} still blocks it. Check:\n  ${projectPath}\n  ${globalPath}`,
-          'warning',
-        );
-        return null;
+      if (operation === 'write') {
+        const tier = writeDeniedBy(config);
+        if (tier) {
+          notify(
+            ctx,
+            `"${blockedPath}" was added to allowWrite, but ${tier} still blocks it. Check:\n  ${projectPath}\n  ${globalPath}`,
+            'warning',
+          );
+          return null;
+        }
       }
 
       onUpdate?.({
