@@ -102,6 +102,13 @@ impl PathSelector {
     pub(crate) fn is_literal(&self) -> bool {
         matches!(self, Self::Literal { .. })
     }
+
+    /// True when the entry resolves against the policy base rather than naming
+    /// an absolute path or home-relative scope.
+    pub(crate) fn is_base_relative(&self) -> bool {
+        let raw = self.as_str();
+        !Path::new(raw).has_root() && raw != "~" && !raw.starts_with("~/")
+    }
 }
 
 impl AsRef<str> for PathSelector {

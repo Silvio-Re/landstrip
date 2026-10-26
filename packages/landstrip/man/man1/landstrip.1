@@ -162,6 +162,16 @@ Relative paths resolve against
 (default: current working directory);
 .Sq ~
 expands to the user's home directory.
+Relative
+.Va denyWrite
+and
+.Va denyWriteAlways
+entries additionally anchor at every
+.Va allowWrite
+root that is a directory, so the write deny list covers all granted write
+scopes, not only the policy base.
+They also match each granted root's own name, protecting exact-file grants
+and directory roots that match the deny selector.
 Path entries accept bare strings, explicit literal selectors
 .Pq Dq literal ,
 or explicit glob selectors

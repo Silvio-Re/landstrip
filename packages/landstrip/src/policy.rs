@@ -13,7 +13,9 @@
 //!
 //! Paths accept absolute names, names relative to the policy base, `~`, and the
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
-//! while lowering the policy.
+//! while lowering the policy. Relative write-deny entries additionally anchor
+//! at every write root that is a directory, so the deny list follows the
+//! granted write scopes.
 
 use crate::config::{AppContainerMode, PathSelector, SandboxDarwin, SandboxNetwork, Settings};
 use crate::error::{Error, PathIo};
@@ -367,11 +369,14 @@ impl Settings {
         retain_windows_allow_roots(&mut write_allow);
         // Linux mediates denyWrite globs dynamically; expanding them here can scan
         // an entire project before even starting a simple command.
-        let mut resolved_write_deny =
-            resolver.resolve_deny_paths(&filesystem.deny_write, !cfg!(target_os = "linux"))?;
+        let mut resolved_write_deny = resolver.resolve_write_deny_paths(
+            &filesystem.deny_write,
+            &write_allow,
+            !cfg!(target_os = "linux"),
+        )?;
         let mut write_denied_links = resolver.collect_symlink_ancestors(&filesystem.deny_write)?;
         let resolved_write_always =
-            resolver.resolve_deny_paths(&filesystem.deny_write_always, true)?;
+            resolver.resolve_write_deny_paths(&filesystem.deny_write_always, &write_allow, true)?;
         let write_always_links =
             resolver.collect_symlink_ancestors(&filesystem.deny_write_always)?;
         resolved_write_deny.merge_always(&resolved_write_always, &mut write_allow);
@@ -727,6 +732,53 @@ impl PolicyResolver {
         Ok(resolved)
     }
 
+    fn resolve_write_deny_paths(
+        &self,
+        paths: &[PathSelector],
+        write_allow: &[PathBuf],
+        expand_globs: bool,
+    ) -> Result<ResolvedDenyPaths> {
+        let mut anchored = Vec::with_capacity(paths.len() * (1 + write_allow.len()));
+        for selector in paths {
+            anchored.push(selector.clone());
+            if selector.is_base_relative() {
+                let relative = normalize_path_lexically(Path::new(selector.as_str()));
+                let relative_str = relative.to_string_lossy();
+                let pattern = GlobPattern::new(&relative_str);
+                for root in write_allow {
+                    // A write root can itself be a protected file or directory.
+                    if root.file_name().is_some_and(|name| {
+                        let name = Path::new(name);
+                        if selector.is_literal() {
+                            relative == name
+                        } else {
+                            pattern.matches_path(name)
+                        }
+                    }) {
+                        anchored.push(PathSelector::Literal {
+                            literal: root.to_string_lossy().into_owned(),
+                        });
+                    }
+                    // Only directory roots can contain denied descendants.
+                    // Anchoring at a file root would create unreachable deny
+                    // roots whose ancestors receive unlink protection, blocking
+                    // removal of the granted root itself (for example a lock
+                    // directory released with rmdir).
+                    if !fs::metadata(root).is_ok_and(|md| md.is_dir()) {
+                        continue;
+                    }
+                    let joined = root.join(selector.as_str()).to_string_lossy().into_owned();
+                    anchored.push(match selector {
+                        PathSelector::Literal { .. } => PathSelector::Literal { literal: joined },
+                        PathSelector::Glob { .. } => PathSelector::Glob { glob: joined },
+                        PathSelector::Bare(_) => PathSelector::Bare(joined),
+                    });
+                }
+            }
+        }
+        self.resolve_deny_paths(&anchored, expand_globs)
+    }
+
     fn resolve_deny_paths(
         &self,
         paths: &[PathSelector],
@@ -1031,7 +1083,7 @@ impl<'a> GlobPattern<'a> {
 
         match fs::symlink_metadata(&base) {
             Ok(_) => self.collect_matches(&base, &mut matches, 0)?,
-            Err(error) if error.is_opaque() => {}
+            Err(error) if error.is_opaque() || error.kind() == io::ErrorKind::NotADirectory => {}
             Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
         }
 

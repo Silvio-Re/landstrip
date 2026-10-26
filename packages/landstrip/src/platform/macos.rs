@@ -321,13 +321,23 @@ impl ProfileBuilder {
             }
 
             let mut ancestors: Vec<PathBuf> = Vec::new();
+            // Ancestors that are themselves granted write roots must not
+            // receive unlink protection: a granted root's own lifecycle (for
+            // example a lock directory released with rmdir) must stay intact,
+            // and denied descendants are already protected by their own write
+            // denies.
+            let is_granted_root =
+                |p: &Path| policy.write_roots.iter().any(|root| root.as_path() == p);
             for root in policy
                 .write_denied_roots
                 .iter()
                 .chain(policy.read_denied_roots.iter())
             {
                 for ancestor in root.ancestors().skip(1) {
-                    if ancestor != Path::new("/") && ancestor.is_under_any(&policy.write_roots) {
+                    if ancestor != Path::new("/")
+                        && !is_granted_root(ancestor)
+                        && ancestor.is_under_any(&policy.write_roots)
+                    {
                         ancestors.push(ancestor.to_path_buf());
                     }
                 }
@@ -339,7 +349,10 @@ impl ProfileBuilder {
             {
                 let base = GlobPattern::new(pattern).base();
                 for ancestor in base.ancestors() {
-                    if ancestor != Path::new("/") && ancestor.is_under_any(&policy.write_roots) {
+                    if ancestor != Path::new("/")
+                        && !is_granted_root(ancestor)
+                        && ancestor.is_under_any(&policy.write_roots)
+                    {
                         ancestors.push(ancestor.to_path_buf());
                     }
                 }
