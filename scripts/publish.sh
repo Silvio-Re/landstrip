@@ -427,6 +427,24 @@ for platform in "${platforms[@]}"; do
   mkdir -p "$package_dir/bin"
   cp "$source_bin" "$package_dir/bin/$binary"
   chmod 755 "$package_dir/bin/$binary"
+  if [[ "$platform" == linux-* ]]; then
+    # npm consumers spawn the binary programmatically, never as a desktop
+    # AppImage. The type-2 AppImage magic (41 49 02) sits in the ELF
+    # e_ident bytes 8..10 (EI_ABIVERSION + EI_PAD start); when a system has
+    # binfmt_misc handlers registered for that magic (e.g. AppImageLauncher),
+    # the kernel hijacks the exec and the launch fails. Clearing the magic in
+    # the npm copy only restores a gABI-compliant ELF header (these bytes must
+    # be zero per the ELF specification) while the GitHub release asset stays
+    # a genuine type-2 AppImage. The runtime locates its squashfs payload by
+    # scanning the file, not via this magic, so self-extraction keeps working
+    # (APPIMAGE_EXTRACT_AND_RUN=1 is set by the CLI and pi-landstrip launchers).
+    printf '\x00\x00\x00' \
+      | dd of="$package_dir/bin/$binary" bs=1 seek=8 count=3 conv=notrunc status=none
+    [[ "$(od -An -tx1 -j8 -N3 "$package_dir/bin/$binary" | tr -d ' \n')" == 000000 ]] \
+      || die "failed to clear the AppImage magic in $package_dir/bin/$binary"
+    [[ "$(od -An -tx1 -N4 "$package_dir/bin/$binary" | tr -d ' \n')" == 7f454c46 ]] \
+      || die "$package_dir/bin/$binary lost its ELF header while clearing the AppImage magic"
+  fi
   cp "$asset_path" "$checksum_path" "$commit_path" "$workdir/release/"
   npm_package_dirs+=("$package_dir")
 done

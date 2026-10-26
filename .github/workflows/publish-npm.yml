@@ -65,6 +65,11 @@ jobs:
           trap 'rm -rf "$smoke_dir"' EXIT
           tar -xzf "$RUNNER_TEMP/npm-release/landstrip-landstrip-linux-x64-$VERSION.tgz" \
             -C "$smoke_dir" package/bin/landstrip
+          # The npm binary must not carry the type-2 AppImage magic: it lets
+          # system binfmt_misc handlers (e.g. AppImageLauncher) hijack the
+          # exec. publish.sh clears e_ident bytes 8..10 for npm copies.
+          magic="$(od -An -tx1 -j8 -N3 "$smoke_dir/package/bin/landstrip" | tr -d ' \n')"
+          test "$magic" = "000000"
           actual="$(APPIMAGE_EXTRACT_AND_RUN=1 "$smoke_dir/package/bin/landstrip" --version)"
           test "$actual" = "landstrip $VERSION"
       - name: Publish exact tarballs to npm with provenance
