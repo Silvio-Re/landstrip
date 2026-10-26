@@ -5,6 +5,7 @@ const {
   lstatSync,
   mkdtempSync,
   readlinkSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -442,6 +443,82 @@ function resolveFilesystemPatterns(patterns, baseDirectory) {
   return patterns.map((pattern) => resolvePathSelector(pattern, baseDirectory));
 }
 
+// Expand only glob roots; literal roots may not exist yet. Darwin also keeps lexical aliases.
+function resolveWriteRoots(writeRoots, baseDirectory) {
+  const roots = new Set();
+  const opaqueErrors = new Set(['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'EIO', 'ENOTCONN']);
+  const addRoot = (root) => {
+    if (process.platform === 'darwin') roots.add(root);
+    roots.add(canonicalizePath(root, baseDirectory));
+  };
+  for (const selector of writeRoots) {
+    const raw = isRecord(selector) ? selector.literal ?? selector.glob : selector;
+    const lexical = expandPath(raw, baseDirectory);
+    const { isGlob } = resolveSelectorForMatch(selector, baseDirectory);
+    if (!isGlob) {
+      addRoot(lexical);
+      continue;
+    }
+    const wildcard = lexical.search(/[*?[\]]/);
+    const prefix = lexical.slice(0, wildcard);
+    const start = prefix.endsWith(sep) ? resolve(prefix) : dirname(prefix);
+    const matcher = globToRegExp(normalizePathForComparison(lexical));
+    const pending = [[start, 0]];
+    let matched = false;
+    while (pending.length > 0) {
+      const [current, depth] = pending.pop();
+      if (depth >= 40) throw new Error('Write-root glob traversal exceeds maximum depth (40)');
+      try {
+        const metadata = lstatSync(current);
+        if (matcher.test(normalizePathForComparison(current))) {
+          addRoot(current);
+          matched = true;
+        }
+        if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
+          for (const entry of readdirSync(current)) {
+            pending.push([join(current, entry), depth + 1]);
+          }
+        }
+      } catch (error) {
+        if (!opaqueErrors.has(error.code)) throw error;
+      }
+    }
+    if (!matched && typeof selector === 'string') {
+      try {
+        lstatSync(lexical);
+        addRoot(lexical);
+      } catch (error) {
+        if (!opaqueErrors.has(error.code)) throw error;
+      }
+    }
+  }
+  return roots;
+}
+
+// Preserve write-root anchoring when lowering relative denies to absolute selectors.
+function resolveWriteDenyPatterns(patterns, baseDirectory, writeRoots = []) {
+  const resolved = resolveFilesystemPatterns(patterns, baseDirectory);
+  if (!baseDirectory) return resolved;
+  const lexicalBase = resolve(baseDirectory);
+  const baseRoot = canonicalizePath(baseDirectory);
+  let roots;
+  for (const pattern of patterns ?? []) {
+    const raw = isRecord(pattern) ? pattern.literal ?? pattern.glob : pattern;
+    if (isAbsolute(expandHomePath(raw))) continue;
+    roots ??= resolveWriteRoots(writeRoots, baseDirectory);
+    const { isGlob } = resolveSelectorForMatch(pattern, baseDirectory);
+    const relativePattern = normalizePathForComparison(relative(baseRoot, resolve(baseRoot, raw)));
+    for (const root of roots) {
+      const rootName = normalizePathForComparison(basename(root));
+      if (rootName && (isGlob ? globToRegExp(relativePattern).test(rootName) : relativePattern === rootName)) {
+        resolved.push({ literal: canonicalizePath(root, baseDirectory) });
+      }
+      if (root !== baseRoot && root !== lexicalBase) resolved.push(resolvePathSelector(pattern, root));
+    }
+  }
+  return resolved;
+}
+
 function resolveFilesystemPolicy(filesystem, baseDirectory) {
   if (!filesystem) return {};
   const resolved = {};
@@ -458,10 +535,10 @@ function resolveFilesystemPolicy(filesystem, baseDirectory) {
     resolved.allowWrite = resolveFilesystemPatterns(filesystem.allowWrite, baseDirectory);
   }
   if (filesystem.denyWrite !== undefined) {
-    resolved.denyWrite = resolveFilesystemPatterns(filesystem.denyWrite, baseDirectory);
+    resolved.denyWrite = resolveWriteDenyPatterns(filesystem.denyWrite, baseDirectory, filesystem.allowWrite);
   }
   if (filesystem.denyWriteAlways !== undefined) {
-    resolved.denyWriteAlways = resolveFilesystemPatterns(filesystem.denyWriteAlways, baseDirectory);
+    resolved.denyWriteAlways = resolveWriteDenyPatterns(filesystem.denyWriteAlways, baseDirectory, filesystem.allowWrite);
   }
   return resolved;
 }
@@ -879,6 +956,15 @@ function matchesPathPattern(filePath, patterns, baseDirectory = process.cwd()) {
   });
 }
 
+// Relative write denies apply at the policy base and every effective write root.
+function matchesWriteDenyPattern(filePath, patterns, baseDirectory = process.cwd(), writeRoots = []) {
+  return matchesPathPattern(
+    filePath,
+    resolveWriteDenyPatterns(patterns, baseDirectory, writeRoots),
+    baseDirectory,
+  );
+}
+
 function matchPathSpecificity(filePath, patterns, baseDirectory = process.cwd()) {
   if (!Array.isArray(patterns) || patterns.length === 0) return -1;
   let best = -1;
@@ -973,17 +1059,17 @@ function evaluateWriteAccess(filePath, filesystemOrConfig, options, allowWriteOv
   const opts = normalizeWriteOptions(options, allowWriteOverrides);
   const baseDirectory = opts.baseDirectory;
 
-  if (filesystem.denyWriteAlways && matchesPathPattern(filePath, filesystem.denyWriteAlways, baseDirectory)) {
-    return 'denyAlways';
-  }
-
-  if (filesystem.denyWrite && matchesPathPattern(filePath, filesystem.denyWrite, baseDirectory)) {
-    return 'deny';
-  }
-
   const effectiveAllowWrite = opts.allowWriteOverrides.length > 0
     ? mergeArray(filesystem.allowWrite ?? [], opts.allowWriteOverrides)
     : (filesystem.allowWrite ?? []);
+
+  if (filesystem.denyWriteAlways && matchesWriteDenyPattern(filePath, filesystem.denyWriteAlways, baseDirectory, effectiveAllowWrite)) {
+    return 'denyAlways';
+  }
+
+  if (filesystem.denyWrite && matchesWriteDenyPattern(filePath, filesystem.denyWrite, baseDirectory, effectiveAllowWrite)) {
+    return 'deny';
+  }
 
   if (effectiveAllowWrite.length > 0 && matchesPathPattern(filePath, effectiveAllowWrite, baseDirectory)) {
     return 'allow';
@@ -1282,6 +1368,7 @@ module.exports = {
 
   normalizePathForComparison,
   matchesPathPattern,
+  matchesWriteDenyPattern,
   matchPathSpecificity,
   isPathReadAllowed,
   isPathWriteAllowed,

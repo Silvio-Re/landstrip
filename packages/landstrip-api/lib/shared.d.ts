@@ -173,6 +173,14 @@ export function matchesPathPattern(
   baseDirectory?: string,
 ): boolean;
 
+// Relative write denies apply at the policy base and every effective write root.
+export function matchesWriteDenyPattern(
+  filePath: string,
+  patterns: LandstripPathSelector[],
+  baseDirectory?: string,
+  writeRoots?: LandstripPathSelector[],
+): boolean;
+
 export function matchPathSpecificity(
   filePath: string,
   patterns: LandstripPathSelector[],

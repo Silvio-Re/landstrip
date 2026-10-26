@@ -48,8 +48,8 @@ test('resolveFilesystemPolicy resolves all tiers including non-overridable tiers
     denyReadAlways: ['/workspace/root-only'],
     allowRead: ['/workspace'],
     allowWrite: ['/workspace/dist'],
-    denyWrite: ['/workspace/src'],
-    denyWriteAlways: ['/workspace/.git'],
+    denyWrite: ['/workspace/src', '/workspace/dist/src'],
+    denyWriteAlways: ['/workspace/.git', '/workspace/dist/.git'],
   });
 });
 
